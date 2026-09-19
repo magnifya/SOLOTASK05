@@ -1,36 +1,7 @@
-# SOLOTASK05
+# SOLOTASK05 门限签名托管后端
 
-门限签名托管后端。Python 加 cryptography，对外提供 HTTP 服务与命令行入口，两者能力一致。
-
-## 运行
-
-    python -m app --port <port>      # 启动 HTTP 服务
-    python -m app <subcommand>       # 命令行入口，输出单行 JSON
-
-## 公开接口
-
-POST /v1/wallets
-  请求：wallet_id、shares（shares 为 2 表示两方各持一个份额）
-  成功：201 -> wallet_id、public_key、两个份额标识
-  份额数不为 2：400
-  wallet_id 重复创建：409
-
-POST /v1/wallets/{wallet_id}/sign
-  请求：signing_request_id、两个份额签名
-  成功：201 -> signature
-  缺少任一份额或份额校验失败：400
-  同一 signing_request_id 重复提交：返回已有签名，不重复计入
-
-GET /v1/wallets/{wallet_id}
-  成功：200 -> public_key、created_at
-  不存在：404
-
-## 约定
-
-- 完整的私钥不得在任何时刻存在于任何单一位置
-- 服务端不得保存完整私钥；响应与磁盘上都不能出现完整私钥材料
-- 缺少任一份额时不得产出可用的完整签名
+用 Python 加 cryptography 实现一个两方门限签名托管后端，对外提供 HTTP 服务与命令行入口。建钱包走 POST /v1/wallets，请求体是 JSON，含 wallet_id 与 shares；shares 必须等于 2，返回 201 与 wallet_id、public_key 和两个份额标识 share_ids；shares 不等于 2 返回 400，wallet_id 重复则返回 409。份额签名用 Ed25519，各用自身私钥对 signing_request_id 与 message 拼接结果签名。签名走 POST /v1/wallets/{wallet_id}/sign，请求体是 JSON，含 signing_request_id、message 与 signatures，元素含 share_id 与 signature；两份齐备且校验通过返回 201 与 signature，缺一份或校验失败返回 400；同一 signing_request_id 重复提交返回已有签名。GET /v1/wallets/{wallet_id} 返回 public_key 与 created_at，不存在返回 404。命令行提供 create、sign、show 三个子命令，与接口一一对应，打印单行 JSON。服务端只保存份额，响应、磁盘与日志都不得出现完整私钥。
 
 ## 当前状态
 
-接口尚未实现；实现完成后需在此补充安装依赖、启动方式与基础测试命令。
+上述接口尚未实现。实现完成后，请在此补充安装依赖、启动方式与基础测试命令。
