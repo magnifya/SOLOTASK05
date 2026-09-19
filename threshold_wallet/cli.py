@@ -79,6 +79,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="份额签名，可重复两次；HEX 可由 share-sign 生成",
     )
 
+    # policy  <-> PUT /v1/wallets/{id}/approval-policy
+    p_policy = sub.add_parser(
+        "policy", help="设置审批策略（PUT .../approval-policy）"
+    )
+    p_policy.add_argument("--url", default=DEFAULT_URL)
+    p_policy.add_argument("--wallet-id", required=True)
+    p_policy.add_argument("--required-approvals", type=int, required=True)
+    p_policy.add_argument("--timeout-seconds", type=int, required=True)
+
+    # request-create  <-> POST /v1/wallets/{id}/sign-requests
+    p_rc = sub.add_parser(
+        "request-create", help="创建签名请求审批单（POST .../sign-requests）"
+    )
+    p_rc.add_argument("--url", default=DEFAULT_URL)
+    p_rc.add_argument("--wallet-id", required=True)
+    p_rc.add_argument("--signing-request-id", required=True)
+    p_rc.add_argument("--message", required=True)
+
+    # request-show  <-> GET /v1/wallets/{id}/sign-requests/{rid}
+    p_rs = sub.add_parser(
+        "request-show", help="查询签名请求审批单（GET .../sign-requests/{id}）"
+    )
+    p_rs.add_argument("--url", default=DEFAULT_URL)
+    p_rs.add_argument("--wallet-id", required=True)
+    p_rs.add_argument("--signing-request-id", required=True)
+
+    # approve / reject  <-> POST .../sign-requests/{rid}/approve|reject
+    for name, help_text in (
+        ("approve", "批准签名请求（POST .../approve）"),
+        ("reject", "拒绝签名请求（POST .../reject）"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--url", default=DEFAULT_URL)
+        p.add_argument("--wallet-id", required=True)
+        p.add_argument("--signing-request-id", required=True)
+        p.add_argument("--approver-id", required=True)
+        p.add_argument("--reason", default=None)
+
     # share-sign（份额持有方本地辅助命令）
     p_ss = sub.add_parser(
         "share-sign",
@@ -175,6 +213,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "message": args.message,
                     "signatures": signatures,
                 },
+            )
+
+        elif args.command == "policy":
+            status, body = _http_request(
+                "PUT",
+                f"{args.url}/v1/wallets/{args.wallet_id}/approval-policy",
+                {
+                    "required_approvals": args.required_approvals,
+                    "timeout_seconds": args.timeout_seconds,
+                },
+            )
+
+        elif args.command == "request-create":
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}/sign-requests",
+                {
+                    "id": args.signing_request_id,
+                    "message": args.message,
+                },
+            )
+
+        elif args.command == "request-show":
+            status, body = _http_request(
+                "GET",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/sign-requests/{args.signing_request_id}",
+                None,
+            )
+
+        elif args.command in ("approve", "reject"):
+            payload = {"approver_id": args.approver_id}
+            if args.reason is not None:
+                payload["reason"] = args.reason
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/sign-requests/{args.signing_request_id}/{args.command}",
+                payload,
             )
 
         elif args.command == "share-sign":

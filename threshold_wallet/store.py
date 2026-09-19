@@ -6,6 +6,8 @@
     shares/<wallet_id>/<share_id>.json
                                     单个份额（份额私钥以 hex 保存），一份一个文件
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
+    policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
+    requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -47,9 +49,13 @@ class WalletStore:
         self._wallets_dir = os.path.join(data_dir, "wallets")
         self._shares_dir = os.path.join(data_dir, "shares")
         self._signatures_dir = os.path.join(data_dir, "signatures")
+        self._policies_dir = os.path.join(data_dir, "policies")
+        self._requests_dir = os.path.join(data_dir, "requests")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
+        os.makedirs(self._policies_dir, exist_ok=True)
+        os.makedirs(self._requests_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     # ---- 内部工具 -------------------------------------------------------
@@ -68,6 +74,14 @@ class WalletStore:
     def _signatures_path(self, wallet_id: str) -> str:
         _check_id("wallet_id", wallet_id)
         return os.path.join(self._signatures_dir, wallet_id + ".json")
+
+    def _policy_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._policies_dir, wallet_id + ".json")
+
+    def _requests_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._requests_dir, wallet_id + ".json")
 
     @staticmethod
     def _atomic_write(path: str, data: dict) -> None:
@@ -170,3 +184,57 @@ class WalletStore:
         if not all_records:
             return None
         return all_records.get(signing_request_id)
+
+    # ---- 审批策略 -------------------------------------------------------
+
+    def save_policy(self, wallet_id: str, policy: dict) -> None:
+        """原子地写入（或覆盖）钱包的审批策略。"""
+        path = self._policy_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, policy)
+
+    def get_policy(self, wallet_id: str) -> Optional[dict]:
+        """返回钱包的审批策略，未设置返回 None。"""
+        return self._read_json(self._policy_path(wallet_id))
+
+    # ---- 签名请求审批单 ---------------------------------------------------
+
+    def create_request(
+        self, wallet_id: str, signing_request_id: str, record: dict
+    ) -> Optional[dict]:
+        """原子地创建一条签名请求审批单。
+
+        在同一把锁内先查重：若该 signing_request_id 已存在，则不覆盖、
+        直接返回已有记录；否则写入并返回 None。
+        """
+        _check_id("signing_request_id", signing_request_id)
+        path = self._requests_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            existing = all_records.get(signing_request_id)
+            if existing is not None:
+                return existing
+            all_records[signing_request_id] = record
+            self._atomic_write(path, all_records)
+            return None
+
+    def get_request(
+        self, wallet_id: str, signing_request_id: str
+    ) -> Optional[dict]:
+        """返回某条签名请求审批单，不存在返回 None。"""
+        _check_id("signing_request_id", signing_request_id)
+        all_records = self._read_json(self._requests_path(wallet_id))
+        if not all_records:
+            return None
+        return all_records.get(signing_request_id)
+
+    def update_request(
+        self, wallet_id: str, signing_request_id: str, record: dict
+    ) -> None:
+        """原子地覆盖一条已存在的签名请求审批单（状态机推进用）。"""
+        _check_id("signing_request_id", signing_request_id)
+        path = self._requests_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            all_records[signing_request_id] = record
+            self._atomic_write(path, all_records)

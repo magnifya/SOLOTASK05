@@ -1,9 +1,14 @@
 """HTTP 服务层：标准库 http.server，无第三方 Web 框架依赖。
 
 路由：
-- POST /v1/wallets                       建钱包
-- POST /v1/wallets/<wallet_id>/sign      提交两份额签名
-- GET  /v1/wallets/<wallet_id>           查询钱包
+- POST /v1/wallets                                  建钱包
+- GET  /v1/wallets/<wallet_id>                      查询钱包
+- PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
+- POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
+- POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
+- GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
+- POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
+- POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -71,12 +76,21 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
             path = urlparse(self.path).path
-            wallet_id = self._match_wallet(path)
-            if wallet_id is None:
-                self._send_error(404, "not found")
-                return
             try:
-                self._send_json(200, service.get_wallet(wallet_id))
+                matched = self._split_wallet_path(path)
+                if matched is None:
+                    self._send_error(404, "not found")
+                    return
+                wallet_id, rest = matched
+                if not rest:
+                    self._send_json(200, service.get_wallet(wallet_id))
+                    return
+                if len(rest) == 2 and rest[0] == "sign-requests":
+                    self._send_json(
+                        200, service.get_sign_request(wallet_id, rest[1])
+                    )
+                    return
+                self._send_error(404, "not found")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
 
@@ -91,8 +105,13 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(201, result)
                     return
 
-                wallet_id = self._match_wallet_sign(path)
-                if wallet_id is not None:
+                matched = self._split_wallet_path(path)
+                if matched is None:
+                    self._send_error(404, "not found")
+                    return
+                wallet_id, rest = matched
+
+                if rest == ["sign"]:
                     body = self._read_json_body()
                     status, result = service.sign(
                         wallet_id,
@@ -103,6 +122,54 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(status, result)
                     return
 
+                if rest == ["sign-requests"]:
+                    body = self._read_json_body()
+                    request_id = body.get("id")
+                    if request_id is None:
+                        request_id = body.get("signing_request_id")
+                    status, result = service.create_sign_request(
+                        wallet_id, request_id, body.get("message")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "sign-requests"
+                    and rest[2] in ("approve", "reject")
+                ):
+                    body = self._read_json_body()
+                    decide = (
+                        service.approve if rest[2] == "approve" else service.reject
+                    )
+                    result = decide(
+                        wallet_id,
+                        rest[1],
+                        body.get("approver_id"),
+                        body.get("reason"),
+                    )
+                    self._send_json(200, result)
+                    return
+
+                self._send_error(404, "not found")
+            except ServiceError as exc:
+                self._send_error(exc.status, exc.message)
+
+        def do_PUT(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            try:
+                matched = self._split_wallet_path(path)
+                if matched is not None:
+                    wallet_id, rest = matched
+                    if rest == ["approval-policy"]:
+                        body = self._read_json_body()
+                        result = service.put_policy(
+                            wallet_id,
+                            body.get("required_approvals"),
+                            body.get("timeout_seconds"),
+                        )
+                        self._send_json(200, result)
+                        return
                 self._send_error(404, "not found")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
@@ -110,25 +177,14 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
         # ---- 路径匹配 ---------------------------------------------------
 
         @staticmethod
-        def _match_wallet(path: str):
-            """/v1/wallets/<wallet_id> -> wallet_id，否则 None。"""
+        def _split_wallet_path(path: str):
+            """/v1/wallets/<wallet_id>/<rest...> -> (wallet_id, rest)，否则 None。"""
             if not path.startswith(_WALLETS_PREFIX):
                 return None
-            tail = path[len(_WALLETS_PREFIX):]
-            if tail and "/" not in tail:
-                return tail
-            return None
-
-        @staticmethod
-        def _match_wallet_sign(path: str):
-            """/v1/wallets/<wallet_id>/sign -> wallet_id，否则 None。"""
-            if not path.startswith(_WALLETS_PREFIX):
+            parts = path[len(_WALLETS_PREFIX):].split("/")
+            if not parts[0]:
                 return None
-            tail = path[len(_WALLETS_PREFIX):]
-            wallet_id, sep, suffix = tail.partition("/")
-            if wallet_id and sep and suffix == "sign":
-                return wallet_id
-            return None
+            return parts[0], parts[1:]
 
     return _Handler
 
