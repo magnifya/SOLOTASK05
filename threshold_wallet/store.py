@@ -6,6 +6,8 @@
     shares/<wallet_id>/<share_id>.json
                                     单个份额（份额私钥以 hex 保存），一份一个文件
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
+    policies/<wallet_id>.json       审批策略（required_approvals/timeout_seconds）
+    requests/<wallet_id>.json       该钱包所有签名审批请求（按 id 索引的字典）
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -17,6 +19,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -35,6 +38,11 @@ def _check_id(kind: str, value: str) -> None:
         raise ValueError(f"invalid {kind}: {value!r}")
 
 
+def validate_request_id(value: str) -> None:
+    """供 service 层在边界处校验签名请求 id（同时杜绝路径穿越）。"""
+    _check_id("signing_request_id", value)
+
+
 class DuplicateWalletError(Exception):
     """wallet_id 已存在。"""
 
@@ -47,9 +55,13 @@ class WalletStore:
         self._wallets_dir = os.path.join(data_dir, "wallets")
         self._shares_dir = os.path.join(data_dir, "shares")
         self._signatures_dir = os.path.join(data_dir, "signatures")
+        self._policies_dir = os.path.join(data_dir, "policies")
+        self._requests_dir = os.path.join(data_dir, "requests")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
+        os.makedirs(self._policies_dir, exist_ok=True)
+        os.makedirs(self._requests_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     # ---- 内部工具 -------------------------------------------------------
@@ -68,6 +80,14 @@ class WalletStore:
     def _signatures_path(self, wallet_id: str) -> str:
         _check_id("wallet_id", wallet_id)
         return os.path.join(self._signatures_dir, wallet_id + ".json")
+
+    def _policy_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._policies_dir, wallet_id + ".json")
+
+    def _requests_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._requests_dir, wallet_id + ".json")
 
     @staticmethod
     def _atomic_write(path: str, data: dict) -> None:
@@ -170,3 +190,66 @@ class WalletStore:
         if not all_records:
             return None
         return all_records.get(signing_request_id)
+
+    # ---- 审批策略 -------------------------------------------------------
+
+    def save_approval_policy(self, wallet_id: str, policy: dict) -> None:
+        """原子地（覆盖）写入钱包的审批策略。"""
+        path = self._policy_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, policy)
+
+    def get_approval_policy(self, wallet_id: str) -> Optional[dict]:
+        """返回审批策略，未设置返回 None。"""
+        return self._read_json(self._policy_path(wallet_id))
+
+    # ---- 签名审批请求 ---------------------------------------------------
+
+    def get_request_doc(self, wallet_id: str) -> Optional[dict]:
+        """返回该钱包全部签名审批请求（id -> record），从未创建返回 None。"""
+        return self._read_json(self._requests_path(wallet_id))
+
+    def create_sign_request(self, wallet_id: str, record: dict) -> str:
+        """在锁内创建签名审批请求。
+
+        返回：
+        - "created"  记录不存在，已写入；
+        - "same"     同 id 且 message 相同，不覆盖；
+        - "conflict" 同 id 但 message 不同，不覆盖。
+        """
+        request_id = record["id"]
+        _check_id("signing_request_id", request_id)
+        path = self._requests_path(wallet_id)
+        with self._lock:
+            doc = self._read_json(path) or {}
+            existing = doc.get(request_id)
+            if existing is not None:
+                return "same" if existing["message"] == record["message"] else "conflict"
+            doc[request_id] = record
+            self._atomic_write(path, doc)
+            return "created"
+
+    def update_sign_request(
+        self, wallet_id: str, request_id: str, mutate
+    ) -> Optional[dict]:
+        """在锁内读取请求、调用 mutate(record) 并仅在其返回新记录时原子写回。
+
+        mutate 返回 None 表示放弃更新（调用方据此返回 409）；返回 dict 表示
+        要持久化的新记录。返回的记录通过深拷贝隔离，避免调用方持有可变别名。
+        请求不存在返回 None。
+        """
+        _check_id("signing_request_id", request_id)
+        path = self._requests_path(wallet_id)
+        with self._lock:
+            doc = self._read_json(path)
+            if not doc:
+                return None
+            record = doc.get(request_id)
+            if record is None:
+                return None
+            updated = mutate(copy.deepcopy(record))
+            if updated is None:
+                return copy.deepcopy(record)
+            doc[request_id] = updated
+            self._atomic_write(path, doc)
+            return copy.deepcopy(updated)

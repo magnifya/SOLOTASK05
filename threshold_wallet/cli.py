@@ -1,9 +1,14 @@
 """命令行入口。
 
-与 HTTP 接口一一对应的三个客户端子命令（均打印单行 JSON）：
-- create  对应 POST /v1/wallets
-- sign    对应 POST /v1/wallets/<wallet_id>/sign
-- show    对应 GET  /v1/wallets/<wallet_id>
+与 HTTP 接口一一对应的客户端子命令（均打印单行 JSON）：
+- create          对应 POST /v1/wallets
+- sign            对应 POST /v1/wallets/<wallet_id>/sign
+- show            对应 GET  /v1/wallets/<wallet_id>
+- policy          对应 PUT  /v1/wallets/<wallet_id>/approval-policy
+- request-create  对应 POST /v1/wallets/<wallet_id>/sign-requests
+- request-show    对应 GET  /v1/wallets/<wallet_id>/sign-requests/<id>
+- approve         对应 POST .../sign-requests/<id>/approve
+- reject          对应 POST .../sign-requests/<id>/reject
 
 另有两个本地命令：
 - serve       启动 HTTP 服务
@@ -63,6 +68,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="查询钱包（GET /v1/wallets/{id}）")
     p_show.add_argument("--url", default=DEFAULT_URL)
     p_show.add_argument("--wallet-id", required=True)
+
+    # policy  <-> PUT /v1/wallets/{id}/approval-policy
+    p_policy = sub.add_parser(
+        "policy", help="设置审批策略（PUT .../approval-policy）"
+    )
+    p_policy.add_argument("--url", default=DEFAULT_URL)
+    p_policy.add_argument("--wallet-id", required=True)
+    p_policy.add_argument(
+        "--required-approvals", type=int, required=True, help="必须为 1 或 2"
+    )
+    p_policy.add_argument(
+        "--timeout-seconds", type=int, required=True, help="必须为正整数"
+    )
+
+    # request-create  <-> POST .../sign-requests
+    p_rc = sub.add_parser(
+        "request-create", help="创建签名审批请求（POST .../sign-requests）"
+    )
+    p_rc.add_argument("--url", default=DEFAULT_URL)
+    p_rc.add_argument("--wallet-id", required=True)
+    p_rc.add_argument("--id", required=True, dest="request_id")
+    p_rc.add_argument("--message", required=True)
+
+    # request-show  <-> GET .../sign-requests/{id}
+    p_rs = sub.add_parser(
+        "request-show", help="查询签名审批请求（GET .../sign-requests/{id}）"
+    )
+    p_rs.add_argument("--url", default=DEFAULT_URL)
+    p_rs.add_argument("--wallet-id", required=True)
+    p_rs.add_argument("--id", required=True, dest="request_id")
+
+    # approve / reject  <-> POST .../sign-requests/{id}/approve|reject
+    for action in ("approve", "reject"):
+        p_a = sub.add_parser(action, help=f"{action} 一条签名审批请求")
+        p_a.add_argument("--url", default=DEFAULT_URL)
+        p_a.add_argument("--wallet-id", required=True)
+        p_a.add_argument("--id", required=True, dest="request_id")
+        p_a.add_argument("--approver-id", required=True)
+        p_a.add_argument("--reason", default=None)
 
     # sign  <-> POST /v1/wallets/{id}/sign
     p_sign = sub.add_parser("sign", help="提交两份份额签名（POST .../sign）")
@@ -163,6 +207,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "show":
             status, body = _http_request(
                 "GET", f"{args.url}/v1/wallets/{args.wallet_id}", None
+            )
+
+        elif args.command == "policy":
+            status, body = _http_request(
+                "PUT",
+                f"{args.url}/v1/wallets/{args.wallet_id}/approval-policy",
+                {
+                    "required_approvals": args.required_approvals,
+                    "timeout_seconds": args.timeout_seconds,
+                },
+            )
+
+        elif args.command == "request-create":
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}/sign-requests",
+                {"id": args.request_id, "message": args.message},
+            )
+
+        elif args.command == "request-show":
+            status, body = _http_request(
+                "GET",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/sign-requests/{args.request_id}",
+                None,
+            )
+
+        elif args.command in ("approve", "reject"):
+            payload: dict = {"approver_id": args.approver_id}
+            if args.reason is not None:
+                payload["reason"] = args.reason
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/sign-requests/{args.request_id}/{args.command}",
+                payload,
             )
 
         elif args.command == "sign":
