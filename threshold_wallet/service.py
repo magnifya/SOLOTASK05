@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from . import audit, crypto
@@ -62,18 +64,32 @@ class WalletService:
         # 启动恢复：崩溃时停留在 activating 的轮换先回滚为 prepared，
         # 已完成激活残留的暂存目录一并清理，然后才对外服务。
         self._store.recover_incomplete_activations()
-        # 每钱包一把事务锁：串行化同一钱包的"状态变更 + 审计事件"，
-        # ThreadingHTTPServer 并发下保证状态与事件原子、懒过期只记一次。
+        # 每钱包一把进程内线程锁（跨进程部分由 store.wallet_lock 的
+        # flock 文件锁承担）：串行化同一钱包的"状态变更 + 审计事件"，
+        # 保证状态与事件原子、懒过期只记一次。
         self._wallet_locks: dict[str, threading.Lock] = {}
         self._wallet_locks_guard = threading.Lock()
 
-    def _wallet_lock(self, wallet_id: str) -> threading.Lock:
+    def _thread_lock(self, wallet_id: str) -> threading.Lock:
         with self._wallet_locks_guard:
             lock = self._wallet_locks.get(wallet_id)
             if lock is None:
                 lock = threading.Lock()
                 self._wallet_locks[wallet_id] = lock
             return lock
+
+    @contextmanager
+    def _wallet_lock(self, wallet_id: str) -> Iterator[None]:
+        """每钱包事务锁 = 进程内线程锁 + 跨进程 flock 文件锁。
+
+        多个服务进程可共用同一 data-dir：同一钱包的状态变更与审计
+        追加在跨进程可见的互斥下串行，激活与签名交错时只有一个首次
+        提交。flock 绑定在文件描述上，进程异常退出由内核自动释放，
+        不会被陈旧锁阻塞。
+        """
+        with self._thread_lock(wallet_id):
+            with self._store.wallet_lock(wallet_id):
+                yield
 
     @staticmethod
     def _audit_event(
@@ -108,9 +124,12 @@ class WalletService:
             raise ServiceError(400, "shares must equal 2")
         try:
             share_keys = [crypto.generate_share_key(sid) for sid in SHARE_IDS]
-            self._store.create_wallet(
-                wallet_id, share_keys, _utc_now_iso()
-            )
+            # 跨进程互斥：两个进程并发建同 id 钱包时只有一个成功，
+            # 另一个得到 409，份额文件不会被覆盖
+            with self._wallet_lock(wallet_id):
+                self._store.create_wallet(
+                    wallet_id, share_keys, _utc_now_iso()
+                )
         except DuplicateWalletError:
             raise ServiceError(409, f"wallet {wallet_id!r} already exists")
         except ValueError:

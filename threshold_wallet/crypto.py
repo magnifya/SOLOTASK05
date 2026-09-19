@@ -55,6 +55,13 @@ def sign_share(private_bytes: bytes, payload: bytes) -> bytes:
     return private_key.sign(payload)
 
 
+def public_key_from_private(private_bytes: bytes) -> bytes:
+    """从 32 字节份额私钥推导对应的 Ed25519 公钥（残留文件校验用）。"""
+    return Ed25519PrivateKey.from_private_bytes(private_bytes).public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+
+
 def verify_share(public_bytes: bytes, payload: bytes, signature: bytes) -> bool:
     """校验一个份额的 Ed25519 签名；任何异常都视为校验失败。"""
     try:

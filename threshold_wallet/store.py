@@ -15,6 +15,8 @@
                                     激活成功后整目录删除
     audit/<wallet_id>.json          该钱包的审计事件日志（seq 从 1 起仅追加，
                                     由 audit.AuditStore 维护）
+    locks/<sha256(wallet_id)>.lock  每钱包跨进程事务锁文件（flock，进程退出
+                                    自动释放，由 locks.WalletLockManager 维护）
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -32,9 +34,11 @@ import re
 import shutil
 import tempfile
 import threading
+from contextlib import AbstractContextManager
 from typing import Optional
 
-from .crypto import ShareKey
+from .crypto import ShareKey, public_key_from_private
+from .locks import WalletLockManager
 
 #: wallet_id / rotation_id / signing_request_id 允许的字符（同时杜绝路径穿越）
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -69,6 +73,7 @@ class WalletStore:
         self._requests_dir = os.path.join(data_dir, "requests")
         self._rotations_dir = os.path.join(data_dir, "rotations")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
+        self._locks_dir = os.path.join(data_dir, "locks")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -77,10 +82,21 @@ class WalletStore:
         os.makedirs(self._rotations_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
         self._lock = threading.Lock()
+        self._lock_manager = WalletLockManager(self._locks_dir)
 
     @property
     def data_dir(self) -> str:
         return self._data_dir
+
+    def wallet_lock(self, wallet_id: str) -> AbstractContextManager[None]:
+        """该钱包的跨进程排他事务锁（flock；进程死亡自动释放，无陈旧锁）。
+
+        多个服务进程共用同一 data-dir 时，同一钱包的"状态变更 + 审计
+        事件追加"必须在此锁内完成。wallet_id 先经安全校验，与存储路径
+        使用同一规则，拒绝非法 id。
+        """
+        _check_id("wallet_id", wallet_id)
+        return self._lock_manager.hold(wallet_id)
 
     # ---- 内部工具 -------------------------------------------------------
 
@@ -541,27 +557,189 @@ class WalletStore:
                 self.delete_share(wallet_id, share_id)
 
     def recover_incomplete_activations(self) -> None:
-        """启动恢复：把崩溃时停留在 activating 的轮换回滚为 prepared，
-        并清理已完成激活残留的暂存目录。逐个钱包尽力而为。"""
+        """启动恢复（幂等、不产生任何审计事件）。逐个钱包尽力而为：
+
+        1. ``activating``：用备份恢复原钱包元数据与旧份额、删除已换入的
+           新份额，记录回滚为 ``prepared``，再按 prepared 规则校验；
+        2. ``active``：激活已提交，清理残留的暂存目录与备份；
+        3. ``prepared``：仅当目录名与 rotation_id 一致、目录内恰有记录中
+           两个 share_ids 的文件、JSON 可解析且 share_id、public_key、
+           32 字节私钥均匹配时保留；否则记录与暂存目录一并安全删除；
+        4. 未知状态的记录、没有有效 prepared 记录对应的暂存目录（孤儿）
+           一律安全删除。
+
+        绝不改动在用钱包与其份额（除第 1 步按备份恢复），清理后不留
+        任何私钥副本。每钱包的恢复在该钱包的跨进程事务锁内进行，
+        与并行进程的轮换/签名操作互斥。
+        """
+        handled: set[str] = set()
         for wallet_id in self.list_rotation_wallet_ids():
-            for record in self.list_rotations(wallet_id):
-                rotation_id = record.get("rotation_id")
-                state = record.get("state")
-                if not isinstance(rotation_id, str):
-                    continue
-                try:
-                    if state == "activating":
-                        self.rollback_activation_files(wallet_id, record)
-                        restored = {
-                            key: value
-                            for key, value in record.items()
-                            if key != "previous_public_key"
-                        }
-                        restored["state"] = "prepared"
-                        self.update_rotation(wallet_id, rotation_id, restored)
-                        self.delete_activation_backups(wallet_id, rotation_id)
-                    elif state == "active":
-                        # 崩溃发生在激活提交之后、暂存清理之前
+            handled.add(wallet_id)
+            try:
+                with self.wallet_lock(wallet_id):
+                    self._recover_wallet_rotations(wallet_id)
+            except (ValueError, OSError):
+                continue
+        # 没有轮换记录文件的钱包：其暂存目录整体为孤儿，安全删除
+        for wallet_id in self._list_staging_wallet_ids():
+            if wallet_id in handled:
+                continue
+            try:
+                with self.wallet_lock(wallet_id):
+                    shutil.rmtree(
+                        os.path.join(self._rotation_staging_dir, wallet_id),
+                        ignore_errors=True,
+                    )
+            except (ValueError, OSError):
+                continue
+
+    def _list_staging_wallet_ids(self) -> list[str]:
+        """返回 rotation-staging 下全部安全的 wallet_id 目录名。"""
+        try:
+            names = os.listdir(self._rotation_staging_dir)
+        except FileNotFoundError:
+            return []
+        result = []
+        for name in sorted(names):
+            if not _SAFE_ID.match(name):
+                continue
+            if os.path.isdir(os.path.join(self._rotation_staging_dir, name)):
+                result.append(name)
+        return result
+
+    def _recover_wallet_rotations(self, wallet_id: str) -> None:
+        """单个钱包的轮换恢复（调用方须持有该钱包跨进程事务锁）。"""
+        keep_staging: set[str] = set()
+        for record in self.list_rotations(wallet_id):
+            rotation_id = record.get("rotation_id")
+            state = record.get("state")
+            if not isinstance(rotation_id, str) or not _SAFE_ID.match(
+                rotation_id
+            ):
+                # 无法安全定位暂存目录的损坏记录：保持原样（不可激活、
+                # 不可查询，inert），绝不做任何猜测性删除
+                continue
+            try:
+                if state == "activating":
+                    # 崩溃发生在激活中途：恢复原钱包、旧份额与 prepared
+                    self.rollback_activation_files(wallet_id, record)
+                    restored = {
+                        key: value
+                        for key, value in record.items()
+                        if key != "previous_public_key"
+                    }
+                    restored["state"] = "prepared"
+                    self.update_rotation(wallet_id, rotation_id, restored)
+                    self.delete_activation_backups(wallet_id, rotation_id)
+                    record = restored
+                    state = "prepared"
+                if state == "prepared":
+                    if self._is_valid_prepared_staging(wallet_id, record):
+                        keep_staging.add(rotation_id)
+                    else:
+                        # 无效 prepared：记录与暂存一并安全删除，
+                        # 在用钱包与份额不受影响
+                        self.delete_rotation(wallet_id, rotation_id)
                         self.delete_staging(wallet_id, rotation_id)
-                except (ValueError, OSError):
-                    continue
+                elif state == "active":
+                    # 崩溃发生在激活提交之后、暂存清理之前
+                    self.delete_staging(wallet_id, rotation_id)
+                elif state != "activating":
+                    # 未知状态：记录不可信，安全删除（不触碰在用钱包）
+                    self.delete_rotation(wallet_id, rotation_id)
+                    self.delete_staging(wallet_id, rotation_id)
+            except (ValueError, OSError):
+                continue
+        # 孤儿暂存目录：没有有效 prepared 记录对应的目录一律删除
+        staging_root = os.path.join(self._rotation_staging_dir, wallet_id)
+        try:
+            names = os.listdir(staging_root)
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if not _SAFE_ID.match(name) or name in keep_staging:
+                continue
+            shutil.rmtree(
+                os.path.join(staging_root, name), ignore_errors=True
+            )
+        # 清理后空的钱包暂存根目录一并移除
+        try:
+            if not os.listdir(staging_root):
+                os.rmdir(staging_root)
+        except (FileNotFoundError, OSError):
+            pass
+
+    def _is_valid_prepared_staging(
+        self, wallet_id: str, record: dict
+    ) -> bool:
+        """prepared 记录 + 暂存目录的严格有效性判定。
+
+        全部满足才保留：目录名与 rotation_id 一致；目录内**恰好**有
+        记录中两个 share_ids 的 ``<share_id>.json`` 文件（无多无少）；
+        每个文件 JSON 可解析，share_id 与记录一致，private_key 为
+        32 字节且能推导出与文件 public_key 一致的公钥；两个份额公钥
+        按序拼接与记录的 public_key 一致。
+        """
+        rotation_id = record.get("rotation_id")
+        share_ids = record.get("share_ids")
+        public_key = record.get("public_key")
+        if not isinstance(rotation_id, str) or not _SAFE_ID.match(rotation_id):
+            return False
+        if (
+            not isinstance(share_ids, list)
+            or len(share_ids) != 2
+            or len(set(share_ids)) != 2
+            or any(
+                not isinstance(sid, str) or not _SAFE_SHARE_ID.match(sid)
+                for sid in share_ids
+            )
+        ):
+            return False
+        if not isinstance(public_key, str):
+            return False
+        try:
+            combined = bytes.fromhex(public_key)
+        except ValueError:
+            return False
+        if len(combined) != 64:
+            return False
+        staging = self._staging_dir(wallet_id, rotation_id)
+        if not os.path.isdir(staging):
+            return False
+        try:
+            names = os.listdir(staging)
+        except OSError:
+            return False
+        if set(names) != {sid + ".json" for sid in share_ids}:
+            return False
+        public_parts = []
+        for share_id in share_ids:
+            try:
+                staged = self._read_json(
+                    os.path.join(staging, share_id + ".json")
+                )
+            except (ValueError, OSError):
+                # JSON 不可解析 / 读取失败：一律判定无效
+                return False
+            if not isinstance(staged, dict):
+                return False
+            if staged.get("share_id") != share_id:
+                return False
+            pub_hex = staged.get("public_key")
+            priv_hex = staged.get("private_key")
+            if not isinstance(pub_hex, str) or not isinstance(priv_hex, str):
+                return False
+            try:
+                public_bytes = bytes.fromhex(pub_hex)
+                private_bytes = bytes.fromhex(priv_hex)
+            except ValueError:
+                return False
+            if len(public_bytes) != 32 or len(private_bytes) != 32:
+                return False
+            try:
+                if public_key_from_private(private_bytes) != public_bytes:
+                    return False
+            except ValueError:
+                return False
+            public_parts.append(public_bytes)
+        return b"".join(public_parts) == combined
