@@ -12,9 +12,11 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
-from . import crypto
+from . import audit, crypto
+from .audit import AuditStore
 from .store import DuplicateWalletError, WalletStore
 
 #: 两方门限：份额数固定为 2
@@ -52,6 +54,40 @@ class WalletService:
 
     def __init__(self, store: WalletStore) -> None:
         self._store = store
+        self._audit = AuditStore(store.data_dir)
+        # 每钱包一把事务锁：串行化同一钱包的"状态变更 + 审计事件"，
+        # ThreadingHTTPServer 并发下保证状态与事件原子、懒过期只记一次。
+        self._wallet_locks: dict[str, threading.Lock] = {}
+        self._wallet_locks_guard = threading.Lock()
+
+    def _wallet_lock(self, wallet_id: str) -> threading.Lock:
+        with self._wallet_locks_guard:
+            lock = self._wallet_locks.get(wallet_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._wallet_locks[wallet_id] = lock
+            return lock
+
+    @staticmethod
+    def _audit_event(
+        event_type: str,
+        request_id=None,
+        actor_id=None,
+        reason=None,
+        details=None,
+    ) -> dict:
+        """构造审计事件（seq 由 AuditStore 分配）。"""
+        return {
+            "type": event_type,
+            "at": _utc_now_iso(),
+            "request_id": request_id,
+            "actor_id": actor_id,
+            "reason": reason,
+            "details": details,
+        }
+
+    def _emit(self, wallet_id: str, event: dict) -> None:
+        self._audit.append_event(wallet_id, event)
 
     # ---- 建钱包 ---------------------------------------------------------
 
@@ -137,7 +173,28 @@ class WalletService:
             "required_approvals": required_approvals,
             "timeout_seconds": timeout_seconds,
         }
-        self._store.save_policy(wallet_id, policy)
+        # 同值更新也成功并记录（operation 区分首设/更新）
+        old_policy = self._store.get_policy(wallet_id)
+        operation = "created" if old_policy is None else "updated"
+        with self._wallet_lock(wallet_id):
+            self._store.save_policy(wallet_id, policy)
+            event = self._audit_event(
+                audit.TYPE_POLICY_UPDATED,
+                details={
+                    "required_approvals": required_approvals,
+                    "timeout_seconds": timeout_seconds,
+                    "operation": operation,
+                },
+            )
+            try:
+                self._emit(wallet_id, event)
+            except BaseException:
+                # 状态/事件原子：事件未落盘则回滚策略状态
+                if old_policy is None:
+                    self._store.delete_policy(wallet_id)
+                else:
+                    self._store.save_policy(wallet_id, old_policy)
+                raise
         return policy
 
     # ---- 签名请求审批单 ---------------------------------------------------
@@ -158,16 +215,43 @@ class WalletService:
         }
 
     def _expire_if_needed(self, wallet_id: str, record: dict) -> dict:
-        """懒过期：任何操作前把已超时的 pending 单持久化为 expired。"""
+        """懒过期：任何操作前把已超时的 pending 单持久化为 expired，
+        并原子记录一次 request_expired 事件。调用方须持有该钱包事务锁。
+        事件追加失败时回滚为原 pending 状态后向上抛出。"""
+        if record["state"] == "pending" and (
+            datetime.now(timezone.utc) >= _parse_iso(record["t1"])
+        ):
+            expired = dict(record)
+            expired["state"] = "expired"
+            self._store.update_request(wallet_id, record["id"], expired)
+            try:
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_REQUEST_EXPIRED,
+                        request_id=record["id"],
+                        details={"state": "expired"},
+                    ),
+                )
+            except BaseException:
+                self._store.update_request(wallet_id, record["id"], record)
+                raise
+            record = expired
+        return record
+
+    @staticmethod
+    def _expired_view(record: dict) -> dict:
+        """只读视角的过期判定：超时 pending 在返回视图里呈现为 expired，
+        但不落盘、不记事件（用于不触发懒过期的操作）。"""
         if record["state"] == "pending" and (
             datetime.now(timezone.utc) >= _parse_iso(record["t1"])
         ):
             record = dict(record)
             record["state"] = "expired"
-            self._store.update_request(wallet_id, record["id"], record)
         return record
 
-    def _get_request_or_404(self, wallet_id: str, request_id: str) -> dict:
+    def _fetch_request_or_404(self, wallet_id: str, request_id: str) -> dict:
+        """只读取审批单（404），不做懒过期；调用方自行在钱包事务锁内过期。"""
         try:
             record = self._store.get_request(wallet_id, request_id)
         except ValueError:
@@ -176,7 +260,7 @@ class WalletService:
             raise ServiceError(
                 404, f"signing request {request_id!r} not found"
             )
-        return self._expire_if_needed(wallet_id, record)
+        return record
 
     @staticmethod
     def _validate_request_body(request_id: object, message: object) -> None:
@@ -220,23 +304,86 @@ class WalletService:
             .replace("+00:00", "Z"),
             "reason": None,
         }
-        existing = self._store.create_request(wallet_id, request_id, record)
-        if existing is not None:
-            existing = self._expire_if_needed(wallet_id, existing)
-            if existing["message"] != message:
-                raise ServiceError(
-                    409,
-                    f"signing request {request_id!r} already exists "
-                    "with a different message",
-                )
-            # 同 id 同文：幂等重放
-            return 200, self._request_view(existing)
+        with self._wallet_lock(wallet_id):
+            existing = self._store.create_request(wallet_id, request_id, record)
+            if existing is not None:
+                # 重放（无论同文幂等还是异文 409）均不记事件；
+                # POST 重放不是懒过期触发点，只读呈现过期态。
+                existing = self._expired_view(existing)
+                if existing["message"] != message:
+                    raise ServiceError(
+                        409,
+                        f"signing request {request_id!r} already exists "
+                        "with a different message",
+                    )
+                # 同 id 同文：幂等重放
+                return 200, self._request_view(existing)
+            # 首次创建：状态 + C 事件原子
+            event = self._audit_event(
+                audit.TYPE_REQUEST_CREATED,
+                request_id=request_id,
+                details={"message": message},
+            )
+            try:
+                self._emit(wallet_id, event)
+            except BaseException:
+                self._store.delete_request(wallet_id, request_id)
+                raise
         return 201, self._request_view(record)
 
     def get_sign_request(self, wallet_id: str, request_id: str) -> dict:
         self._get_wallet_or_404(wallet_id)
-        record = self._get_request_or_404(wallet_id, request_id)
-        return self._request_view(record)
+        with self._wallet_lock(wallet_id):
+            record = self._fetch_request_or_404(wallet_id, request_id)
+            record = self._expire_if_needed(wallet_id, record)
+            return self._request_view(record)
+
+    # ---- 审计事件查询 ---------------------------------------------------
+
+    #: 审计事件查询每页上限与默认条数
+    AUDIT_DEFAULT_LIMIT = 1000
+    AUDIT_MAX_LIMIT = 1000
+
+    @staticmethod
+    def _parse_positive_int(value: object, name: str) -> int:
+        """from_seq/limit 必须是正整数（bool/浮点/带符号/缺失均拒绝）。"""
+        if isinstance(value, str):
+            text = value.strip()
+            if not text.isdigit():
+                raise ServiceError(400, f"{name} must be a positive integer")
+            value = int(text)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+        ):
+            raise ServiceError(400, f"{name} must be a positive integer")
+        return value
+
+    def get_audit_events(
+        self,
+        wallet_id: str,
+        from_seq: object = None,
+        limit: object = None,
+    ) -> dict:
+        """返回 {wallet_id, events}（seq 升序）。纯只读：不触发懒过期。"""
+        self._get_wallet_or_404(wallet_id)
+        seq = (
+            1
+            if from_seq is None
+            else self._parse_positive_int(from_seq, "from_seq")
+        )
+        size = (
+            self.AUDIT_DEFAULT_LIMIT
+            if limit is None
+            else self._parse_positive_int(limit, "limit")
+        )
+        if size > self.AUDIT_MAX_LIMIT:
+            raise ServiceError(
+                400, f"limit must be at most {self.AUDIT_MAX_LIMIT}"
+            )
+        events = self._audit.list_events(wallet_id, from_seq=seq, limit=size)
+        return {"wallet_id": wallet_id, "events": events}
 
     # ---- 批准 / 拒绝 -----------------------------------------------------
 
@@ -276,31 +423,71 @@ class WalletService:
         self._get_wallet_or_404(wallet_id)
         self._validate_approver_id(approver_id)
         self._validate_reason(reason)
-        record = self._get_request_or_404(wallet_id, request_id)
-        if record["state"] != "pending":
-            raise ServiceError(
-                409,
-                f"signing request {request_id!r} is {record['state']}, "
-                "not pending",
-            )
+        with self._wallet_lock(wallet_id):
+            record = self._fetch_request_or_404(wallet_id, request_id)
+            # 懒过期可能在此原子记一次 E；过期后操作落入终态分支（409、不记 A/R）
+            record = self._expire_if_needed(wallet_id, record)
+            if record["state"] != "pending":
+                raise ServiceError(
+                    409,
+                    f"signing request {request_id!r} is {record['state']}, "
+                    "not pending",
+                )
 
-        record = dict(record)
-        record["approvers"] = list(record["approvers"])
-        if action == "approve":
-            # 同一 approver 重复批准不计数，但仍返回 200
-            if approver_id not in record["approvers"]:
-                record["approvers"].append(approver_id)
+            if action == "approve":
+                # 同一 approver 重复批准不计数、不记事件（幂等 200）
+                if approver_id in record["approvers"]:
+                    return self._request_view(record)
+                new_record = dict(record)
+                new_record["approvers"] = list(record["approvers"])
+                new_record["approvers"].append(approver_id)
                 if reason is not None:
-                    record["reason"] = reason
-                if len(record["approvers"]) >= record["req"]:
-                    record["state"] = "approved"
-                self._store.update_request(wallet_id, request_id, record)
-        else:  # reject：任何一名审批人拒绝即终态
-            record["state"] = "rejected"
+                    new_record["reason"] = reason
+                reached = len(new_record["approvers"]) >= new_record["req"]
+                if reached:
+                    new_record["state"] = "approved"
+                self._store.update_request(wallet_id, request_id, new_record)
+                event = self._audit_event(
+                    audit.TYPE_REQUEST_APPROVED,
+                    request_id=request_id,
+                    actor_id=approver_id,
+                    reason=reason,
+                    details={
+                        "count": len(new_record["approvers"]),
+                        "req": new_record["req"],
+                        "state": new_record["state"],
+                    },
+                )
+                try:
+                    self._emit(wallet_id, event)
+                except BaseException:
+                    self._store.update_request(wallet_id, request_id, record)
+                    raise
+                return self._request_view(new_record)
+
+            # reject：任何一名审批人拒绝即终态（首批）
+            new_record = dict(record)
+            new_record["state"] = "rejected"
             if reason is not None:
-                record["reason"] = reason
-            self._store.update_request(wallet_id, request_id, record)
-        return self._request_view(record)
+                new_record["reason"] = reason
+            self._store.update_request(wallet_id, request_id, new_record)
+            event = self._audit_event(
+                audit.TYPE_REQUEST_REJECTED,
+                request_id=request_id,
+                actor_id=approver_id,
+                reason=reason,
+                details={
+                    "count": len(new_record["approvers"]),
+                    "req": new_record["req"],
+                    "state": "rejected",
+                },
+            )
+            try:
+                self._emit(wallet_id, event)
+            except BaseException:
+                self._store.update_request(wallet_id, request_id, record)
+                raise
+            return self._request_view(new_record)
 
     def approve(
         self,
@@ -351,30 +538,14 @@ class WalletService:
                 400, f"exactly {REQUIRED_SHARES} share signatures are required"
             )
 
-        # 幂等：同一 signing_request_id 重放直接返回已有签名，不再校验
+        # 幂等：同一 signing_request_id 重放直接返回已有签名，
+        # 不校验、不触发过期、不记任何事件
         try:
             existing = self._store.get_signature(wallet_id, signing_request_id)
         except ValueError:
             raise ServiceError(400, "invalid signing_request_id")
         if existing is not None:
             return 200, {"signature": existing["signature"]}
-
-        # 启用审批策略时：必须存在同 id、同 message 且已 approved 的审批单
-        approval_record = None
-        if self._store.get_policy(wallet_id) is not None:
-            approval_record = self._get_request_or_404(
-                wallet_id, signing_request_id
-            )
-            if approval_record["message"] != message:
-                raise ServiceError(
-                    409, "message does not match the signing request"
-                )
-            if approval_record["state"] != "approved":
-                raise ServiceError(
-                    409,
-                    f"signing request {signing_request_id!r} is "
-                    f"{approval_record['state']}, not approved",
-                )
 
         share_pub = {s["share_id"]: s["public_key"] for s in wallet["shares"]}
         submitted: dict[str, bytes] = {}
@@ -415,17 +586,62 @@ class WalletService:
             [verified[sid] for sid in SHARE_IDS]
         )
         record = {"message": message, "signature": aggregate.hex()}
-        existing = self._store.save_signature(
-            wallet_id, signing_request_id, record
-        )
-        if existing is not None:
-            # 重复提交：幂等返回已有签名
-            return 200, {"signature": existing["signature"]}
-        if approval_record is not None:
-            # 审批单推进到终态 signed
-            approval_record = dict(approval_record)
-            approval_record["state"] = "signed"
-            self._store.update_request(
-                wallet_id, signing_request_id, approval_record
+
+        with self._wallet_lock(wallet_id):
+            # 锁内二次查重：并发下可能已有首签提交（重放，无事件）
+            existing = self._store.get_signature(wallet_id, signing_request_id)
+            if existing is not None:
+                return 200, {"signature": existing["signature"]}
+
+            # 启用审批策略时：必须存在同 id、同 message 且已 approved 的审批单。
+            # 这一步可能原子地把超时 pending 单记一次 E 并转为 expired。
+            approval_record = None
+            if self._store.get_policy(wallet_id) is not None:
+                approval_record = self._fetch_request_or_404(
+                    wallet_id, signing_request_id
+                )
+                approval_record = self._expire_if_needed(
+                    wallet_id, approval_record
+                )
+                if approval_record["message"] != message:
+                    raise ServiceError(
+                        409, "message does not match the signing request"
+                    )
+                if approval_record["state"] != "approved":
+                    raise ServiceError(
+                        409,
+                        f"signing request {signing_request_id!r} is "
+                        f"{approval_record['state']}, not approved",
+                    )
+
+            existing = self._store.save_signature(
+                wallet_id, signing_request_id, record
             )
+            if existing is not None:
+                # 重复提交：幂等返回已有签名（无事件）
+                return 200, {"signature": existing["signature"]}
+
+            if approval_record is not None:
+                # 审批单推进到终态 signed
+                signed_record = dict(approval_record)
+                signed_record["state"] = "signed"
+                self._store.update_request(
+                    wallet_id, signing_request_id, signed_record
+                )
+
+            event = self._audit_event(
+                audit.TYPE_REQUEST_SIGNED,
+                request_id=signing_request_id,
+                details={"message": message, "state": "signed"},
+            )
+            try:
+                self._emit(wallet_id, event)
+            except BaseException:
+                # 状态/事件原子：撤回签名与审批单终态推进
+                self._store.delete_signature(wallet_id, signing_request_id)
+                if approval_record is not None:
+                    self._store.update_request(
+                        wallet_id, signing_request_id, approval_record
+                    )
+                raise
         return 201, {"signature": aggregate.hex()}

@@ -8,6 +8,8 @@
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
     policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
     requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
+    audit/<wallet_id>.json          该钱包的审计事件日志（seq 从 1 起仅追加，
+                                    由 audit.AuditStore 维护）
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -57,6 +59,10 @@ class WalletStore:
         os.makedirs(self._policies_dir, exist_ok=True)
         os.makedirs(self._requests_dir, exist_ok=True)
         self._lock = threading.Lock()
+
+    @property
+    def data_dir(self) -> str:
+        return self._data_dir
 
     # ---- 内部工具 -------------------------------------------------------
 
@@ -238,3 +244,48 @@ class WalletStore:
             all_records = self._read_json(path) or {}
             all_records[signing_request_id] = record
             self._atomic_write(path, all_records)
+
+    # ---- 回滚（状态/事件原子性用）----------------------------------------
+
+    def delete_policy(self, wallet_id: str) -> None:
+        """删除钱包的审批策略文件（策略事件追加失败时回滚用）。"""
+        path = self._policy_path(wallet_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def delete_request(self, wallet_id: str, signing_request_id: str) -> None:
+        """删除一条签名请求审批单（创建事件追加失败时回滚用）。"""
+        _check_id("signing_request_id", signing_request_id)
+        path = self._requests_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or signing_request_id not in all_records:
+                return
+            del all_records[signing_request_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    def delete_signature(self, wallet_id: str, signing_request_id: str) -> None:
+        """删除一条已完成签名记录（签名事件追加失败时回滚用）。"""
+        _check_id("signing_request_id", signing_request_id)
+        path = self._signatures_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or signing_request_id not in all_records:
+                return
+            del all_records[signing_request_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass

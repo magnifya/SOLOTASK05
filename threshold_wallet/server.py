@@ -7,6 +7,7 @@
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
+- GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
 
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .service import ServiceError, WalletService
 
@@ -75,7 +76,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
         # ---- 路由 -------------------------------------------------------
 
         def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
             try:
                 matched = self._split_wallet_path(path)
                 if matched is None:
@@ -88,6 +91,16 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if len(rest) == 2 and rest[0] == "sign-requests":
                     self._send_json(
                         200, service.get_sign_request(wallet_id, rest[1])
+                    )
+                    return
+                if rest == ["audit-events"]:
+                    self._send_json(
+                        200,
+                        service.get_audit_events(
+                            wallet_id,
+                            from_seq=query.get("from_seq", [None])[0],
+                            limit=query.get("limit", [None])[0],
+                        ),
                     )
                     return
                 self._send_error(404, "not found")

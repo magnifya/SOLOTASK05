@@ -25,6 +25,7 @@
 | GET  | `/v1/wallets/{wallet_id}/sign-requests/{id}` | 查询审批单 |
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/approve` | 批准 `{"approver_id", "reason"?}` |
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/reject` | 拒绝 `{"approver_id", "reason"?}` |
+| GET  | `/v1/wallets/{wallet_id}/audit-events` | 查询审计事件（seq 升序，分页 `from_seq`/`limit`） |
 | POST | `/v1/wallets/{wallet_id}/sign` | 提交两份份额签名，返回聚合 `signature` |
 
 状态码：
@@ -55,6 +56,35 @@
 - 设置策略后，`POST /sign` 要求存在同 id、同 message 且已 `approved`
   的审批单，两份额签名齐备返回 `201` 并把审批单推进为 `signed`；
   未设策略时行为不变（首签 `201`，重放 `200`）。
+
+## 审计事件
+
+`GET /v1/wallets/{wallet_id}/audit-events` 返回
+`{"wallet_id": ..., "events": [...]}`，事件按 `seq` **升序**。
+查询参数 `from_seq`、`limit` 均为正整数，默认 `1` / `1000`，
+`limit` 上限 `1000`；非法（0、负数、小数、非数字、超限）返回 `400`，
+钱包不存在返回 `404`。审计查询是纯只读，**不触发** pending 懒过期。
+
+每条事件字段为
+`seq, type, at, request_id, actor_id, reason, details`，
+`at` 为 UTC（`...Z`），不适用的字段取 `null`。`seq` 从 1 起、
+落盘后单调递增；服务重启后续写，接续文件中已有最大 seq。
+
+| 类型 | 何时记录 | request_id / actor_id / reason / details |
+| ---- | ---- | ---- |
+| `policy_updated` (P) | 策略设置成功，**同值更新也记** | rid/actor/reason 为 null；`d={required_approvals, timeout_seconds, operation: created\|updated}` |
+| `request_created` (C) | 审批单**首次创建** | `rid=id`，其余 null；`d={message}`。同 id 异文 `409`，重放不记 |
+| `request_approved` (A) | **首次**批准（同一 approver 重复批准不计数、不记） | `rid=id, a=approver_id, r=传入\|null`；`d={count, req, state}` |
+| `request_rejected` (R) | **首次**拒绝 | `rid=id, a=approver_id, r=传入\|null`；`d={count, req, state: rejected}` |
+| `request_expired` (E) | pending 单超时被懒过期 | `rid=id`，actor/reason 为 null；`d={state: expired}`。GET 审批单、approve、reject、sign 触发，每个单只记一次 |
+| `request_signed` (S) | **首次**签名成功 | `rid=id`，actor/reason 为 null；`d={message, state: signed}`。重放 `200` 不记 |
+
+对终态单（approved/rejected/expired/signed）再 approve/reject 返回 `409`
+且不记事件；签名重放、审批单创建重放均不产生事件。
+
+**状态/事件原子性**：状态变更与事件追加在每钱包事务锁内完成；
+若事件落盘失败，则回滚本次状态（删除新建策略/审批单/签名，或恢复
+更新前的旧值/原 pending 状态），保证状态与事件一致。
 
 ## 安装
 
