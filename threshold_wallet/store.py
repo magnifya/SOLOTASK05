@@ -34,7 +34,7 @@ import tempfile
 import threading
 from typing import Optional
 
-from .crypto import ShareKey
+from .crypto import ShareKey, combine_public_keys, public_key_from_private
 
 #: wallet_id / rotation_id / signing_request_id 允许的字符（同时杜绝路径穿越）
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -501,7 +501,7 @@ class WalletStore:
         with self._lock:
             shutil.rmtree(staging, ignore_errors=True)
 
-    # ---- 启动恢复：未完成的激活先回滚 --------------------------------------
+    # ---- 启动恢复：未完成的激活先回滚，轮换残留按有效性判定 --------------
 
     def list_rotation_wallet_ids(self) -> list[str]:
         """返回拥有轮换记录文件的全部 wallet_id。"""
@@ -512,6 +512,42 @@ class WalletStore:
         return sorted(
             name[: -len(".json")] for name in names if name.endswith(".json")
         )
+
+    def list_staging_wallet_ids(self) -> list[str]:
+        """返回轮换暂存根目录下出现过的全部 wallet_id（含无记录文件的）。"""
+        try:
+            names = os.listdir(self._rotation_staging_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name
+            for name in names
+            if os.path.isdir(os.path.join(self._rotation_staging_dir, name))
+        )
+
+    def list_staging_rotation_ids(self, wallet_id: str) -> list[str]:
+        """返回某钱包暂存目录下的全部 rotation_id 目录名。"""
+        _check_id("wallet_id", wallet_id)
+        base = os.path.join(self._rotation_staging_dir, wallet_id)
+        try:
+            names = os.listdir(base)
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+        return sorted(
+            name for name in names if os.path.isdir(os.path.join(base, name))
+        )
+
+    def list_rotation_entries(self, wallet_id: str) -> list[tuple[str, dict]]:
+        """返回 (记录键, 记录) 对；记录键即删除时使用的 rotation_id。"""
+        _check_id("wallet_id", wallet_id)
+        all_records = self._read_json(self._rotations_path(wallet_id))
+        if not isinstance(all_records, dict):
+            return []
+        return [
+            (key, record)
+            for key, record in all_records.items()
+            if isinstance(key, str) and isinstance(record, dict)
+        ]
 
     def rollback_activation_files(
         self, wallet_id: str, rotation_record: dict
@@ -540,28 +576,155 @@ class WalletStore:
             if isinstance(share_id, str):
                 self.delete_share(wallet_id, share_id)
 
-    def recover_incomplete_activations(self) -> None:
-        """启动恢复：把崩溃时停留在 activating 的轮换回滚为 prepared，
-        并清理已完成激活残留的暂存目录。逐个钱包尽力而为。"""
-        for wallet_id in self.list_rotation_wallet_ids():
-            for record in self.list_rotations(wallet_id):
-                rotation_id = record.get("rotation_id")
-                state = record.get("state")
-                if not isinstance(rotation_id, str):
-                    continue
-                try:
-                    if state == "activating":
-                        self.rollback_activation_files(wallet_id, record)
-                        restored = {
-                            key: value
-                            for key, value in record.items()
-                            if key != "previous_public_key"
-                        }
-                        restored["state"] = "prepared"
-                        self.update_rotation(wallet_id, rotation_id, restored)
-                        self.delete_activation_backups(wallet_id, rotation_id)
-                    elif state == "active":
-                        # 崩溃发生在激活提交之后、暂存清理之前
+    @staticmethod
+    def _rotation_record_shape_ok(record: dict) -> bool:
+        """轮换记录的基本形状校验（启动恢复判定"无效记录"用）。"""
+        rotation_id = record.get("rotation_id")
+        if not isinstance(rotation_id, str) or not _SAFE_ID.match(rotation_id):
+            return False
+        if record.get("state") not in ("prepared", "activating", "active"):
+            return False
+        share_ids = record.get("share_ids")
+        if (
+            not isinstance(share_ids, list)
+            or len(share_ids) != 2
+            or any(
+                not isinstance(sid, str) or not _SAFE_SHARE_ID.match(sid)
+                for sid in share_ids
+            )
+        ):
+            return False
+        public_key = record.get("public_key")
+        if not isinstance(public_key, str):
+            return False
+        try:
+            if len(bytes.fromhex(public_key)) != 64:
+                return False
+        except ValueError:
+            return False
+        return True
+
+    def _prepared_staging_valid(self, wallet_id: str, record: dict) -> bool:
+        """判定 prepared 轮换的暂存目录是否完整有效。
+
+        仅当全部满足时保留：目录名与 rotation_id 一致（由路径构造保证）、
+        目录内恰有记录中两个 share_ids 对应的份额文件（无多无缺）、每个
+        文件 JSON 可解析、share_id 与记录一致、public_key 恰为 32 字节、
+        私钥恰为 32 字节且能推导出该 public_key、两个份额公钥按序拼接
+        等于记录中的钱包 public_key。
+        """
+        rotation_id = record["rotation_id"]
+        share_ids = list(record["share_ids"])
+        staging = self._staging_dir(wallet_id, rotation_id)
+        try:
+            names = set(os.listdir(staging))
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        if names != {sid + ".json" for sid in share_ids}:
+            return False
+        share_public_keys: list[bytes] = []
+        for share_id in share_ids:
+            try:
+                data = self._read_json(
+                    os.path.join(staging, share_id + ".json")
+                )
+            except (ValueError, OSError):
+                # JSON 不可解析 / 读取失败
+                return False
+            if not isinstance(data, dict) or data.get("share_id") != share_id:
+                return False
+            public_hex = data.get("public_key")
+            private_hex = data.get("private_key")
+            if not isinstance(public_hex, str) or not isinstance(
+                private_hex, str
+            ):
+                return False
+            try:
+                public_bytes = bytes.fromhex(public_hex)
+                private_bytes = bytes.fromhex(private_hex)
+            except ValueError:
+                return False
+            if len(public_bytes) != 32 or len(private_bytes) != 32:
+                return False
+            try:
+                if public_key_from_private(private_bytes) != public_bytes:
+                    return False
+            except ValueError:
+                return False
+            share_public_keys.append(public_bytes)
+        return (
+            combine_public_keys(share_public_keys).hex()
+            == record["public_key"]
+        )
+
+    def recover_wallet_rotation(self, wallet_id: str) -> None:
+        """按钱包恢复轮换现场（调用方须持有该钱包的跨进程事务锁）。
+
+        - activating：用备份回滚钱包元数据与旧份额、删除已换入的新份额，
+          状态恢复为 prepared，再按 prepared 规则校验暂存；
+        - active：激活已提交，删除残留的暂存与备份；
+        - prepared：暂存校验通过才保留，否则安全删除记录与暂存目录；
+        - 无效记录：安全删除记录及其暂存目录；
+        - 孤儿暂存目录（无对应有效 prepared 记录）：安全删除。
+        全程不触碰在用钱包的份额文件与元数据（activating 回滚除外），
+        被删除的暂存私钥不留任何副本，也不产生审计事件。
+        """
+        _check_id("wallet_id", wallet_id)
+        kept_prepared: set[str] = set()
+        for key, record in self.list_rotation_entries(wallet_id):
+            rotation_id = record.get("rotation_id")
+            try:
+                if not self._rotation_record_shape_ok(record):
+                    # 无效记录：连记录带暂存一起安全删除
+                    self.delete_rotation(wallet_id, key)
+                    if isinstance(rotation_id, str) and _SAFE_ID.match(
+                        rotation_id
+                    ):
                         self.delete_staging(wallet_id, rotation_id)
-                except (ValueError, OSError):
                     continue
+                state = record["state"]
+                if state == "activating":
+                    self.rollback_activation_files(wallet_id, record)
+                    restored = {
+                        k: v
+                        for k, v in record.items()
+                        if k != "previous_public_key"
+                    }
+                    restored["state"] = "prepared"
+                    self.update_rotation(wallet_id, rotation_id, restored)
+                    self.delete_activation_backups(wallet_id, rotation_id)
+                    record = restored
+                    state = "prepared"
+                if state == "active":
+                    # 崩溃发生在激活提交之后、暂存清理之前
+                    self.delete_staging(wallet_id, rotation_id)
+                elif state == "prepared":
+                    if self._prepared_staging_valid(wallet_id, record):
+                        kept_prepared.add(rotation_id)
+                    else:
+                        # 暂存缺失/损坏/不匹配：记录与残留一起安全删除，
+                        # 绝不留下来路不明的私钥副本
+                        self.delete_rotation(wallet_id, rotation_id)
+                        self.delete_staging(wallet_id, rotation_id)
+            except (ValueError, OSError):
+                continue
+        # 孤儿暂存目录：没有对应有效 prepared 记录的一律安全删除
+        for rotation_id in self.list_staging_rotation_ids(wallet_id):
+            if rotation_id not in kept_prepared:
+                self.delete_staging(wallet_id, rotation_id)
+
+    def recover_incomplete_activations(self) -> None:
+        """启动恢复：逐个钱包回滚未完成激活、清理轮换残留，尽力而为。
+
+        注意：本方法不持跨进程锁；多进程共用 data-dir 时应使用
+        service 层的加锁编排（见 WalletService 启动恢复）。
+        """
+        wallet_ids = sorted(
+            set(self.list_rotation_wallet_ids())
+            | set(self.list_staging_wallet_ids())
+        )
+        for wallet_id in wallet_ids:
+            try:
+                self.recover_wallet_rotation(wallet_id)
+            except (ValueError, OSError):
+                continue

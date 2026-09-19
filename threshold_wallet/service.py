@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import audit, crypto
 from .audit import AuditStore
+from .flock import FileLock, wallet_lock_path
 from .store import DuplicateWalletError, WalletStore
 
 #: 两方门限：份额数固定为 2
@@ -53,27 +54,82 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+class _WalletTransactionLock:
+    """每钱包事务锁：进程内 threading.Lock + 跨进程文件锁的组合。
+
+    同一 data-dir 可被多个服务进程共用；状态变更与审计追加必须在这把
+    组合锁内完成，跨进程互斥由 flock 保证，进程异常退出后内核自动
+    释放文件锁，不会被陈旧锁阻塞。
+    """
+
+    def __init__(self, thread_lock: threading.Lock, file_lock: FileLock) -> None:
+        self._thread_lock = thread_lock
+        self._file_lock = file_lock
+
+    def __enter__(self) -> "_WalletTransactionLock":
+        self._thread_lock.acquire()
+        try:
+            self._file_lock.acquire()
+        except BaseException:
+            self._thread_lock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        try:
+            self._file_lock.release()
+        finally:
+            self._thread_lock.release()
+
+
 class WalletService:
     """建钱包、查询钱包、校验并聚合两份额签名。"""
 
     def __init__(self, store: WalletStore) -> None:
         self._store = store
         self._audit = AuditStore(store.data_dir)
-        # 启动恢复：崩溃时停留在 activating 的轮换先回滚为 prepared，
-        # 已完成激活残留的暂存目录一并清理，然后才对外服务。
-        self._store.recover_incomplete_activations()
         # 每钱包一把事务锁：串行化同一钱包的"状态变更 + 审计事件"，
         # ThreadingHTTPServer 并发下保证状态与事件原子、懒过期只记一次。
         self._wallet_locks: dict[str, threading.Lock] = {}
         self._wallet_locks_guard = threading.Lock()
+        # 启动恢复：崩溃时停留在 activating 的轮换先回滚为 prepared，
+        # 轮换残留按有效性判定保留或安全删除，然后才对外服务。
+        # 同一 data-dir 可能有另一存活进程正在服务，因此每个钱包的恢复
+        # 都在其跨进程事务锁内进行：对方在途的激活/签名提交完成后才
+        # 判定现场，对方已崩溃时 flock 自动释放、不会阻塞恢复。
+        self._recover_on_startup()
 
-    def _wallet_lock(self, wallet_id: str) -> threading.Lock:
+    def _thread_lock_for(self, wallet_id: str) -> threading.Lock:
         with self._wallet_locks_guard:
             lock = self._wallet_locks.get(wallet_id)
             if lock is None:
                 lock = threading.Lock()
                 self._wallet_locks[wallet_id] = lock
             return lock
+
+    def _wallet_lock(self, wallet_id: str) -> _WalletTransactionLock:
+        """返回该钱包的事务锁上下文管理器（进程内 + 跨进程）。
+
+        wallet_id 含非法字符时抛 ValueError（与存储层一致）。
+        """
+        return _WalletTransactionLock(
+            self._thread_lock_for(wallet_id),
+            FileLock(wallet_lock_path(self._store.data_dir, wallet_id)),
+        )
+
+    def _recover_on_startup(self) -> None:
+        """启动恢复编排：逐个钱包在其跨进程事务锁内恢复轮换现场。"""
+        wallet_ids = sorted(
+            set(self._store.list_rotation_wallet_ids())
+            | set(self._store.list_staging_wallet_ids())
+        )
+        for wallet_id in wallet_ids:
+            try:
+                with self._wallet_lock(wallet_id):
+                    self._store.recover_wallet_rotation(wallet_id)
+            except (ValueError, OSError):
+                # 单个钱包的恢复失败不影响其他钱包，尽力而为
+                continue
 
     @staticmethod
     def _audit_event(
@@ -108,9 +164,12 @@ class WalletService:
             raise ServiceError(400, "shares must equal 2")
         try:
             share_keys = [crypto.generate_share_key(sid) for sid in SHARE_IDS]
-            self._store.create_wallet(
-                wallet_id, share_keys, _utc_now_iso()
-            )
+            # 跨进程防重：同一 data-dir 上多个服务进程并发建同名钱包时，
+            # 只有一个能在事务锁内提交成功
+            with self._wallet_lock(wallet_id):
+                self._store.create_wallet(
+                    wallet_id, share_keys, _utc_now_iso()
+                )
         except DuplicateWalletError:
             raise ServiceError(409, f"wallet {wallet_id!r} already exists")
         except ValueError:
