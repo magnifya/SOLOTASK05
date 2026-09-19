@@ -239,17 +239,6 @@ class WalletService:
             record = expired
         return record
 
-    @staticmethod
-    def _expired_view(record: dict) -> dict:
-        """只读视角的过期判定：超时 pending 在返回视图里呈现为 expired，
-        但不落盘、不记事件（用于不触发懒过期的操作）。"""
-        if record["state"] == "pending" and (
-            datetime.now(timezone.utc) >= _parse_iso(record["t1"])
-        ):
-            record = dict(record)
-            record["state"] = "expired"
-        return record
-
     def _fetch_request_or_404(self, wallet_id: str, request_id: str) -> dict:
         """只读取审批单（404），不做懒过期；调用方自行在钱包事务锁内过期。"""
         try:
@@ -307,9 +296,8 @@ class WalletService:
         with self._wallet_lock(wallet_id):
             existing = self._store.create_request(wallet_id, request_id, record)
             if existing is not None:
-                # 重放（无论同文幂等还是异文 409）均不记事件；
-                # POST 重放不是懒过期触发点，只读呈现过期态。
-                existing = self._expired_view(existing)
+                # 重放（无论同文幂等还是异文 409）均不记事件、不改状态；
+                # POST 重放不是懒过期触发点，原样返回磁盘中的状态。
                 if existing["message"] != message:
                     raise ServiceError(
                         409,
@@ -614,34 +602,41 @@ class WalletService:
                         f"{approval_record['state']}, not approved",
                     )
 
-            existing = self._store.save_signature(
-                wallet_id, signing_request_id, record
-            )
-            if existing is not None:
-                # 重复提交：幂等返回已有签名（无事件）
-                return 200, {"signature": existing["signature"]}
-
-            if approval_record is not None:
-                # 审批单推进到终态 signed
-                signed_record = dict(approval_record)
-                signed_record["state"] = "signed"
-                self._store.update_request(
-                    wallet_id, signing_request_id, signed_record
-                )
-
-            event = self._audit_event(
-                audit.TYPE_REQUEST_SIGNED,
-                request_id=signing_request_id,
-                details={"message": message, "state": "signed"},
-            )
+            # 首签提交：签名记录、审批单 signed 终态、S 事件三步必须
+            # 一致提交；任一步失败则回滚前两步，不留半完成数据。
+            sig_saved = False
+            approval_advanced = False
             try:
+                existing = self._store.save_signature(
+                    wallet_id, signing_request_id, record
+                )
+                if existing is not None:
+                    # 重复提交：幂等返回已有签名（无事件）
+                    return 200, {"signature": existing["signature"]}
+                sig_saved = True
+
+                if approval_record is not None:
+                    # 审批单推进到终态 signed
+                    signed_record = dict(approval_record)
+                    signed_record["state"] = "signed"
+                    self._store.update_request(
+                        wallet_id, signing_request_id, signed_record
+                    )
+                    approval_advanced = True
+
+                event = self._audit_event(
+                    audit.TYPE_REQUEST_SIGNED,
+                    request_id=signing_request_id,
+                    details={"message": message, "state": "signed"},
+                )
                 self._emit(wallet_id, event)
             except BaseException:
-                # 状态/事件原子：撤回签名与审批单终态推进
-                self._store.delete_signature(wallet_id, signing_request_id)
-                if approval_record is not None:
+                # 状态/事件原子：撤回审批单终态推进与本次签名
+                if approval_advanced:
                     self._store.update_request(
                         wallet_id, signing_request_id, approval_record
                     )
+                if sig_saved:
+                    self._store.delete_signature(wallet_id, signing_request_id)
                 raise
         return 201, {"signature": aggregate.hex()}
