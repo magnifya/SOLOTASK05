@@ -27,6 +27,9 @@
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/reject` | 拒绝 `{"approver_id", "reason"?}` |
 | GET  | `/v1/wallets/{wallet_id}/audit-events` | 查询审计事件（seq 升序，分页 `from_seq`/`limit`） |
 | POST | `/v1/wallets/{wallet_id}/sign` | 提交两份份额签名，返回聚合 `signature` |
+| POST | `/v1/wallets/{wallet_id}/share-rotations` | 准备份额轮换 `{"rotation_id"}` |
+| GET  | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}` | 查询轮换状态 |
+| POST | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}/activate` | 激活轮换 |
 
 状态码：
 
@@ -81,6 +84,42 @@
 
 对终态单（approved/rejected/expired/signed）再 approve/reject 返回 `409`
 且不记事件；签名重放、审批单创建重放均不产生事件。
+
+## 份额轮换灾备
+
+`POST /v1/wallets/{wallet_id}/share-rotations` 准备一次份额轮换：
+
+- 请求体 `{"rotation_id"}`，`rotation_id` 必须匹配
+  `[A-Za-z0-9_-]{1,128}`，否则 `400`；钱包不存在 `404`。
+- 首次准备生成两份新份额，`share_ids` 为 `{rotation_id}-share-1` 与
+  `{rotation_id}-share-2`，新份额私钥只写入**暂存文件**
+  （`rotation-staging/<wallet_id>/<rotation_id>/`，一份一个文件），
+  在激活前绝不触碰在用份额与钱包元数据。成功 `201`，返回
+  `{rotation_id, state: prepared, share_ids, public_key}`。
+- 每钱包同时只允许一个 `prepared` 轮换，冲突 `409`；
+  同 `rotation_id` 重放返回 `200` 且不重新生成。
+- `GET .../share-rotations/{rotation_id}` 查询轮换（`200`），
+  未知轮换 `404`。
+- `POST .../share-rotations/{rotation_id}/activate` 仅 `prepared`
+  可激活：在每钱包事务锁内原子替换份额文件、钱包 `shares`/`public_key`
+  与轮换状态，成功 `201`（`state: active`）；`active` 重放 `200`；
+  其余状态 `409`。激活成功后删除暂存的新份额文件与备份。
+- **失败回滚**：激活任一环节失败，回滚份额文件、公钥与轮换状态并
+  清理备份；服务启动时先把崩溃残留的未完成激活（`activating`）
+  回滚为 `prepared`，轮换状态跨重启持久。
+- 激活后未首签的签名请求必须使用新 `share_ids`，旧份额提交返回
+  `400`；已首签的请求重放仍 `200`。
+
+轮换审计事件（七字段 `seq, type, at, request_id, actor_id, reason,
+details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
+
+| 类型 | 何时记录 | details |
+| ---- | ---- | ---- |
+| `share_rotation_prepared` | 轮换**首次准备** | `{rotation_id, share_ids, public_key}` |
+| `share_rotation_activated` | 轮换**首次激活** | `{rotation_id, share_ids, public_key, previous_public_key}` |
+
+`details` 只含标识与公钥，绝不含私钥；状态变更与事件追加在每钱包
+事务锁内原子完成，失败不产生事件或 seq 缺口；重放不重复记事件。
 
 **状态/事件原子性**：状态变更与事件追加在每钱包事务锁内完成；
 若事件落盘失败，则回滚本次状态（删除新建策略/审批单/签名，或恢复
@@ -152,6 +191,8 @@ python -m unittest discover -s tests -v
 
 - **响应**：建钱包只返回 `share_ids` 与公钥，任何接口都不返回私钥。
 - **磁盘**：钱包元数据文件不含任何私钥；两个份额私钥分文件存放
-  （`shares/<wallet_id>/<share_id>.json`），任何文件至多含一个份额私钥，
-  从不存在两者拼接后的完整私钥。写入采用临时文件 + 原子替换。
+  （`shares/<wallet_id>/<share_id>.json`），轮换准备期的新份额私钥
+  分文件暂存于 `rotation-staging/<wallet_id>/<rotation_id>/`，
+  任何文件至多含一个份额私钥，从不存在两者拼接后的完整私钥。
+  写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。

@@ -8,6 +8,11 @@
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
     policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
     requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
+    rotations/<wallet_id>.json      该钱包的份额轮换记录（prepared/activating/active）
+    rotation-staging/<wallet_id>/<rotation_id>/
+                                    轮换暂存目录：新份额私钥文件（<share_id>.json），
+                                    激活期间的旧份额/钱包元数据备份（*.bak.json），
+                                    激活成功后整目录删除
     audit/<wallet_id>.json          该钱包的审计事件日志（seq 从 1 起仅追加，
                                     由 audit.AuditStore 维护）
 
@@ -24,19 +29,28 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 from typing import Optional
 
 from .crypto import ShareKey
 
-#: wallet_id / share_id / signing_request_id 允许的字符（同时杜绝路径穿越）
+#: wallet_id / rotation_id / signing_request_id 允许的字符（同时杜绝路径穿越）
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+#: share_id 允许的字符：轮换份额 id 为 <rotation_id>-share-N，最长 128+8
+_SAFE_SHARE_ID = re.compile(r"^[A-Za-z0-9_-]{1,136}$")
 
 
 def _check_id(kind: str, value: str) -> None:
     if not isinstance(value, str) or not _SAFE_ID.match(value):
         raise ValueError(f"invalid {kind}: {value!r}")
+
+
+def _check_share_id(value: str) -> None:
+    if not isinstance(value, str) or not _SAFE_SHARE_ID.match(value):
+        raise ValueError(f"invalid share_id: {value!r}")
 
 
 class DuplicateWalletError(Exception):
@@ -53,11 +67,15 @@ class WalletStore:
         self._signatures_dir = os.path.join(data_dir, "signatures")
         self._policies_dir = os.path.join(data_dir, "policies")
         self._requests_dir = os.path.join(data_dir, "requests")
+        self._rotations_dir = os.path.join(data_dir, "rotations")
+        self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
         os.makedirs(self._policies_dir, exist_ok=True)
         os.makedirs(self._requests_dir, exist_ok=True)
+        os.makedirs(self._rotations_dir, exist_ok=True)
+        os.makedirs(self._rotation_staging_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -72,7 +90,7 @@ class WalletStore:
 
     def _share_path(self, wallet_id: str, share_id: str) -> str:
         _check_id("wallet_id", wallet_id)
-        _check_id("share_id", share_id)
+        _check_share_id(share_id)
         return os.path.join(
             self._shares_dir, wallet_id, share_id + ".json"
         )
@@ -289,3 +307,261 @@ class WalletStore:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
+
+    # ---- 份额文件与钱包元数据（轮换激活用）--------------------------------
+
+    def save_share(self, wallet_id: str, record: dict) -> None:
+        """原子地写入（或覆盖）一个份额文件（含该份额私钥 hex）。"""
+        path = self._share_path(wallet_id, record["share_id"])
+        with self._lock:
+            self._atomic_write(path, record)
+
+    def delete_share(self, wallet_id: str, share_id: str) -> None:
+        """删除一个份额文件（轮换激活换下旧份额 / 回滚清理新份额用）。"""
+        path = self._share_path(wallet_id, share_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def save_wallet_meta(self, wallet_id: str, meta: dict) -> None:
+        """原子地覆盖钱包元数据文件（无私钥；轮换激活/回滚用）。"""
+        path = self._wallet_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, meta)
+
+    # ---- 份额轮换记录 -----------------------------------------------------
+
+    def _rotations_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._rotations_dir, wallet_id + ".json")
+
+    def create_rotation(
+        self, wallet_id: str, rotation_id: str, record: dict
+    ) -> Optional[dict]:
+        """原子地创建一条份额轮换记录。
+
+        在同一把锁内先查重：若该 rotation_id 已存在，则不覆盖、
+        直接返回已有记录；否则写入并返回 None。
+        """
+        _check_id("rotation_id", rotation_id)
+        path = self._rotations_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            existing = all_records.get(rotation_id)
+            if existing is not None:
+                return existing
+            all_records[rotation_id] = record
+            self._atomic_write(path, all_records)
+            return None
+
+    def get_rotation(
+        self, wallet_id: str, rotation_id: str
+    ) -> Optional[dict]:
+        """返回某条份额轮换记录，不存在返回 None。"""
+        _check_id("rotation_id", rotation_id)
+        all_records = self._read_json(self._rotations_path(wallet_id))
+        if not all_records:
+            return None
+        return all_records.get(rotation_id)
+
+    def list_rotations(self, wallet_id: str) -> list[dict]:
+        """返回该钱包的全部份额轮换记录（无文件时返回 []）。"""
+        _check_id("wallet_id", wallet_id)
+        all_records = self._read_json(self._rotations_path(wallet_id))
+        if not all_records:
+            return []
+        return [
+            dict(record)
+            for record in all_records.values()
+            if isinstance(record, dict)
+        ]
+
+    def update_rotation(
+        self, wallet_id: str, rotation_id: str, record: dict
+    ) -> None:
+        """原子地覆盖一条已存在的份额轮换记录（状态机推进用）。"""
+        _check_id("rotation_id", rotation_id)
+        path = self._rotations_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            all_records[rotation_id] = record
+            self._atomic_write(path, all_records)
+
+    def delete_rotation(self, wallet_id: str, rotation_id: str) -> None:
+        """删除一条份额轮换记录（准备事件追加失败时回滚用）。"""
+        _check_id("rotation_id", rotation_id)
+        path = self._rotations_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or rotation_id not in all_records:
+                return
+            del all_records[rotation_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    # ---- 轮换暂存目录（新份额私钥 + 激活备份）------------------------------
+
+    def _staging_dir(self, wallet_id: str, rotation_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        _check_id("rotation_id", rotation_id)
+        return os.path.join(
+            self._rotation_staging_dir, wallet_id, rotation_id
+        )
+
+    def _staging_share_path(
+        self, wallet_id: str, rotation_id: str, share_id: str
+    ) -> str:
+        _check_share_id(share_id)
+        return os.path.join(
+            self._staging_dir(wallet_id, rotation_id), share_id + ".json"
+        )
+
+    def _staging_backup_path(
+        self, wallet_id: str, rotation_id: str, share_id: str
+    ) -> str:
+        _check_share_id(share_id)
+        return os.path.join(
+            self._staging_dir(wallet_id, rotation_id),
+            share_id + ".bak.json",
+        )
+
+    def _staging_wallet_backup_path(
+        self, wallet_id: str, rotation_id: str
+    ) -> str:
+        return os.path.join(
+            self._staging_dir(wallet_id, rotation_id), "wallet.bak.json"
+        )
+
+    def save_staging_share(
+        self, wallet_id: str, rotation_id: str, record: dict
+    ) -> None:
+        """把一个新份额（含私钥）写入轮换暂存目录，一份一个文件。"""
+        path = self._staging_share_path(
+            wallet_id, rotation_id, record["share_id"]
+        )
+        with self._lock:
+            self._atomic_write(path, record)
+
+    def get_staging_share(
+        self, wallet_id: str, rotation_id: str, share_id: str
+    ) -> Optional[dict]:
+        """返回暂存的新份额记录，不存在返回 None。"""
+        return self._read_json(
+            self._staging_share_path(wallet_id, rotation_id, share_id)
+        )
+
+    def save_activation_backups(
+        self,
+        wallet_id: str,
+        rotation_id: str,
+        old_shares: list[dict],
+        wallet_meta: dict,
+    ) -> None:
+        """激活前把旧份额文件与钱包元数据备份进暂存目录（回滚依据）。"""
+        with self._lock:
+            for record in old_shares:
+                self._atomic_write(
+                    self._staging_backup_path(
+                        wallet_id, rotation_id, record["share_id"]
+                    ),
+                    record,
+                )
+            self._atomic_write(
+                self._staging_wallet_backup_path(wallet_id, rotation_id),
+                wallet_meta,
+            )
+
+    def delete_activation_backups(
+        self, wallet_id: str, rotation_id: str
+    ) -> None:
+        """删除激活备份（*.bak.json），保留暂存的新份额文件。"""
+        staging = self._staging_dir(wallet_id, rotation_id)
+        with self._lock:
+            try:
+                names = os.listdir(staging)
+            except FileNotFoundError:
+                return
+            for name in names:
+                if name.endswith(".bak.json"):
+                    try:
+                        os.unlink(os.path.join(staging, name))
+                    except FileNotFoundError:
+                        pass
+
+    def delete_staging(self, wallet_id: str, rotation_id: str) -> None:
+        """删除整个轮换暂存目录（激活成功后清理暂存与备份）。"""
+        staging = self._staging_dir(wallet_id, rotation_id)
+        with self._lock:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    # ---- 启动恢复：未完成的激活先回滚 --------------------------------------
+
+    def list_rotation_wallet_ids(self) -> list[str]:
+        """返回拥有轮换记录文件的全部 wallet_id。"""
+        try:
+            names = os.listdir(self._rotations_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")] for name in names if name.endswith(".json")
+        )
+
+    def rollback_activation_files(
+        self, wallet_id: str, rotation_record: dict
+    ) -> None:
+        """用暂存目录中的备份恢复钱包元数据与旧份额文件，并删除已换入的
+        新份额文件。备份缺失（崩溃发生在备份写入前）时各步自动跳过。"""
+        rotation_id = rotation_record["rotation_id"]
+        wallet_backup = self._read_json(
+            self._staging_wallet_backup_path(wallet_id, rotation_id)
+        )
+        if wallet_backup is not None:
+            self.save_wallet_meta(wallet_id, wallet_backup)
+        staging = self._staging_dir(wallet_id, rotation_id)
+        try:
+            names = os.listdir(staging)
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if name.endswith(".bak.json") and name != "wallet.bak.json":
+                share_record = self._read_json(os.path.join(staging, name))
+                if isinstance(share_record, dict) and isinstance(
+                    share_record.get("share_id"), str
+                ):
+                    self.save_share(wallet_id, share_record)
+        for share_id in rotation_record.get("share_ids", []):
+            if isinstance(share_id, str):
+                self.delete_share(wallet_id, share_id)
+
+    def recover_incomplete_activations(self) -> None:
+        """启动恢复：把崩溃时停留在 activating 的轮换回滚为 prepared，
+        并清理已完成激活残留的暂存目录。逐个钱包尽力而为。"""
+        for wallet_id in self.list_rotation_wallet_ids():
+            for record in self.list_rotations(wallet_id):
+                rotation_id = record.get("rotation_id")
+                state = record.get("state")
+                if not isinstance(rotation_id, str):
+                    continue
+                try:
+                    if state == "activating":
+                        self.rollback_activation_files(wallet_id, record)
+                        restored = {
+                            key: value
+                            for key, value in record.items()
+                            if key != "previous_public_key"
+                        }
+                        restored["state"] = "prepared"
+                        self.update_rotation(wallet_id, rotation_id, restored)
+                        self.delete_activation_backups(wallet_id, rotation_id)
+                    elif state == "active":
+                        # 崩溃发生在激活提交之后、暂存清理之前
+                        self.delete_staging(wallet_id, rotation_id)
+                except (ValueError, OSError):
+                    continue

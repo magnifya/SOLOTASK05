@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -30,6 +31,9 @@ ALLOWED_REQUIRED_APPROVALS = (1, 2)
 
 #: approve/reject 附言 reason 的最大长度
 MAX_REASON_LENGTH = 1024
+
+#: rotation_id 允许的字符（与存储层安全 id 一致）
+ROTATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class ServiceError(Exception):
@@ -55,6 +59,9 @@ class WalletService:
     def __init__(self, store: WalletStore) -> None:
         self._store = store
         self._audit = AuditStore(store.data_dir)
+        # 启动恢复：崩溃时停留在 activating 的轮换先回滚为 prepared，
+        # 已完成激活残留的暂存目录一并清理，然后才对外服务。
+        self._store.recover_incomplete_activations()
         # 每钱包一把事务锁：串行化同一钱包的"状态变更 + 审计事件"，
         # ThreadingHTTPServer 并发下保证状态与事件原子、懒过期只记一次。
         self._wallet_locks: dict[str, threading.Lock] = {}
@@ -375,6 +382,221 @@ class WalletService:
         events = self._audit.list_events(wallet_id, from_seq=seq, limit=size)
         return {"wallet_id": wallet_id, "events": events}
 
+    # ---- 份额轮换 ---------------------------------------------------------
+
+    @staticmethod
+    def _rotation_view(record: dict) -> dict:
+        """轮换记录对外视图（只含公钥与标识，绝不含私钥）。"""
+        return {
+            "rotation_id": record["rotation_id"],
+            "state": record["state"],
+            "share_ids": list(record["share_ids"]),
+            "public_key": record["public_key"],
+        }
+
+    @staticmethod
+    def _validate_rotation_id(rotation_id: object) -> None:
+        if not isinstance(rotation_id, str) or not ROTATION_ID_RE.match(
+            rotation_id
+        ):
+            raise ServiceError(
+                400, "rotation_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    def create_share_rotation(
+        self, wallet_id: str, rotation_id: object
+    ) -> tuple[int, dict]:
+        """准备一次份额轮换：生成两份新份额，私钥只落暂存文件。
+
+        返回 (HTTP 状态码, 响应体)。同 rotation_id 重放返回 200 且不重新
+        生成；每钱包同时只允许一个 prepared 轮换，冲突返回 409。
+        """
+        self._get_wallet_or_404(wallet_id)
+        self._validate_rotation_id(rotation_id)
+        with self._wallet_lock(wallet_id):
+            existing = self._store.get_rotation(wallet_id, rotation_id)
+            if existing is not None:
+                # 幂等重放：原样返回，不重新生成、不记事件
+                return 200, self._rotation_view(existing)
+            for record in self._store.list_rotations(wallet_id):
+                if record.get("state") in ("prepared", "activating"):
+                    raise ServiceError(
+                        409,
+                        f"wallet {wallet_id!r} already has a prepared "
+                        "share rotation",
+                    )
+            share_ids = [
+                f"{rotation_id}-share-1",
+                f"{rotation_id}-share-2",
+            ]
+            share_keys = [crypto.generate_share_key(sid) for sid in share_ids]
+            public_key = crypto.combine_public_keys(
+                [k.public_bytes for k in share_keys]
+            ).hex()
+            record = {
+                "rotation_id": rotation_id,
+                "state": "prepared",
+                "share_ids": share_ids,
+                "public_key": public_key,
+                "created_at": _utc_now_iso(),
+            }
+            try:
+                # 新份额私钥只写入暂存文件（一份一个文件），激活前绝不
+                # 触碰在用份额与钱包元数据
+                for key in share_keys:
+                    self._store.save_staging_share(
+                        wallet_id,
+                        rotation_id,
+                        {
+                            "share_id": key.share_id,
+                            "public_key": key.public_bytes.hex(),
+                            # 仅该份额自己的私钥；系统中不存在完整私钥
+                            "private_key": key.private_bytes.hex(),
+                        },
+                    )
+                self._store.create_rotation(wallet_id, rotation_id, record)
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_SHARE_ROTATION_PREPARED,
+                        details={
+                            "rotation_id": rotation_id,
+                            "share_ids": share_ids,
+                            "public_key": public_key,
+                        },
+                    ),
+                )
+            except BaseException:
+                # 状态/事件原子：事件未落盘则回滚轮换记录与暂存文件
+                self._store.delete_rotation(wallet_id, rotation_id)
+                self._store.delete_staging(wallet_id, rotation_id)
+                raise
+        return 201, self._rotation_view(record)
+
+    def get_share_rotation(self, wallet_id: str, rotation_id: str) -> dict:
+        self._get_wallet_or_404(wallet_id)
+        with self._wallet_lock(wallet_id):
+            # 锁内读取：并发激活期间不会读到瞬态 activating
+            try:
+                record = self._store.get_rotation(wallet_id, rotation_id)
+            except ValueError:
+                raise ServiceError(400, "invalid rotation_id")
+            if record is None:
+                raise ServiceError(
+                    404, f"share rotation {rotation_id!r} not found"
+                )
+            return self._rotation_view(record)
+
+    def activate_share_rotation(
+        self, wallet_id: str, rotation_id: str
+    ) -> tuple[int, dict]:
+        """激活一次已准备的轮换：锁内替换份额文件、钱包公钥与轮换状态。
+
+        仅 prepared 可激活（201）；active 重放返回 200；其余状态 409。
+        失败时回滚份额文件、公钥与状态并清理备份；激活成功后删除暂存。
+        """
+        self._get_wallet_or_404(wallet_id)
+        self._validate_rotation_id(rotation_id)
+        with self._wallet_lock(wallet_id):
+            record = self._store.get_rotation(wallet_id, rotation_id)
+            if record is None:
+                raise ServiceError(
+                    404, f"share rotation {rotation_id!r} not found"
+                )
+            if record["state"] == "active":
+                # 幂等重放：不重复替换、不记事件
+                return 200, self._rotation_view(record)
+            if record["state"] != "prepared":
+                raise ServiceError(
+                    409,
+                    f"share rotation {rotation_id!r} is "
+                    f"{record['state']}, not prepared",
+                )
+
+            # 锁内重读钱包元数据，拿到当前在用份额与公钥
+            wallet = self._store.get_wallet(wallet_id)
+            if wallet is None:
+                raise ServiceError(404, f"wallet {wallet_id!r} not found")
+            previous_public_key = wallet["public_key"]
+            old_share_ids = [s["share_id"] for s in wallet["shares"]]
+            old_share_records = []
+            for share_id in old_share_ids:
+                share_record = self._store.get_share(wallet_id, share_id)
+                if share_record is None:
+                    raise ServiceError(
+                        409, f"wallet {wallet_id!r} share files are incomplete"
+                    )
+                old_share_records.append(share_record)
+            new_share_records = []
+            for share_id in record["share_ids"]:
+                staged = self._store.get_staging_share(
+                    wallet_id, rotation_id, share_id
+                )
+                if staged is None:
+                    raise ServiceError(
+                        409,
+                        f"share rotation {rotation_id!r} staging files "
+                        "are incomplete",
+                    )
+                new_share_records.append(staged)
+
+            new_meta = dict(wallet)
+            new_meta["shares"] = [
+                {"share_id": r["share_id"], "public_key": r["public_key"]}
+                for r in new_share_records
+            ]
+            new_meta["public_key"] = record["public_key"]
+            active_record = dict(record)
+            active_record["state"] = "active"
+            active_record["previous_public_key"] = previous_public_key
+
+            committed = False
+            try:
+                # 先落 activating 标记与旧份额/元数据备份：崩溃后启动
+                # 恢复据此回滚
+                activating = dict(record)
+                activating["state"] = "activating"
+                activating["previous_public_key"] = previous_public_key
+                self._store.update_rotation(wallet_id, rotation_id, activating)
+                self._store.save_activation_backups(
+                    wallet_id, rotation_id, old_share_records, wallet
+                )
+                # 锁内替换：新份额文件、钱包 shares/public_key、轮换状态
+                for share_record in new_share_records:
+                    self._store.save_share(wallet_id, share_record)
+                self._store.save_wallet_meta(wallet_id, new_meta)
+                for share_id in old_share_ids:
+                    self._store.delete_share(wallet_id, share_id)
+                self._store.update_rotation(
+                    wallet_id, rotation_id, active_record
+                )
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_SHARE_ROTATION_ACTIVATED,
+                        details={
+                            "rotation_id": rotation_id,
+                            "share_ids": list(record["share_ids"]),
+                            "public_key": record["public_key"],
+                            "previous_public_key": previous_public_key,
+                        },
+                    ),
+                )
+                committed = True
+            except BaseException:
+                if not committed:
+                    # 回滚份额文件、公钥与状态，并清理激活备份
+                    # （保留暂存的新份额文件，prepared 轮换可重试激活）
+                    self._store.rollback_activation_files(wallet_id, record)
+                    self._store.update_rotation(wallet_id, rotation_id, record)
+                    self._store.delete_activation_backups(
+                        wallet_id, rotation_id
+                    )
+                raise
+            # 激活成功：删除暂存的新份额文件与备份
+            self._store.delete_staging(wallet_id, rotation_id)
+        return 201, self._rotation_view(active_record)
+
     # ---- 批准 / 拒绝 -----------------------------------------------------
 
     @staticmethod
@@ -528,9 +750,14 @@ class WalletService:
                 400, f"exactly {REQUIRED_SHARES} share signatures are required"
             )
 
-        share_pub = {s["share_id"]: s["public_key"] for s in wallet["shares"]}
-
         with self._wallet_lock(wallet_id):
+            # 锁内重读钱包元数据：份额轮换激活后，未首签的请求必须用新的
+            # share_ids 与公钥校验，旧份额一律 400。
+            wallet = self._store.get_wallet(wallet_id)
+            if wallet is None:
+                raise ServiceError(404, f"wallet {wallet_id!r} not found")
+            expected_share_ids = [s["share_id"] for s in wallet["shares"]]
+            share_pub = {s["share_id"]: s["public_key"] for s in wallet["shares"]}
             # 幂等查重的唯一检查点：必须在每钱包事务锁内、且在任何份额校验
             # 之前。重放直接返回磁盘上已提交的签名，不校验签名、不触发懒
             # 过期、不记事件。这把锁同时挡住首签事务尚未提交完成的并发
@@ -566,12 +793,12 @@ class WalletService:
                 submitted[share_id] = signature_bytes
 
             # 两份必须齐备，且不能夹带未知份额
-            if set(submitted) != set(SHARE_IDS):
+            if set(submitted) != set(expected_share_ids):
                 raise ServiceError(400, "signatures from both share_ids are required")
 
             payload = crypto.build_payload(signing_request_id, message)
             verified: dict[str, bytes] = {}
-            for share_id in SHARE_IDS:
+            for share_id in expected_share_ids:
                 public_bytes = bytes.fromhex(share_pub[share_id])
                 if not crypto.verify_share(
                     public_bytes, payload, submitted[share_id]
@@ -580,7 +807,7 @@ class WalletService:
                 verified[share_id] = submitted[share_id]
 
             aggregate = crypto.combine_signatures(
-                [verified[sid] for sid in SHARE_IDS]
+                [verified[sid] for sid in expected_share_ids]
             )
             record = {"message": message, "signature": aggregate.hex()}
 

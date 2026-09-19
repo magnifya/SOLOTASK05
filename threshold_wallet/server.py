@@ -10,6 +10,9 @@
 - GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
+- POST /v1/wallets/<wallet_id>/share-rotations             准备份额轮换
+- GET  /v1/wallets/<wallet_id>/share-rotations/<id>        查询轮换
+- POST /v1/wallets/<wallet_id>/share-rotations/<id>/activate  激活轮换
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -93,6 +96,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200, service.get_sign_request(wallet_id, rest[1])
                     )
                     return
+                if len(rest) == 2 and rest[0] == "share-rotations":
+                    self._send_json(
+                        200, service.get_share_rotation(wallet_id, rest[1])
+                    )
+                    return
                 if rest == ["audit-events"]:
                     self._send_json(
                         200,
@@ -142,6 +150,25 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         request_id = body.get("signing_request_id")
                     status, result = service.create_sign_request(
                         wallet_id, request_id, body.get("message")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["share-rotations"]:
+                    body = self._read_json_body()
+                    status, result = service.create_share_rotation(
+                        wallet_id, body.get("rotation_id")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "share-rotations"
+                    and rest[2] == "activate"
+                ):
+                    status, result = service.activate_share_rotation(
+                        wallet_id, rest[1]
                     )
                     self._send_json(status, result)
                     return
