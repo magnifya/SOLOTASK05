@@ -26,6 +26,7 @@
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/approve` | 批准 `{"approver_id", "reason"?}` |
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/reject` | 拒绝 `{"approver_id", "reason"?}` |
 | POST | `/v1/wallets/{wallet_id}/sign` | 提交两份份额签名，返回聚合 `signature` |
+| GET  | `/v1/wallets/{wallet_id}/audit-events` | 查询审计事件流（`from_seq`/`limit`） |
 
 状态码：
 
@@ -55,6 +56,30 @@
 - 设置策略后，`POST /sign` 要求存在同 id、同 message 且已 `approved`
   的审批单，两份额签名齐备返回 `201` 并把审批单推进为 `signed`；
   未设策略时行为不变（首签 `201`，重放 `200`）。
+
+## 审计事件流
+
+`GET /v1/wallets/{wallet_id}/audit-events?from_seq=&limit=` 返回
+`{"wallet_id", "events"}`，事件按 `seq` 升序。`from_seq`、`limit`
+必须为正整数，默认 `1` / `1000`，`limit` 上限 `1000`；参数非法 `400`，
+钱包不存在 `404`。该接口只读，不触发懒过期。
+
+每个事件字段为 `{seq, type, at, request_id, actor_id, reason, details}`：
+`seq` 从 1 起单调递增、重启后延续；`at` 为 UTC ISO-8601（`Z` 结尾）；
+无值的字段为 `null`。事件类型：
+
+| type | 触发时机 | details |
+| ---- | ---- | ---- |
+| `policy_updated` | 策略设置成功（含同值覆盖） | `{required_approvals, timeout_seconds, operation: created\|updated}` |
+| `request_created` | 审批单首次创建 | `{message}` |
+| `request_approved` | 首次有效批准（重复批准不计） | `{count, req, state}` |
+| `request_rejected` | 首次拒绝 | `{count, req, state}` |
+| `request_expired` | GET/approve/reject/sign 触发 pending 懒过期（只记一次） | `{state: expired}` |
+| `request_signed` | 首次签名成功 | `{message, state: signed}` |
+
+幂等重放（重复创建、重复批准、重复签名、终态操作）不产生事件。
+状态推进与事件写入在同一事务内落盘：任一步失败即回滚状态文件，
+不会出现"状态变了但事件丢失"或反之。
 
 ## 安装
 

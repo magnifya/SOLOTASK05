@@ -9,6 +9,7 @@
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
+- GET  /v1/wallets/<wallet_id>/audit-events           查询审计事件流
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .service import ServiceError, WalletService
 
@@ -75,7 +76,8 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
         # ---- 路由 -------------------------------------------------------
 
         def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             try:
                 matched = self._split_wallet_path(path)
                 if matched is None:
@@ -90,9 +92,30 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200, service.get_sign_request(wallet_id, rest[1])
                     )
                     return
+                if rest == ["audit-events"]:
+                    query = parse_qs(parsed.query)
+                    self._send_json(
+                        200,
+                        service.get_audit_events(
+                            wallet_id,
+                            self._query_one(query, "from_seq"),
+                            self._query_one(query, "limit"),
+                        ),
+                    )
+                    return
                 self._send_error(404, "not found")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
+
+        @staticmethod
+        def _query_one(query: dict, name: str):
+            """取单个查询参数；重复出现视为非法（400）。"""
+            values = query.get(name)
+            if values is None:
+                return None
+            if len(values) != 1:
+                raise ServiceError(400, f"duplicate query parameter: {name}")
+            return values[0]
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
