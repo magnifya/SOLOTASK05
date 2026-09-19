@@ -39,6 +39,8 @@ TYPE_REQUEST_APPROVED = "request_approved"
 TYPE_REQUEST_REJECTED = "request_rejected"
 TYPE_REQUEST_EXPIRED = "request_expired"
 TYPE_REQUEST_SIGNED = "request_signed"
+TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
+TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {

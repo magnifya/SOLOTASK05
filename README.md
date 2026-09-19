@@ -27,6 +27,9 @@
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/reject` | 拒绝 `{"approver_id", "reason"?}` |
 | GET  | `/v1/wallets/{wallet_id}/audit-events` | 查询审计事件（seq 升序，分页 `from_seq`/`limit`） |
 | POST | `/v1/wallets/{wallet_id}/sign` | 提交两份份额签名，返回聚合 `signature` |
+| POST | `/v1/wallets/{wallet_id}/share-rotations` | 准备份额轮换 `{"rotation_id"}` |
+| GET  | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}` | 查询轮换状态 |
+| POST | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}/activate` | 激活轮换 |
 
 状态码：
 
@@ -57,6 +60,39 @@
   的审批单，两份额签名齐备返回 `201` 并把审批单推进为 `signed`；
   未设策略时行为不变（首签 `201`，重放 `200`）。
 
+## 份额轮换灾备
+
+轮换为两份份额同时换新：先暂存（prepared），再激活（active）。
+`rotation_id` 必须匹配 `[A-Za-z0-9_-]{1,128}`，否则 `400`。
+
+- `POST /share-rotations`，请求体 `{"rotation_id"}`：
+  生成两把彼此独立的新 Ed25519 密钥，份额标识固定为
+  `<rotation_id>-share-1`、`<rotation_id>-share-2`；两份**新私钥**
+  分别落两个暂存文件（一份一文件，任何位置仍不存在完整私钥）。
+  成功 `201`，返回
+  `{rotation_id, state: "prepared", share_ids, public_key}`；
+  同一 `rotation_id` 重放返回 `200` 且**不重生**密钥；每个钱包至多
+  一个 prepared（activating 同此限制），冲突返回 `409`；钱包不存在
+  `404`。
+- `GET /share-rotations/{rotation_id}`：成功 `200` 返回同构状态视图；
+  未知轮换 `404`，钱包不存在 `404`。
+- `POST /share-rotations/{rotation_id}/activate`：仅 `prepared` 可
+  激活。在钱包事务锁内：备份旧钱包元数据与旧份额（一份一文件）→
+  写入两份新份额文件并原子替换钱包 `public_key`、删除旧份额文件 →
+  状态置 `active`。成功 `201` 返回 active 视图；`active` 重放幂等
+  `200`；未知 `404`；其余状态（如 activating）`409`。激活成功后
+  删除暂存的新份额私钥与激活备份，私钥只在 `shares/` 生效处保留
+  一份。
+- **激活后签名必须使用新的 `share_ids`**：仍用旧 `share-1/share-2`
+  提交签名返回 `400`；新份额首签 `201`，同一签名请求重放 `200`。
+- **失败回滚**：激活任一步（状态写入、文件替换、事件落盘）失败，
+  都在锁内恢复旧份额文件与旧钱包公钥、删除安装到一半的新份额、
+  状态退回 `prepared`、清理备份；回滚后可重新激活。
+- **启动恢复**：服务启动时扫描所有轮换暂存目录，未完成的激活
+  （状态为 `activating`，或备份已存在但尚未到 active）先回滚；
+  `prepared`/`active` 状态跨重启保留，active 提交后来不及清理的
+  暂存/备份残骸在启动时补清理。
+
 ## 审计事件
 
 `GET /v1/wallets/{wallet_id}/audit-events` 返回
@@ -78,6 +114,8 @@
 | `request_rejected` (R) | **首次**拒绝 | `rid=id, a=approver_id, r=传入\|null`；`d={count, req, state: rejected}` |
 | `request_expired` (E) | pending 单超时被懒过期 | `rid=id`，actor/reason 为 null；`d={state: expired}`。GET 审批单、approve、reject、sign 触发，每个单只记一次 |
 | `request_signed` (S) | **首次**签名成功 | `rid=id`，actor/reason 为 null；`d={message, state: signed}`。重放 `200` 不记 |
+| `share_rotation_prepared` | 轮换**首次**暂存成功 | rid/actor/reason 为 null；`d={rotation_id, share_ids, public_key}`。同 id 重放 `200` 不记 |
+| `share_rotation_activated` | 轮换**首次**激活成功 | rid/actor/reason 为 null；`d={rotation_id, share_ids, public_key, previous_public_key}`。active 重放 `200` 不记。**details 绝不含任何私钥** |
 
 对终态单（approved/rejected/expired/signed）再 approve/reject 返回 `409`
 且不记事件；签名重放、审批单创建重放均不产生事件。
@@ -136,6 +174,18 @@ python -m threshold_wallet.cli request-show --wallet-id alice \
      --signing-request-id req-1
 ```
 
+份额轮换对应的子命令为 `rotation-prepare` / `rotation-show` /
+`rotation-activate`：
+
+```bash
+python -m threshold_wallet.cli rotation-prepare --wallet-id alice \
+     --rotation-id rot-1
+python -m threshold_wallet.cli rotation-show --wallet-id alice \
+     --rotation-id rot-1
+python -m threshold_wallet.cli rotation-activate --wallet-id alice \
+     --rotation-id rot-1
+```
+
 可用 `--url` 指定服务地址（默认 `http://127.0.0.1:8080`），
 `share-sign` 用 `--data-dir` 指向服务端数据目录。
 
@@ -145,13 +195,18 @@ python -m threshold_wallet.cli request-show --wallet-id alice \
 python -m unittest discover -s tests -v
 ```
 
-覆盖：份额原语、持久化、全部 HTTP 状态码、幂等重放、聚合公钥独立验证，
-以及磁盘/响应/日志的"无完整私钥"安全审计。
+覆盖：份额原语、持久化、全部 HTTP 状态码、幂等重放、聚合公钥独立验证、
+份额轮换契约/回滚/重启恢复，以及磁盘/响应/日志的"无完整私钥"安全审计。
 
 ## 私钥安全边界
 
-- **响应**：建钱包只返回 `share_ids` 与公钥，任何接口都不返回私钥。
+- **响应**：建钱包只返回 `share_ids` 与公钥，任何接口（含轮换状态与
+  审计事件）都不返回私钥。
 - **磁盘**：钱包元数据文件不含任何私钥；两个份额私钥分文件存放
   （`shares/<wallet_id>/<share_id>.json`），任何文件至多含一个份额私钥，
-  从不存在两者拼接后的完整私钥。写入采用临时文件 + 原子替换。
+  从不存在两者拼接后的完整私钥。轮换暂存的两份新私钥同样分文件存放
+  （`rotations/<wallet_id>/<rotation_id>/<share_id>.json`）；激活成功
+  后暂存私钥与旧份额私钥一并删除，私钥只在生效处保留一份；激活备份
+  中的旧份额也维持一份一文件，并在激活成功或回滚完成后删除。
+  写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。

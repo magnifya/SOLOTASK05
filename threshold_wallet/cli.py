@@ -117,6 +117,31 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--approver-id", required=True)
         p.add_argument("--reason", default=None)
 
+    # rotation-prepare  <-> POST /v1/wallets/{id}/share-rotations
+    p_rp = sub.add_parser(
+        "rotation-prepare", help="准备份额轮换（POST .../share-rotations）"
+    )
+    p_rp.add_argument("--url", default=DEFAULT_URL)
+    p_rp.add_argument("--wallet-id", required=True)
+    p_rp.add_argument("--rotation-id", required=True)
+
+    # rotation-show  <-> GET /v1/wallets/{id}/share-rotations/{rid}
+    p_rsh = sub.add_parser(
+        "rotation-show", help="查询份额轮换（GET .../share-rotations/{id}）"
+    )
+    p_rsh.add_argument("--url", default=DEFAULT_URL)
+    p_rsh.add_argument("--wallet-id", required=True)
+    p_rsh.add_argument("--rotation-id", required=True)
+
+    # rotation-activate  <-> POST .../share-rotations/{rid}/activate
+    p_ra = sub.add_parser(
+        "rotation-activate",
+        help="激活份额轮换（POST .../share-rotations/{id}/activate）",
+    )
+    p_ra.add_argument("--url", default=DEFAULT_URL)
+    p_ra.add_argument("--wallet-id", required=True)
+    p_ra.add_argument("--rotation-id", required=True)
+
     # share-sign（份额持有方本地辅助命令）
     p_ss = sub.add_parser(
         "share-sign",
@@ -252,6 +277,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{args.url}/v1/wallets/{args.wallet_id}"
                 f"/sign-requests/{args.signing_request_id}/{args.command}",
                 payload,
+            )
+
+        elif args.command == "rotation-prepare":
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}/share-rotations",
+                {"rotation_id": args.rotation_id},
+            )
+
+        elif args.command == "rotation-show":
+            status, body = _http_request(
+                "GET",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/share-rotations/{args.rotation_id}",
+                None,
+            )
+
+        elif args.command == "rotation-activate":
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/share-rotations/{args.rotation_id}/activate",
+                {},
             )
 
         elif args.command == "share-sign":
