@@ -77,15 +77,33 @@ class AuditStore:
             data = self._read(wallet_id)
             if data is None:
                 data = {"wallet_id": wallet_id, "next_seq": 1, "events": []}
-            next_seq = data.get("next_seq")
-            if not isinstance(next_seq, int) or next_seq < 1:
-                # 兼容没有 next_seq 字段的文件：末尾事件 seq + 1
-                next_seq = (
-                    data["events"][-1]["seq"] + 1 if data.get("events") else 1
-                )
+            events = data.get("events")
+            if not isinstance(events, list):
+                events = []
+                data["events"] = events
+            # 重启恢复：以文件中实际最大事件 seq 为准，与记录的 next_seq
+            # 互相校准取较大者，保证 seq 单调连续、不重号、不回退
+            # （同时兼容缺 next_seq 字段的旧文件）。
+            max_seq = 0
+            for existing in events:
+                seq = existing.get("seq") if isinstance(existing, dict) else None
+                if (
+                    isinstance(seq, int)
+                    and not isinstance(seq, bool)
+                    and seq > max_seq
+                ):
+                    max_seq = seq
+            stored_next = data.get("next_seq")
+            if (
+                not isinstance(stored_next, int)
+                or isinstance(stored_next, bool)
+                or stored_next < 1
+            ):
+                stored_next = 1
+            next_seq = max(stored_next, max_seq + 1)
             stamped = dict(event)
             stamped["seq"] = next_seq
-            data["events"].append(stamped)
+            events.append(stamped)
             data["next_seq"] = next_seq + 1
             WalletStore._atomic_write(path, data)
             return stamped
@@ -101,9 +119,13 @@ class AuditStore:
         data = self._read(wallet_id)
         if not data:
             return []
-        out = [
+        # 按 seq 升序返回；即使历史文件事件顺序异常也保证可读、不乱序。
+        events = [
             dict(event)
             for event in data.get("events", [])
-            if event["seq"] >= from_seq
+            if isinstance(event, dict)
+            and isinstance(event.get("seq"), int)
+            and event["seq"] >= from_seq
         ]
-        return out[:limit]
+        events.sort(key=lambda e: e["seq"])
+        return events[:limit]

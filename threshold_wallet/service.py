@@ -239,17 +239,6 @@ class WalletService:
             record = expired
         return record
 
-    @staticmethod
-    def _expired_view(record: dict) -> dict:
-        """只读视角的过期判定：超时 pending 在返回视图里呈现为 expired，
-        但不落盘、不记事件（用于不触发懒过期的操作）。"""
-        if record["state"] == "pending" and (
-            datetime.now(timezone.utc) >= _parse_iso(record["t1"])
-        ):
-            record = dict(record)
-            record["state"] = "expired"
-        return record
-
     def _fetch_request_or_404(self, wallet_id: str, request_id: str) -> dict:
         """只读取审批单（404），不做懒过期；调用方自行在钱包事务锁内过期。"""
         try:
@@ -307,9 +296,10 @@ class WalletService:
         with self._wallet_lock(wallet_id):
             existing = self._store.create_request(wallet_id, request_id, record)
             if existing is not None:
-                # 重放（无论同文幂等还是异文 409）均不记事件；
-                # POST 重放不是懒过期触发点，只读呈现过期态。
-                existing = self._expired_view(existing)
+                # 重放（无论同文幂等还是异文 409）均不记事件、不改状态。
+                # POST 不是懒过期触发点：原样返回磁盘中持久化的状态
+                # （pending/approved/rejected/expired/signed），绝不在响应里
+                # 把磁盘仍是 pending 的单临时呈现成 expired。
                 if existing["message"] != message:
                     raise ServiceError(
                         409,
@@ -538,60 +528,61 @@ class WalletService:
                 400, f"exactly {REQUIRED_SHARES} share signatures are required"
             )
 
-        # 幂等：同一 signing_request_id 重放直接返回已有签名，
-        # 不校验、不触发过期、不记任何事件
-        try:
-            existing = self._store.get_signature(wallet_id, signing_request_id)
-        except ValueError:
-            raise ServiceError(400, "invalid signing_request_id")
-        if existing is not None:
-            return 200, {"signature": existing["signature"]}
-
         share_pub = {s["share_id"]: s["public_key"] for s in wallet["shares"]}
-        submitted: dict[str, bytes] = {}
-        for index, item in enumerate(signatures):
-            if not isinstance(item, dict):
-                raise ServiceError(400, f"signatures[{index}] must be an object")
-            share_id = item.get("share_id")
-            signature_hex = item.get("signature")
-            if not isinstance(share_id, str) or share_id not in share_pub:
-                raise ServiceError(400, f"signatures[{index}] has unknown share_id")
-            if not isinstance(signature_hex, str):
-                raise ServiceError(400, f"signatures[{index}].signature must be hex")
-            try:
-                signature_bytes = bytes.fromhex(signature_hex)
-            except ValueError:
-                raise ServiceError(
-                    400, f"signatures[{index}].signature must be hex"
-                )
-            if share_id in submitted:
-                raise ServiceError(400, "duplicate share_id in signatures")
-            submitted[share_id] = signature_bytes
-
-        # 两份必须齐备，且不能夹带未知份额
-        if set(submitted) != set(SHARE_IDS):
-            raise ServiceError(400, "signatures from both share_ids are required")
-
-        payload = crypto.build_payload(signing_request_id, message)
-        verified: dict[str, bytes] = {}
-        for share_id in SHARE_IDS:
-            public_bytes = bytes.fromhex(share_pub[share_id])
-            if not crypto.verify_share(
-                public_bytes, payload, submitted[share_id]
-            ):
-                raise ServiceError(400, f"signature verification failed for {share_id}")
-            verified[share_id] = submitted[share_id]
-
-        aggregate = crypto.combine_signatures(
-            [verified[sid] for sid in SHARE_IDS]
-        )
-        record = {"message": message, "signature": aggregate.hex()}
 
         with self._wallet_lock(wallet_id):
-            # 锁内二次查重：并发下可能已有首签提交（重放，无事件）
-            existing = self._store.get_signature(wallet_id, signing_request_id)
+            # 幂等查重的唯一检查点：必须在每钱包事务锁内、且在任何份额校验
+            # 之前。重放直接返回磁盘上已提交的签名，不校验签名、不触发懒
+            # 过期、不记事件。这把锁同时挡住首签事务尚未提交完成的并发
+            # 请求，使重放永远读不到“签名已落盘但审批单/事件未提交”的
+            # 半完成数据，保证并发重放只有一个首次结果。
+            try:
+                existing = self._store.get_signature(
+                    wallet_id, signing_request_id
+                )
+            except ValueError:
+                raise ServiceError(400, "invalid signing_request_id")
             if existing is not None:
                 return 200, {"signature": existing["signature"]}
+
+            submitted: dict[str, bytes] = {}
+            for index, item in enumerate(signatures):
+                if not isinstance(item, dict):
+                    raise ServiceError(400, f"signatures[{index}] must be an object")
+                share_id = item.get("share_id")
+                signature_hex = item.get("signature")
+                if not isinstance(share_id, str) or share_id not in share_pub:
+                    raise ServiceError(400, f"signatures[{index}] has unknown share_id")
+                if not isinstance(signature_hex, str):
+                    raise ServiceError(400, f"signatures[{index}].signature must be hex")
+                try:
+                    signature_bytes = bytes.fromhex(signature_hex)
+                except ValueError:
+                    raise ServiceError(
+                        400, f"signatures[{index}].signature must be hex"
+                    )
+                if share_id in submitted:
+                    raise ServiceError(400, "duplicate share_id in signatures")
+                submitted[share_id] = signature_bytes
+
+            # 两份必须齐备，且不能夹带未知份额
+            if set(submitted) != set(SHARE_IDS):
+                raise ServiceError(400, "signatures from both share_ids are required")
+
+            payload = crypto.build_payload(signing_request_id, message)
+            verified: dict[str, bytes] = {}
+            for share_id in SHARE_IDS:
+                public_bytes = bytes.fromhex(share_pub[share_id])
+                if not crypto.verify_share(
+                    public_bytes, payload, submitted[share_id]
+                ):
+                    raise ServiceError(400, f"signature verification failed for {share_id}")
+                verified[share_id] = submitted[share_id]
+
+            aggregate = crypto.combine_signatures(
+                [verified[sid] for sid in SHARE_IDS]
+            )
+            record = {"message": message, "signature": aggregate.hex()}
 
             # 启用审批策略时：必须存在同 id、同 message 且已 approved 的审批单。
             # 这一步可能原子地把超时 pending 单记一次 E 并转为 expired。
@@ -614,34 +605,43 @@ class WalletService:
                         f"{approval_record['state']}, not approved",
                     )
 
-            existing = self._store.save_signature(
-                wallet_id, signing_request_id, record
-            )
-            if existing is not None:
-                # 重复提交：幂等返回已有签名（无事件）
-                return 200, {"signature": existing["signature"]}
-
-            if approval_record is not None:
-                # 审批单推进到终态 signed
-                signed_record = dict(approval_record)
-                signed_record["state"] = "signed"
-                self._store.update_request(
-                    wallet_id, signing_request_id, signed_record
-                )
-
-            event = self._audit_event(
-                audit.TYPE_REQUEST_SIGNED,
-                request_id=signing_request_id,
-                details={"message": message, "state": "signed"},
-            )
+            # 事务提交：签名记录、审批单 signed 状态与 request_signed 事件
+            # 必须在本钱包事务锁内一致落盘。任一写入或事件追加失败，都
+            # 删除本次签名并把审批单恢复为原 approved，绝不留下半完成数据。
+            committed = False
             try:
-                self._emit(wallet_id, event)
-            except BaseException:
-                # 状态/事件原子：撤回签名与审批单终态推进
-                self._store.delete_signature(wallet_id, signing_request_id)
+                existing = self._store.save_signature(
+                    wallet_id, signing_request_id, record
+                )
+                if existing is not None:
+                    # 兜底：锁内查重已保证不会到达；万一到达按重放处理，
+                    # 不动审批单、不记事件。
+                    return 200, {"signature": existing["signature"]}
+
                 if approval_record is not None:
+                    signed_record = dict(approval_record)
+                    signed_record["state"] = "signed"
                     self._store.update_request(
-                        wallet_id, signing_request_id, approval_record
+                        wallet_id, signing_request_id, signed_record
                     )
+
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_REQUEST_SIGNED,
+                        request_id=signing_request_id,
+                        details={"message": message, "state": "signed"},
+                    ),
+                )
+                committed = True
+            except BaseException:
+                if not committed:
+                    self._store.delete_signature(
+                        wallet_id, signing_request_id
+                    )
+                    if approval_record is not None:
+                        self._store.update_request(
+                            wallet_id, signing_request_id, approval_record
+                        )
                 raise
         return 201, {"signature": aggregate.hex()}
