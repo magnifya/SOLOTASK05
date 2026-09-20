@@ -41,6 +41,7 @@ TYPE_REQUEST_EXPIRED = "request_expired"
 TYPE_REQUEST_SIGNED = "request_signed"
 TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
+TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {

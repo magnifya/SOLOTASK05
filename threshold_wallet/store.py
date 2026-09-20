@@ -9,6 +9,9 @@
     policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
     requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
     rotations/<wallet_id>.json      该钱包的份额轮换记录（prepared/activating/active）
+    asset-operations/<wallet_id>.json
+                                    该钱包的资产操作单（pending/committed，幂等去重）
+    assets/<wallet_id>.json         该钱包各资产的余额与版本号（version 单调递增）
     rotation-staging/<wallet_id>/<rotation_id>/
                                     轮换暂存目录：新份额私钥文件（<share_id>.json），
                                     激活期间的旧份额/钱包元数据备份（*.bak.json），
@@ -68,6 +71,8 @@ class WalletStore:
         self._policies_dir = os.path.join(data_dir, "policies")
         self._requests_dir = os.path.join(data_dir, "requests")
         self._rotations_dir = os.path.join(data_dir, "rotations")
+        self._asset_operations_dir = os.path.join(data_dir, "asset-operations")
+        self._assets_dir = os.path.join(data_dir, "assets")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
@@ -75,6 +80,8 @@ class WalletStore:
         os.makedirs(self._policies_dir, exist_ok=True)
         os.makedirs(self._requests_dir, exist_ok=True)
         os.makedirs(self._rotations_dir, exist_ok=True)
+        os.makedirs(self._asset_operations_dir, exist_ok=True)
+        os.makedirs(self._assets_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -406,8 +413,112 @@ class WalletStore:
                 except FileNotFoundError:
                     pass
 
-    # ---- 轮换暂存目录（新份额私钥 + 激活备份）------------------------------
+    # ---- 资产操作单 -------------------------------------------------------
 
+    def _asset_operations_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._asset_operations_dir, wallet_id + ".json")
+
+    def _assets_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._assets_dir, wallet_id + ".json")
+
+    def create_asset_operation(
+        self, wallet_id: str, operation_id: str, record: dict
+    ) -> Optional[dict]:
+        """原子地创建一条资产操作单。
+
+        在同一把锁内先查重：若该 operation_id 已存在，则不覆盖、
+        直接返回已有记录；否则写入并返回 None。
+        """
+        _check_id("operation_id", operation_id)
+        path = self._asset_operations_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            existing = all_records.get(operation_id)
+            if existing is not None:
+                return existing
+            all_records[operation_id] = record
+            self._atomic_write(path, all_records)
+            return None
+
+    def get_asset_operation(
+        self, wallet_id: str, operation_id: str
+    ) -> Optional[dict]:
+        """返回某条资产操作单，不存在返回 None。"""
+        _check_id("operation_id", operation_id)
+        all_records = self._read_json(self._asset_operations_path(wallet_id))
+        if not all_records:
+            return None
+        return all_records.get(operation_id)
+
+    def update_asset_operation(
+        self, wallet_id: str, operation_id: str, record: dict
+    ) -> None:
+        """原子地覆盖一条已存在的资产操作单（提交状态机推进用）。"""
+        _check_id("operation_id", operation_id)
+        path = self._asset_operations_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            all_records[operation_id] = record
+            self._atomic_write(path, all_records)
+
+    def delete_asset_operation(
+        self, wallet_id: str, operation_id: str
+    ) -> None:
+        """删除一条资产操作单（提交事件追加失败时回滚用）。"""
+        _check_id("operation_id", operation_id)
+        path = self._asset_operations_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or operation_id not in all_records:
+                return
+            del all_records[operation_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    # ---- 资产余额与版本 ---------------------------------------------------
+
+    def get_asset(self, wallet_id: str, asset_id: str) -> Optional[dict]:
+        """返回某资产当前 {balance, version}，不存在返回 None。"""
+        _check_id("asset_id", asset_id)
+        all_records = self._read_json(self._assets_path(wallet_id))
+        if not all_records:
+            return None
+        return all_records.get(asset_id)
+
+    def save_asset(self, wallet_id: str, asset_id: str, record: dict) -> None:
+        """原子地覆盖某资产的余额/版本记录（提交事务用）。"""
+        _check_id("asset_id", asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            all_records[asset_id] = record
+            self._atomic_write(path, all_records)
+
+    def delete_asset(self, wallet_id: str, asset_id: str) -> None:
+        """删除某资产记录（提交事件追加失败、回滚到不存在状态时用）。"""
+        _check_id("asset_id", asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or asset_id not in all_records:
+                return
+            del all_records[asset_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    # ---- 轮换暂存目录（新份额私钥 + 激活备份）------------------------------
     def _staging_dir(self, wallet_id: str, rotation_id: str) -> str:
         _check_id("wallet_id", wallet_id)
         _check_id("rotation_id", rotation_id)

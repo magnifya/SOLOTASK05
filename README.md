@@ -30,6 +30,9 @@
 | POST | `/v1/wallets/{wallet_id}/share-rotations` | 准备份额轮换 `{"rotation_id"}` |
 | GET  | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}` | 查询轮换状态 |
 | POST | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}/activate` | 激活轮换 |
+| POST | `/v1/wallets/{wallet_id}/asset-operations` | 创建资产操作单 `{"operation_id", "asset_id", "delta"}` |
+| POST | `/v1/wallets/{wallet_id}/asset-operations/{operation_id}/commit` | 提交资产操作单 |
+| GET  | `/v1/wallets/{wallet_id}/assets/{asset_id}` | 查询资产余额与版本 |
 
 状态码：
 
@@ -125,6 +128,50 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 若事件落盘失败，则回滚本次状态（删除新建策略/审批单/签名，或恢复
 更新前的旧值/原 pending 状态），保证状态与事件一致。
 
+## 资产账本
+
+资产操作单（asset operation）是对钱包内某资产余额的一笔带符号增量
+（delta）入账，采用"先建单（pending）、后提交（committed）"两阶段。
+
+- `POST /v1/wallets/{wallet_id}/asset-operations`，请求体
+  `{"operation_id", "asset_id", "delta"}`：
+  - `operation_id`、`asset_id` 均须非空且匹配
+    `[A-Za-z0-9_-]{1,128}`；`delta` 必须是**非布尔、非零整数**
+    （可为负）。任一非法返回 `400`；钱包不存在返回 `404`。
+  - 首次创建返回 `201`，响应体 `R` 为
+    `{operation_id, asset_id, delta, state: pending, balance: null,
+    version: null}`。pending 阶段不产生资产余额、不记审计事件。
+  - 同 `operation_id` 同参重放返回 `200` 且响应体与首次**完全相同**；
+    同 `operation_id` 异参（不同 `asset_id` 或 `delta`）返回 `409`，
+    原单不被覆盖。`operation_id` 在**钱包内**唯一（不同钱包可复用）。
+- `POST .../asset-operations/{operation_id}/commit`：仅 `pending` 可提交。
+  在每钱包事务锁内检查 `balance + delta >= 0`：
+  - 余额不足返回 `409`，**不改动任何状态、不记事件**，待入账后可重试；
+  - 成功则原子地：更新资产余额、`version + 1`、操作单置 `committed`，
+    返回 `201` 与入账后的 `R`
+    （`balance`/`version` 为结果整数）。
+  - `committed` 重放（含并发落败方）返回 `200` 同体、**不重复入账、
+    不重复记事件**；对终态再提交以外的非法状态返回 `409`。
+  - 并发提交同一操作：恰有一个 `201`，其余全部 `200`，余额/版本只入账
+    一次。
+- `GET /v1/wallets/{wallet_id}/assets/{asset_id}` 返回
+  `{balance, version}`。资产在首次成功提交前不存在（仅有 pending 单
+  也算不存在），返回 `404`；钱包不存在返回 `404`。
+- 余额与版本持久化：服务重启后 pending/committed 均保持，幂等重放
+  行为不变；`version` 从 1 起随每次成功提交严格 `+1`，禁止倒退或
+  重复版本；不同资产各自独立计数。
+
+资产审计事件（七字段，`seq` 在该钱包内连续）：
+
+| 类型 | 何时记录 | request_id / actor_id / reason / details |
+| ---- | ---- | ---- |
+| `asset_operation_committed` | 操作单**首次成功提交** | `request_id=operation_id`，`actor_id`/`reason` 为 `null`；`details` 即提交返回的 `R` |
+
+建单重放、提交重放、余额不足失败、启动恢复均**不**产生事件，因此
+审计 `seq` 不因失败或重放出现缺口。提交的状态变更（操作单、资产
+余额/版本）与事件追加在同一把每钱包事务锁内原子完成：事件落盘失败
+则回滚操作单为原 pending、恢复资产旧余额/版本，绝不留下半提交数据。
+
 ## 多进程与故障恢复
 
 - 多个服务进程可**共用同一 data-dir**：策略、审批单、签名、份额轮换
@@ -205,10 +252,13 @@ python -m unittest discover -s tests -v
 
 ## 私钥安全边界
 
-- **响应**：建钱包只返回 `share_ids` 与公钥，任何接口都不返回私钥。
+- **响应**：建钱包只返回 `share_ids` 与公钥，任何接口都不返回私钥；
+  资产账本接口（`asset-operations`/`assets`）只返回标识、整数余额与
+  版本，不含任何密钥材料。
 - **磁盘**：钱包元数据文件不含任何私钥；两个份额私钥分文件存放
   （`shares/<wallet_id>/<share_id>.json`），轮换准备期的新份额私钥
   分文件暂存于 `rotation-staging/<wallet_id>/<rotation_id>/`，
   任何文件至多含一个份额私钥，从不存在两者拼接后的完整私钥。
-  写入采用临时文件 + 原子替换。
+  资产操作单（`asset-operations/`）与余额（`assets/`）文件只含
+  标识与整数，绝无私钥。写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。

@@ -53,6 +53,17 @@ class NoFullPrivateKeyTest(unittest.TestCase):
         self.srv.request("POST", "/v1/wallets/w-audit/sign", body)
         self.srv.request("GET", "/v1/wallets/w-audit")
 
+        # 同时产生资产操作单与资产余额文件，使其纳入全盘私钥扫描
+        self.srv.request(
+            "POST",
+            "/v1/wallets/w-audit/asset-operations",
+            {"operation_id": "aop-1", "asset_id": "USD", "delta": 100},
+        )
+        self.srv.request(
+            "POST", "/v1/wallets/w-audit/asset-operations/aop-1/commit"
+        )
+        self.srv.request("GET", "/v1/wallets/w-audit/assets/USD")
+
         self.priv1 = self.srv.harness.share_private_hex("w-audit", "share-1")
         self.priv2 = self.srv.harness.share_private_hex("w-audit", "share-2")
 

@@ -436,6 +436,74 @@ class FaultPointRestartTest(unittest.TestCase):
             [e["type"] for e in events], ["share_rotation_prepared"]
         )
 
+    def test_real_active_with_leftover_residue_keeps_active_no_event(self):
+        """真实激活（prepared+activated 两事件均已提交）后，若崩溃残留了
+        暂存新份额与 *.bak.json 备份：启动恢复保留 active、删除整个暂存
+        目录（含备份），不回退状态、不产生第三个事件、不留私钥副本。"""
+        service = _make_service(self.data_dir)
+        service.create_share_rotation("w1", "rot-1")
+        status, view = service.activate_share_rotation("w1", "rot-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(view["state"], "active")
+        # 正常激活已清空暂存；人工重建“提交后、清理前”的残留现场
+        store = WalletStore(self.data_dir)
+        staging = self._staging_dir()
+        os.makedirs(staging, exist_ok=True)
+        residue = {
+            "share-1.bak.json": {
+                "share_id": "share-1",
+                "public_key": "ab" * 32,
+                "private_key": "cd" * 32,
+            },
+            "share-2.bak.json": {
+                "share_id": "share-2",
+                "public_key": "ef" * 32,
+                "private_key": "01" * 32,
+            },
+            "wallet.bak.json": {
+                "wallet_id": "w1",
+                "public_key": self.wallet_before["public_key"],
+            },
+            "rot-1-share-1.json": {
+                "share_id": "rot-1-share-1",
+                "public_key": "11" * 32,
+                "private_key": "22" * 32,
+            },
+            "rot-1-share-2.json": {
+                "share_id": "rot-1-share-2",
+                "public_key": "33" * 32,
+                "private_key": "44" * 32,
+            },
+        }
+        for name, payload in residue.items():
+            with open(os.path.join(staging, name), "w") as f:
+                json.dump(payload, f)
+
+        # 重启恢复
+        service = _make_service(self.data_dir)
+        self.assertEqual(
+            service.get_share_rotation("w1", "rot-1")["state"], "active"
+        )
+        self.assertFalse(os.path.exists(staging))
+        # 在钱包/份额仍是新轮换结果，active 未倒退
+        store = WalletStore(self.data_dir)
+        wallet = store.get_wallet("w1")
+        self.assertEqual(wallet["public_key"], view["public_key"])
+        # 仍只有 prepared + activated 两条事件，恢复不记事件
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["share_rotation_prepared", "share_rotation_activated"],
+        )
+        # 被清理的残留私钥不留任何副本
+        leaked = {"cd" * 32, "01" * 32, "22" * 32, "44" * 32}
+        for base, _, files in os.walk(self.data_dir):
+            for name in files:
+                with open(os.path.join(base, name), "rb") as f:
+                    raw = f.read()
+                for priv in leaked:
+                    self.assertNotIn(priv.encode(), raw, name)
+
 
 class StagingLeftoverValidityTest(unittest.TestCase):
     """启动恢复对轮换残留的判定：仅完整有效的 prepared 暂存保留。"""
