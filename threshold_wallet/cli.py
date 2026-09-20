@@ -263,24 +263,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
         elif args.command == "share-sign":
+            from .service import ServiceError, WalletService
             from .store import RecoveryError, WalletStore
-            from .service import WalletService
 
             # 经服务层构造（在该钱包事务锁外先做启动恢复编排），避免
-            # 在激活崩溃半完成时读到半换入/半删除的份额文件。恢复失败
-            # 直接报错退出，绝不基于不一致的份额签名。
+            # 在激活崩溃半完成时读到半换入/半删除的份额文件。读取份额
+            # 本身也经服务层在该钱包事务锁内先懒恢复再读，绝不基于
+            # 不一致的份额签名。恢复失败或钱包/份额不存在：单行 JSON
+            # 到 stderr 并非零退出。
             try:
                 service = WalletService(WalletStore(args.data_dir))
-            except RecoveryError as exc:
-                return _fail(f"recovery failed, refusing to sign: {exc}")
-            share = service._store.get_share(
-                args.wallet_id, args.share_id
-            )
-            if share is None:
-                return _fail(
-                    f"share {args.share_id!r} of wallet "
-                    f"{args.wallet_id!r} not found"
+                share = service.get_share_for_signing(
+                    args.wallet_id, args.share_id
                 )
+            except (RecoveryError, ServiceError) as exc:
+                return _fail(str(exc))
             payload = crypto.build_payload(
                 args.signing_request_id, args.message
             )

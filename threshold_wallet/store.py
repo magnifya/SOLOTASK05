@@ -7,6 +7,9 @@
                                     单个份额（份额私钥以 hex 保存），一份一个文件
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
     policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
+    transaction-policies/<wallet_id>.json
+                                    该钱包的冷热钱包交易策略
+                                    （mode/max_delta/allowed_assets，只含标识与整数）
     requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
     rotations/<wallet_id>.json      该钱包的份额轮换记录（prepared/activating/active）
     rotation-staging/<wallet_id>/<rotation_id>/
@@ -82,6 +85,9 @@ class WalletStore:
         self._shares_dir = os.path.join(data_dir, "shares")
         self._signatures_dir = os.path.join(data_dir, "signatures")
         self._policies_dir = os.path.join(data_dir, "policies")
+        self._transaction_policies_dir = os.path.join(
+            data_dir, "transaction-policies"
+        )
         self._requests_dir = os.path.join(data_dir, "requests")
         self._rotations_dir = os.path.join(data_dir, "rotations")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
@@ -91,6 +97,7 @@ class WalletStore:
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
         os.makedirs(self._policies_dir, exist_ok=True)
+        os.makedirs(self._transaction_policies_dir, exist_ok=True)
         os.makedirs(self._requests_dir, exist_ok=True)
         os.makedirs(self._rotations_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
@@ -241,6 +248,28 @@ class WalletStore:
         """返回钱包的审批策略，未设置返回 None。"""
         return self._read_json(self._policy_path(wallet_id))
 
+    # ---- 冷热钱包交易策略 -----------------------------------------------
+
+    def _transaction_policy_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(
+            self._transaction_policies_dir, wallet_id + ".json"
+        )
+
+    def save_transaction_policy(self, wallet_id: str, policy: dict) -> None:
+        """原子地写入（或覆盖）钱包的冷热钱包交易策略。
+
+        策略只含 mode/max_delta/allowed_assets（标识与整数），不含任何
+        私钥材料。
+        """
+        path = self._transaction_policy_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, policy)
+
+    def get_transaction_policy(self, wallet_id: str) -> Optional[dict]:
+        """返回钱包的冷热钱包交易策略，未设置返回 None。"""
+        return self._read_json(self._transaction_policy_path(wallet_id))
+
     # ---- 签名请求审批单 ---------------------------------------------------
 
     def create_request(
@@ -288,6 +317,15 @@ class WalletStore:
     def delete_policy(self, wallet_id: str) -> None:
         """删除钱包的审批策略文件（策略事件追加失败时回滚用）。"""
         path = self._policy_path(wallet_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def delete_transaction_policy(self, wallet_id: str) -> None:
+        """删除钱包的冷热钱包交易策略文件（策略事件追加失败时回滚用）。"""
+        path = self._transaction_policy_path(wallet_id)
         with self._lock:
             try:
                 os.unlink(path)

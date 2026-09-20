@@ -30,6 +30,9 @@ SHARE_IDS = ("share-1", "share-2")
 #: 审批策略允许的 required_approvals 取值
 ALLOWED_REQUIRED_APPROVALS = (1, 2)
 
+#: 冷热钱包交易策略允许的 mode 取值
+TRANSACTION_POLICY_MODES = ("hot", "cold")
+
 #: approve/reject 附言 reason 的最大长度
 MAX_REASON_LENGTH = 1024
 
@@ -273,6 +276,35 @@ class WalletService:
             "created_at": record["created_at"],
         }
 
+    def get_share_for_signing(
+        self, wallet_id: str, share_id: str
+    ) -> dict:
+        """供 share-sign 本地命令读取当前在用的单个份额（含私钥 hex）。
+
+        必须在该钱包的事务锁内先做懒恢复（_heal_wallet）再读份额：
+        份额轮换激活崩溃可能留下半换入/半删除的份额文件，绝不能基于
+        不一致的现场读出份额私钥签名。钱包不存在或该在用份额不存在
+        返回 404；恢复无法对账到一致状态时 RecoveryError 向上抛出，
+        由调用方 fail-closed（输出 JSON 并非零退出）。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                wallet = self._store.get_wallet(wallet_id)
+                if wallet is None:
+                    raise ServiceError(
+                        404, f"wallet {wallet_id!r} not found"
+                    )
+                share = self._store.get_share(wallet_id, share_id)
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id or share_id")
+        if share is None:
+            raise ServiceError(
+                404,
+                f"share {share_id!r} of wallet {wallet_id!r} not found",
+            )
+        return share
+
     # ---- 审批策略 -------------------------------------------------------
 
     def _get_wallet_or_404(self, wallet_id: str) -> dict:
@@ -337,6 +369,106 @@ class WalletService:
                     self._store.save_policy(wallet_id, old_policy)
                 raise
         return policy
+
+    # ---- 冷热钱包交易策略 -------------------------------------------------
+
+    @staticmethod
+    def _validate_transaction_policy(
+        mode: object, max_delta: object, allowed_assets: object
+    ) -> None:
+        # mode：非空字符串且只能是 hot/cold（None 等空值一律 400）
+        if not isinstance(mode, str) or mode not in TRANSACTION_POLICY_MODES:
+            raise ServiceError(400, "mode must be one of: hot, cold")
+        # max_delta：bool 是 int 子类必须先排除；必须正整数
+        if (
+            not isinstance(max_delta, int)
+            or isinstance(max_delta, bool)
+            or max_delta <= 0
+        ):
+            raise ServiceError(400, "max_delta must be a positive integer")
+        # allowed_assets：非空数组、逐项合法、去重（重复即 400）
+        if not isinstance(allowed_assets, list) or not allowed_assets:
+            raise ServiceError(
+                400, "allowed_assets must be a non-empty list"
+            )
+        seen: set[str] = set()
+        for index, asset in enumerate(allowed_assets):
+            if not isinstance(asset, str) or not ROTATION_ID_RE.match(asset):
+                raise ServiceError(
+                    400,
+                    f"allowed_assets[{index}] must match "
+                    r"[A-Za-z0-9_-]{1,128}",
+                )
+            if asset in seen:
+                raise ServiceError(
+                    400, f"allowed_assets contains duplicate entry {asset!r}"
+                )
+            seen.add(asset)
+
+    def put_transaction_policy(
+        self,
+        wallet_id: str,
+        mode: object,
+        max_delta: object,
+        allowed_assets: object,
+    ) -> dict:
+        """设置/更新冷热钱包交易策略。
+
+        成功 200 并原样返回策略三项；钱包不存在 404；mode/max_delta/
+        allowed_assets 的类型、空值、重复或非法资产一律 400。策略与
+        transaction_policy_updated 事件在每钱包事务锁内原子持久化，
+        同值更新也记录事件（details 恰为策略三项）。
+        """
+        self._get_wallet_or_404(wallet_id)
+        self._validate_transaction_policy(mode, max_delta, allowed_assets)
+        policy = {
+            "mode": mode,
+            "max_delta": max_delta,
+            "allowed_assets": list(allowed_assets),
+        }
+        with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
+            # 旧值在锁内读取：事件追加失败时据此回滚（首设则删除）
+            old_policy = self._store.get_transaction_policy(wallet_id)
+            self._store.save_transaction_policy(wallet_id, policy)
+            event = self._audit_event(
+                audit.TYPE_TRANSACTION_POLICY_UPDATED,
+                details={
+                    "mode": mode,
+                    "max_delta": max_delta,
+                    "allowed_assets": list(allowed_assets),
+                },
+            )
+            try:
+                self._emit(wallet_id, event)
+            except BaseException:
+                # 状态/事件原子：事件未落盘则回滚策略状态
+                if old_policy is None:
+                    self._store.delete_transaction_policy(wallet_id)
+                else:
+                    self._store.save_transaction_policy(
+                        wallet_id, old_policy
+                    )
+                raise
+        return dict(policy)
+
+    def get_transaction_policy(self, wallet_id: str) -> dict:
+        """查询冷热钱包交易策略：未配置 404，已配置 200 返回策略三项。"""
+        self._get_wallet_or_404(wallet_id)
+        with self._wallet_lock(wallet_id):
+            # 查询前先自愈他进程崩溃遗留的现场
+            self._heal_wallet(wallet_id)
+            policy = self._store.get_transaction_policy(wallet_id)
+            if policy is None:
+                raise ServiceError(
+                    404,
+                    f"wallet {wallet_id!r} has no transaction policy",
+                )
+            return {
+                "mode": policy["mode"],
+                "max_delta": policy["max_delta"],
+                "allowed_assets": list(policy["allowed_assets"]),
+            }
 
     # ---- 签名请求审批单 ---------------------------------------------------
 
@@ -792,18 +924,11 @@ class WalletService:
         with self._wallet_lock(wallet_id):
             # 快照前先自愈他进程崩溃遗留的提交意图，balance/version 才准确
             self._heal_wallet(wallet_id)
-            # R 的 balance/version 快照资产在创建时刻的账本状态
-            asset = self._store.get_asset(wallet_id, asset_id)
-            record = {
-                "operation_id": operation_id,
-                "asset_id": asset_id,
-                "state": "pending",
-                "delta": delta,
-                "balance": asset["balance"] if asset is not None else 0,
-                "version": asset["version"] if asset is not None else 0,
-            }
-            existing = self._store.create_asset_operation(
-                wallet_id, operation_id, record
+            # 重放优先：已存在的操作（pending/committed）按幂等规则原样
+            # 返回或异参 409，绝不用当前策略重新校验——策略更新不影响
+            # 已创建的 pending 操作。
+            existing = self._store.get_asset_operation(
+                wallet_id, operation_id
             )
             if existing is not None:
                 if (
@@ -815,8 +940,41 @@ class WalletService:
                         f"asset operation {operation_id!r} already exists "
                         "with different parameters",
                     )
-                # 同参重放：原样返回磁盘中的当前记录，不改状态、不记事件
                 return 200, existing
+            # 全新首提：按创建时刻的当前交易策略检查。无策略时行为不变；
+            # 有策略时资产必须在白名单内且 abs(delta) <= max_delta。
+            # 检查在任何落盘之前，失败 409 时账本、version、审计与幂等
+            # 结果均不变，且同一 operation_id 之后仍可重新首提。
+            policy = self._store.get_transaction_policy(wallet_id)
+            if policy is not None:
+                if asset_id not in policy["allowed_assets"]:
+                    raise ServiceError(
+                        409,
+                        f"asset {asset_id!r} is not in the transaction "
+                        "policy allowed_assets",
+                    )
+                if abs(delta) > policy["max_delta"]:
+                    raise ServiceError(
+                        409,
+                        "abs(delta) exceeds the transaction policy "
+                        f"max_delta {policy['max_delta']}",
+                    )
+            # R 的 balance/version 快照资产在创建时刻的账本状态
+            asset = self._store.get_asset(wallet_id, asset_id)
+            record = {
+                "operation_id": operation_id,
+                "asset_id": asset_id,
+                "state": "pending",
+                "delta": delta,
+                "balance": asset["balance"] if asset is not None else 0,
+                "version": asset["version"] if asset is not None else 0,
+            }
+            # 同钱包事务锁内无并发写者；返回 existing 仅作兜底（不应到达）
+            raced = self._store.create_asset_operation(
+                wallet_id, operation_id, record
+            )
+            if raced is not None:
+                return 200, raced
         return 201, record
 
     # ---- 资产提交的崩溃恢复 ----------------------------------------------
@@ -1279,13 +1437,38 @@ class WalletService:
             )
             record = {"message": message, "signature": aggregate.hex()}
 
-            # 启用审批策略时：必须存在同 id、同 message 且已 approved 的审批单。
-            # 这一步可能原子地把超时 pending 单记一次 E 并转为 expired。
+            # 签名审批门控（这一步可能原子地把超时 pending 单记一次 E
+            # 并转为 expired）：
+            # - hot 沿用审批规则：设了审批策略才要求同 id、同 message 且
+            #   approved 的审批单，未设审批策略时行为不变；
+            # - cold 强制要求 approved 审批单：无审批策略、无审批单或
+            #   未 approved 一律 409（hot 下无单仍按原规则 404）。
             approval_record = None
-            if self._store.get_policy(wallet_id) is not None:
-                approval_record = self._fetch_request_or_404(
-                    wallet_id, signing_request_id
-                )
+            tx_policy = self._store.get_transaction_policy(wallet_id)
+            approval_policy = self._store.get_policy(wallet_id)
+            cold = tx_policy is not None and tx_policy["mode"] == "cold"
+            require_approval = cold or approval_policy is not None
+            if require_approval:
+                if cold and approval_policy is None:
+                    # cold 而无审批策略：审批单无法被创建，不可能 approved
+                    raise ServiceError(
+                        409,
+                        f"wallet {wallet_id!r} has no approval policy for "
+                        "cold signing",
+                    )
+                try:
+                    approval_record = self._fetch_request_or_404(
+                        wallet_id, signing_request_id
+                    )
+                except ServiceError as exc:
+                    if exc.status == 404 and cold:
+                        # cold 下无对应审批单按冲突 409 处理（hot 仍 404）
+                        raise ServiceError(
+                            409,
+                            f"signing request {signing_request_id!r} has no "
+                            "approved approval request",
+                        )
+                    raise
                 approval_record = self._expire_if_needed(
                     wallet_id, approval_record
                 )
