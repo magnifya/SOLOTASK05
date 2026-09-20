@@ -158,6 +158,16 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 | ---- | ---- | ---- |
 | `asset_operation_committed` | 操作**首次提交成功** | `rid=operation_id`，actor/reason 为 null；`d=R`（committed 视图）。重放与余额不足失败均不记 |
 
+提交是一个**可恢复事务**（在每钱包跨进程事务锁内）：先写只含标识与
+整数的提交意图（`asset-intents/<wallet_id>/<operation_id>.json`），再
+原子改账本（状态转 committed、`balance`、`version+1`），随后追加唯一
+的 `asset_operation_committed` 事件（`details` 即 committed 视图 R），
+成功后删除意图。任一落盘阶段被强制终止，同一 data-dir 重启（或下一次
+持锁访问）先恢复：**事件已持久化则保留事件并按 R 把账本前滚补齐**为
+唯一 committed 结果；**事件未持久化则恢复 pending 与提交前余额/版本**，
+事件从未分配 seq，故无事件、无 seq 缺口、可重试。恢复后不会出现提交
+无事件、事件与余额不符、重复 version 或重复事件；意图文件不含私钥。
+
 ## 多进程与故障恢复
 
 - 多个服务进程可**共用同一 data-dir**：策略、审批单、签名、份额轮换
@@ -173,6 +183,11 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 - 崩溃时停留在 `activating` 的现场回滚为 `prepared`（恢复原钱包元
   数据与旧份额）；已提交 `active` 的暂存与备份被清理。恢复与孤儿
   清理不产生审计事件，审计 seq 跨重启接续、连续不重号。
+- 资产提交的恢复在同一把钱包事务锁内完成：启动时扫描 `asset-intents`
+  残留逐一对账；常驻进程在持锁的查询/创建/提交前自愈他进程崩溃遗留
+  的意图。多进程同时启动或提交同一操作时，恢复与提交按钱包串行，
+  最终仅一个首次 `201`，其余 `200` 同体；恢复完成前查询与重放都
+  读不到半完成状态。
 
 ## 安装
 
@@ -244,5 +259,7 @@ python -m unittest discover -s tests -v
   分文件暂存于 `rotation-staging/<wallet_id>/<rotation_id>/`，
   任何文件至多含一个份额私钥，从不存在两者拼接后的完整私钥。
   资产账本（`assets/<wallet_id>.json`）只含标识与整数，不含私钥。
+  提交意图（`asset-intents/<wallet_id>/<operation_id>.json`）同样只含
+  标识与整数，不含私钥。
   写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。

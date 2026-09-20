@@ -18,6 +18,11 @@
     assets/<wallet_id>.json         该钱包的资产账本：asset-operations（操作
                                     状态机 pending/committed）与 assets（每个
                                     资产的 balance/version），同一文件原子写入
+    asset-intents/<wallet_id>/<operation_id>.json
+                                    资产提交的"提交意图"（可恢复事务日志）：
+                                    仅在 commit 事务窗口内存在，提交完成即删；
+                                    崩溃后启动恢复据此判定提交是否已落事件，
+                                    决定补齐账本或回滚为 pending
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -73,6 +78,7 @@ class WalletStore:
         self._rotations_dir = os.path.join(data_dir, "rotations")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
         self._assets_dir = os.path.join(data_dir, "assets")
+        self._asset_intents_dir = os.path.join(data_dir, "asset-intents")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -81,6 +87,7 @@ class WalletStore:
         os.makedirs(self._rotations_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
         os.makedirs(self._assets_dir, exist_ok=True)
+        os.makedirs(self._asset_intents_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -407,6 +414,81 @@ class WalletStore:
             else:
                 ledger["assets"][asset_id] = asset_record
             self._atomic_write(path, ledger)
+
+    # ---- 资产提交意图（可恢复事务日志）-----------------------------------
+
+    def _asset_intent_path(self, wallet_id: str, operation_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        _check_id("operation_id", operation_id)
+        return os.path.join(
+            self._asset_intents_dir, wallet_id, operation_id + ".json"
+        )
+
+    def write_asset_commit_intent(
+        self, wallet_id: str, operation_id: str, intent: dict
+    ) -> None:
+        """原子写入一条资产提交意图（commit 事务第一步）。
+
+        意图记录只含标识与整数（operation_id/asset_id/delta、提交前后
+        balance/version、事件 seq），不含任何私钥材料。
+        """
+        path = self._asset_intent_path(wallet_id, operation_id)
+        with self._lock:
+            self._atomic_write(path, intent)
+
+    def get_asset_commit_intent(
+        self, wallet_id: str, operation_id: str
+    ) -> Optional[dict]:
+        """返回某操作的提交意图，不存在返回 None。"""
+        return self._read_json(self._asset_intent_path(wallet_id, operation_id))
+
+    def delete_asset_commit_intent(
+        self, wallet_id: str, operation_id: str
+    ) -> None:
+        """删除提交意图（commit 事务完成/中止的最后一步）。"""
+        path = self._asset_intent_path(wallet_id, operation_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def list_asset_intent_wallet_ids(self) -> list[str]:
+        """返回存在提交意图目录的全部 wallet_id。"""
+        try:
+            names = os.listdir(self._asset_intents_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name
+            for name in names
+            if os.path.isdir(os.path.join(self._asset_intents_dir, name))
+        )
+
+    def list_asset_intents(self, wallet_id: str) -> list[tuple[str, Optional[dict]]]:
+        """返回某钱包全部提交意图 (operation_id, intent|None)。
+
+        intent 为 None 表示文件存在但 JSON 不可解析（原子写使正常流程
+        不会出现，仅外部损坏时）：调用方据文件名的 operation_id 与账本/
+        审计对账即可，不依赖意图内容。
+        """
+        _check_id("wallet_id", wallet_id)
+        base = os.path.join(self._asset_intents_dir, wallet_id)
+        try:
+            names = os.listdir(base)
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+        result: list[tuple[str, Optional[dict]]] = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            operation_id = name[: -len(".json")]
+            if not _SAFE_ID.match(operation_id):
+                # 非预期文件：不纳入恢复，也不删除业务数据
+                continue
+            data = self._read_json(os.path.join(base, name))
+            result.append((operation_id, data if isinstance(data, dict) else None))
+        return sorted(result, key=lambda item: item[0])
 
     # ---- 份额文件与钱包元数据（轮换激活用）--------------------------------
 
