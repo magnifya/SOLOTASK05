@@ -172,10 +172,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "serve":
             # 延迟导入：客户端命令不需要 store/server
             from .server import serve
-            from .store import WalletStore
+            from .store import RecoveryError, WalletStore
             from .service import WalletService
 
-            service = WalletService(WalletStore(args.data_dir))
+            # 构造服务即完成启动恢复；恢复无法对账到一致状态时必须阻止
+            # 服务就绪（fail-closed）：打印单行 JSON 错误并以非零码退出，
+            # 绝不绑定端口对外暴露半完成状态。
+            try:
+                service = WalletService(WalletStore(args.data_dir))
+            except RecoveryError as exc:
+                return _fail(f"recovery failed, refusing to serve: {exc}")
+            except OSError as exc:
+                return _fail(f"cannot open data dir, refusing to serve: {exc}")
             print(
                 json.dumps(
                     {
@@ -255,10 +263,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
         elif args.command == "share-sign":
-            from .store import WalletStore
+            from .store import RecoveryError, WalletStore
+            from .service import WalletService
 
-            store = WalletStore(args.data_dir)
-            share = store.get_share(args.wallet_id, args.share_id)
+            # 经服务层构造（在该钱包事务锁外先做启动恢复编排），避免
+            # 在激活崩溃半完成时读到半换入/半删除的份额文件。恢复失败
+            # 直接报错退出，绝不基于不一致的份额签名。
+            try:
+                service = WalletService(WalletStore(args.data_dir))
+            except RecoveryError as exc:
+                return _fail(f"recovery failed, refusing to sign: {exc}")
+            share = service._store.get_share(
+                args.wallet_id, args.share_id
+            )
             if share is None:
                 return _fail(
                     f"share {args.share_id!r} of wallet "

@@ -26,9 +26,11 @@ import time
 import unittest
 
 from threshold_wallet import crypto
+from threshold_wallet import audit as audit_mod
+from threshold_wallet.audit import AuditStore
 from threshold_wallet.flock import FileLock, wallet_lock_path
 from threshold_wallet.service import ServiceError, WalletService
-from threshold_wallet.store import WalletStore
+from threshold_wallet.store import RecoveryError, WalletStore
 
 
 # ---- 子进程 worker（模块级，可 pickle） ------------------------------------
@@ -84,7 +86,10 @@ def _child_crash_mid_activation(data_dir, wallet_id, rotation_id, point,
 
     point="after_marker"：activating 标记 + 备份落盘后崩溃；
     point="after_swap"：新份额已换入、钱包元数据已改、旧份额已删后崩溃；
-    point="after_commit"：轮换状态已提交 active，暂存未清理。
+    point="after_commit"：轮换状态已提交 active，但激活事件尚未落盘（按事件
+                            为提交点的新语义，重启须回滚 prepared）；
+    point="after_event"：active 状态与 share_rotation_activated 事件均已
+                            落盘，仅暂存/备份未清理（重启须保持 active）。
 
     就绪通知用 Event（信号量语义，立即对父进程可见）；不能用
     multiprocessing.Queue——os._exit 会跳过后台 feeder 线程的冲刷。
@@ -123,10 +128,52 @@ def _child_crash_mid_activation(data_dir, wallet_id, rotation_id, point,
     if point == "after_swap":
         ready_event.set()
         os._exit(1)
+    if point == "after_event_activating":
+        # 极端窗口：新份额/元数据已换入、记录仍为 activating，但激活事件
+        # 已落盘（状态推进与事件非原子）。事件即提交点：重启须前滚为
+        # active 并清理，不得回滚。
+        AuditStore(data_dir).append_event(
+            wallet_id,
+            {
+                "type": audit_mod.TYPE_SHARE_ROTATION_ACTIVATED,
+                "at": "2026-09-20T00:00:00Z",
+                "request_id": None,
+                "actor_id": None,
+                "reason": None,
+                "details": {
+                    "rotation_id": rotation_id,
+                    "share_ids": list(record["share_ids"]),
+                    "public_key": record["public_key"],
+                    "previous_public_key": wallet["public_key"],
+                },
+            },
+        )
+        ready_event.set()
+        os._exit(1)
     active = dict(record)
     active["state"] = "active"
     active["previous_public_key"] = wallet["public_key"]
     store.update_rotation(wallet_id, rotation_id, active)
+    if point == "after_commit":
+        ready_event.set()
+        os._exit(1)
+    # after_event：提交点事件已落盘，暂存/备份尚未清理
+    AuditStore(data_dir).append_event(
+        wallet_id,
+        {
+            "type": audit_mod.TYPE_SHARE_ROTATION_ACTIVATED,
+            "at": "2026-09-20T00:00:00Z",
+            "request_id": None,
+            "actor_id": None,
+            "reason": None,
+            "details": {
+                "rotation_id": rotation_id,
+                "share_ids": list(record["share_ids"]),
+                "public_key": record["public_key"],
+                "previous_public_key": wallet["public_key"],
+            },
+        },
+    )
     ready_event.set()
     os._exit(1)
 
@@ -413,9 +460,35 @@ class FaultPointRestartTest(unittest.TestCase):
             [e["type"] for e in events], ["share_rotation_prepared"]
         )
 
-    def test_crash_after_commit_keeps_active_and_cleans_staging(self):
+    def test_crash_after_state_but_before_event_rolls_back_to_prepared(self):
+        # 轮换状态已写 active，但 share_rotation_activated 事件尚未落盘：
+        # 事件才是提交点，重启必须恢复旧公钥/旧份额、置回 prepared，
+        # 保留经校验有效的暂存份额，且不产生激活事件。
         self._crash_at("after_commit")
-        # 提交已完成：状态保持 active，不回退；暂存与备份被清理
+        service = _make_service(self.data_dir)
+        view = service.get_share_rotation("w1", "rot-1")
+        self.assertEqual(view["state"], "prepared")
+        store = WalletStore(self.data_dir)
+        self.assertEqual(store.get_wallet("w1"), self.wallet_before)
+        for sid, record in self.old_shares.items():
+            self.assertEqual(store.get_share("w1", sid), record)
+        self.assertEqual(
+            sorted(os.listdir(self._staging_dir())),
+            ["rot-1-share-1.json", "rot-1-share-2.json"],
+        )
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events], ["share_rotation_prepared"]
+        )
+        # 回滚后可重新激活（首提 201）
+        status, active = service.activate_share_rotation("w1", "rot-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(active["state"], "active")
+
+    def test_crash_after_event_keeps_active_and_cleans_staging(self):
+        # 激活事件已落盘：即使暂存/备份尚未清理，也必须保持 active，
+        # 前滚补齐并清理全部残留，且不重复记事件。
+        self._crash_at("after_event")
         service = _make_service(self.data_dir)
         view = service.get_share_rotation("w1", "rot-1")
         self.assertEqual(view["state"], "active")
@@ -433,7 +506,37 @@ class FaultPointRestartTest(unittest.TestCase):
         self.assertEqual(again["state"], "active")
         events = service.get_audit_events("w1")["events"]
         self.assertEqual(
-            [e["type"] for e in events], ["share_rotation_prepared"]
+            [e["type"] for e in events],
+            ["share_rotation_prepared", "share_rotation_activated"],
+        )
+
+    def test_crash_event_landed_while_activating_forwards_to_active(self):
+        # 记录仍为 activating 但激活事件已落盘：事件是提交点，必须
+        # 前滚为唯一 active 结果（而非回滚），且不重复记事件。
+        self._crash_at("after_event_activating")
+        service = _make_service(self.data_dir)
+        view = service.get_share_rotation("w1", "rot-1")
+        self.assertEqual(view["state"], "active")
+        self.assertFalse(os.path.exists(self._staging_dir()))
+        store = WalletStore(self.data_dir)
+        wallet = store.get_wallet("w1")
+        self.assertEqual(wallet["public_key"], view["public_key"])
+        self.assertEqual(
+            [s["share_id"] for s in wallet["shares"]],
+            ["rot-1-share-1", "rot-1-share-2"],
+        )
+        for sid in ("share-1", "share-2"):
+            self.assertIsNone(store.get_share("w1", sid))
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["share_rotation_prepared", "share_rotation_activated"],
+        )
+        self.assertEqual(
+            service.activate_share_rotation("w1", "rot-1")[0], 200
+        )
+        self.assertEqual(
+            len(service.get_audit_events("w1")["events"]), 2
         )
 
 
@@ -796,29 +899,21 @@ class AuditContinuityTest(unittest.TestCase):
             os.path.join(staging_root, "rot-broken", "rot-broken-share-1.json")
         )
         record = store.get_rotation("w1", "rot-broken")
-        # 再补一条 active 记录与其残留暂存
-        store.create_rotation(
-            "w1",
-            "rot-done",
-            {
-                "rotation_id": "rot-done",
-                "state": "active",
-                "share_ids": ["rot-done-share-1", "rot-done-share-2"],
-                "public_key": "ab" * 64,
-                "created_at": record["created_at"],
-            },
-        )
-        os.makedirs(os.path.join(staging_root, "rot-done"))
+        # 再补一个无记录的孤儿暂存目录（含来路不明的份额文件）
+        done_dir = os.path.join(staging_root, "rot-done")
+        os.makedirs(done_dir)
+        with open(os.path.join(done_dir, "leftover.json"), "w") as f:
+            json.dump({"share_id": "leftover"}, f)
         # 重启触发恢复与清理
         self.service = _make_service(self.data_dir)
         events_after = self._events()
-        # 孤儿清理、失效记录删除、active 残留清理都不新增业务事件
+        # 孤儿清理与失效记录删除都不新增业务事件
         self.assertEqual(len(events_after), count_before + 1)  # 仅 prepared 一条
         self._assert_seq_continuous(events_after)
         # 清理确实发生
         self.assertFalse(os.path.exists(os.path.join(staging_root, "rot-orphan")))
         self.assertFalse(os.path.exists(os.path.join(staging_root, "rot-broken")))
-        self.assertFalse(os.path.exists(os.path.join(staging_root, "rot-done")))
+        self.assertFalse(os.path.exists(done_dir))
 
 
 if __name__ == "__main__":

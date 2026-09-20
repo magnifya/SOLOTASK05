@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from . import audit, crypto
 from .audit import AuditStore
 from .flock import FileLock, wallet_lock_path
-from .store import DuplicateWalletError, WalletStore
+from .store import DuplicateWalletError, RecoveryError, WalletStore
 
 #: 两方门限：份额数固定为 2
 REQUIRED_SHARES = 2
@@ -120,20 +120,86 @@ class WalletService:
     def _recover_on_startup(self) -> None:
         """启动恢复编排：逐个钱包在其跨进程事务锁内恢复轮换现场与未完成
         的资产提交事务。对外服务前必须完成，使任何查询/重放都读不到
-        半完成状态。"""
+        半完成状态。
+
+        任一钱包恢复失败（RecoveryError/OSError）都向上抛出，由调用方阻止
+        服务就绪（fail-closed）：绝不静默跳过带着损坏现场对外服务。"""
         wallet_ids = sorted(
             set(self._store.list_rotation_wallet_ids())
             | set(self._store.list_staging_wallet_ids())
             | set(self._store.list_asset_intent_wallet_ids())
         )
         for wallet_id in wallet_ids:
-            try:
-                with self._wallet_lock(wallet_id):
-                    self._store.recover_wallet_rotation(wallet_id)
-                    self._recover_wallet_asset_commits(wallet_id)
-            except (ValueError, OSError):
-                # 单个钱包的恢复失败不影响其他钱包，尽力而为
-                continue
+            with self._wallet_lock(wallet_id):
+                self._recover_wallet(wallet_id)
+
+    def _activated_rotations(self, wallet_id: str) -> dict[str, dict]:
+        """该钱包已落盘的 share_rotation_activated 事件映射。"""
+        return self._audit.activated_rotation_events(wallet_id)
+
+    def _recover_wallet(self, wallet_id: str) -> None:
+        """在已持有该钱包事务锁的前提下，恢复轮换现场与未完成的资产提交。
+
+        两者以同一把钱包锁串行，任何一个失败都向上抛出（RecoveryError/
+        OSError），由调用方决定阻止就绪或把请求转成 503，绝不静默。"""
+        self._store.recover_wallet_rotation(
+            wallet_id, self._activated_rotations(wallet_id)
+        )
+        self._recover_wallet_asset_commits(wallet_id)
+
+    def _heal_wallet(self, wallet_id: str) -> None:
+        """持锁后自愈他进程崩溃遗留的现场（懒恢复，fail-closed）。
+
+        常驻进程不会重跑启动恢复；为使任何查询/重放永远读不到他进程
+        留下的半完成激活或半完成提交，业务操作在拿到钱包事务锁后先调用
+        本方法。在途事务必持同锁，故这里看到的残留只能来自崩溃进程：
+
+        - 资产提交意图残留：按提交事件是否落盘前滚或回滚；
+        - activating 记录：激活事务窗口内的残留，按激活事件前滚/回滚；
+        - active 记录但暂存/备份仍残留、或激活事件缺失：崩溃现场，
+          按事件前滚补齐或（事件在却无法补齐时）fail-closed；
+        - 无任何记录对应的孤儿暂存目录：安全删除。
+
+        静止现场不触发恢复：prepared（暂存完整待激活）与干净完成的
+        active（事件在、暂存已清空）。对账失败向上抛出
+        RecoveryError/OSError，绝不静默继续。
+        """
+        if self._store.list_asset_intents(wallet_id):
+            self._recover_wallet(wallet_id)
+            return
+        rotations = self._store.list_rotations(wallet_id)
+        staging_ids = set(self._store.list_staging_rotation_ids(wallet_id))
+        needs_recovery = False
+        active_check = False
+        for record in rotations:
+            state = record.get("state")
+            rid = record.get("rotation_id")
+            if state == "activating":
+                needs_recovery = True
+            elif state == "active":
+                # 干净完成的 active：事件在且暂存已清空。暂存残留或
+                # 事件缺失才是崩溃现场（后者需读审计判定）。
+                if rid in staging_ids:
+                    needs_recovery = True
+                else:
+                    active_check = True
+            elif state == "prepared" and isinstance(rid, str):
+                # prepared 的暂存目录是预期现场，不算孤儿
+                staging_ids.discard(rid)
+        if not needs_recovery and active_check:
+            activated = self._activated_rotations(wallet_id)
+            for record in rotations:
+                if (
+                    record.get("state") == "active"
+                    and record.get("rotation_id") not in activated
+                ):
+                    needs_recovery = True
+                    break
+        if not needs_recovery and staging_ids:
+            # 无对应 prepared 记录的孤儿暂存目录
+            needs_recovery = True
+        if needs_recovery:
+            self._recover_wallet(wallet_id)
 
     @staticmethod
     def _audit_event(
@@ -192,7 +258,11 @@ class WalletService:
 
     def get_wallet(self, wallet_id: str) -> dict:
         try:
-            record = self._store.get_wallet(wallet_id)
+            with self._wallet_lock(wallet_id):
+                # 查询前先自愈他进程崩溃遗留的激活现场，绝不把换了一半
+                # 的公钥/份额经 GET 暴露出去
+                self._heal_wallet(wallet_id)
+                record = self._store.get_wallet(wallet_id)
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
         if record is None:
@@ -247,6 +317,7 @@ class WalletService:
         old_policy = self._store.get_policy(wallet_id)
         operation = "created" if old_policy is None else "updated"
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             self._store.save_policy(wallet_id, policy)
             event = self._audit_event(
                 audit.TYPE_POLICY_UPDATED,
@@ -364,6 +435,7 @@ class WalletService:
             "reason": None,
         }
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             existing = self._store.create_request(wallet_id, request_id, record)
             if existing is not None:
                 # 重放（无论同文幂等还是异文 409）均不记事件、不改状态。
@@ -394,6 +466,7 @@ class WalletService:
     def get_sign_request(self, wallet_id: str, request_id: str) -> dict:
         self._get_wallet_or_404(wallet_id)
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             record = self._fetch_request_or_404(wallet_id, request_id)
             record = self._expire_if_needed(wallet_id, record)
             return self._request_view(record)
@@ -477,6 +550,7 @@ class WalletService:
         self._get_wallet_or_404(wallet_id)
         self._validate_rotation_id(rotation_id)
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             existing = self._store.get_rotation(wallet_id, rotation_id)
             if existing is not None:
                 # 幂等重放：原样返回，不重新生成、不记事件
@@ -539,6 +613,7 @@ class WalletService:
     def get_share_rotation(self, wallet_id: str, rotation_id: str) -> dict:
         self._get_wallet_or_404(wallet_id)
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             # 锁内读取：并发激活期间不会读到瞬态 activating
             try:
                 record = self._store.get_rotation(wallet_id, rotation_id)
@@ -561,6 +636,7 @@ class WalletService:
         self._get_wallet_or_404(wallet_id)
         self._validate_rotation_id(rotation_id)
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             record = self._store.get_rotation(wallet_id, rotation_id)
             if record is None:
                 raise ServiceError(
@@ -613,7 +689,6 @@ class WalletService:
             active_record["state"] = "active"
             active_record["previous_public_key"] = previous_public_key
 
-            committed = False
             try:
                 # 先落 activating 标记与旧份额/元数据备份：崩溃后启动
                 # 恢复据此回滚
@@ -645,19 +720,31 @@ class WalletService:
                         },
                     ),
                 )
-                committed = True
             except BaseException:
-                if not committed:
-                    # 回滚份额文件、公钥与状态，并清理激活备份
-                    # （保留暂存的新份额文件，prepared 轮换可重试激活）
-                    self._store.rollback_activation_files(wallet_id, record)
-                    self._store.update_rotation(wallet_id, rotation_id, record)
-                    self._store.delete_activation_backups(
-                        wallet_id, rotation_id
+                # 以激活事件是否真正落盘为唯一判据，而不是是否抛错：
+                landed = self._activated_rotations(wallet_id).get(rotation_id)
+                if landed is not None:
+                    # 事件已落盘（提交不可撤回）：前滚为唯一 active 并
+                    # 清理残留，绝不回滚、不重复记事件
+                    self._store.forward_complete_activation(
+                        wallet_id, active_record, landed
                     )
+                    return 201, self._rotation_view(active_record)
+                # 事件未落盘：回滚份额文件、公钥与状态，清理激活备份
+                # （保留暂存的新份额文件，prepared 轮换可重试激活）
+                self._store.rollback_activation_files(wallet_id, record)
+                self._store.update_rotation(wallet_id, rotation_id, record)
+                self._store.delete_activation_backups(
+                    wallet_id, rotation_id
+                )
                 raise
-            # 激活成功：删除暂存的新份额文件与备份
-            self._store.delete_staging(wallet_id, rotation_id)
+            # 激活成功：删除暂存的新份额文件与备份。此清理非提交点，
+            # 若清理 I/O 失败也不改结果（事件已落盘，激活已生效），
+            # 残留由重放/下一次持锁访问/重启自愈前滚时清掉。
+            try:
+                self._store.delete_staging(wallet_id, rotation_id)
+            except OSError:
+                pass
         return 201, self._rotation_view(active_record)
 
     # ---- 资产账本 ---------------------------------------------------------
@@ -704,7 +791,7 @@ class WalletService:
         self._validate_delta(delta)
         with self._wallet_lock(wallet_id):
             # 快照前先自愈他进程崩溃遗留的提交意图，balance/version 才准确
-            self._heal_asset_intents(wallet_id)
+            self._heal_wallet(wallet_id)
             # R 的 balance/version 快照资产在创建时刻的账本状态
             asset = self._store.get_asset(wallet_id, asset_id)
             record = {
@@ -744,26 +831,11 @@ class WalletService:
         - 事件不在：提交未生效，按意图记录的提交前快照把操作恢复为
           pending、资产恢复提交前 balance/version（提交前不存在则删除
           资产条目），再删意图。事件从未分配 seq，故无 seq 缺口。
-        恢复本身不记任何审计事件。
+        恢复本身不记任何审计事件。任一条意图无法对账到一致状态都抛
+        RecoveryError，由调用方阻止就绪/返回 503，绝不静默跳过。
         """
         for operation_id, intent in self._store.list_asset_intents(wallet_id):
-            try:
-                self._resolve_asset_commit_intent(wallet_id, operation_id, intent)
-            except (ValueError, OSError):
-                # 单条意图恢复失败不阻断同钱包其他事务；该意图保留在盘上，
-                # 下次重启或该操作再次提交时在锁内自愈
-                continue
-
-    def _heal_asset_intents(self, wallet_id: str) -> None:
-        """持锁后自愈他进程崩溃遗留的提交意图（懒恢复）。
-
-        常驻进程不会重跑启动恢复；为使查询/创建/提交永远读不到他进程
-        留下的半完成提交，任何资产读写在拿到钱包事务锁后先调用本方法：
-        若盘上存在意图，说明持锁者之外没有在途事务（在途必持同锁），
-        这些意图只能来自崩溃进程，按事件是否落盘对账补齐或回滚。
-        """
-        if self._store.list_asset_intents(wallet_id):
-            self._recover_wallet_asset_commits(wallet_id)
+            self._resolve_asset_commit_intent(wallet_id, operation_id, intent)
 
     def _resolve_asset_commit_intent(
         self, wallet_id: str, operation_id: str, intent: object
@@ -780,8 +852,8 @@ class WalletService:
             balance = details.get("balance") if isinstance(details, dict) else None
             version = details.get("version") if isinstance(details, dict) else None
             delta = details.get("delta") if isinstance(details, dict) else None
-            # 仅当前滚目标是形状完整的 R 时才补齐；否则保留意图不强改
-            # （原子写使正常崩溃不会产生损坏事件，此处只防御外部篡改）。
+            # 仅当前滚目标是形状完整的 R 时才补齐；事件损坏（原子写使
+            # 正常崩溃不会出现，此处只防御外部篡改）无法安全对账，fail-closed。
             if (
                 not isinstance(details, dict)
                 or not isinstance(asset_id, str)
@@ -792,7 +864,10 @@ class WalletService:
                 or not isinstance(version, int)
                 or isinstance(version, bool)
             ):
-                return None
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset operation "
+                    f"{operation_id!r} committed event is malformed"
+                )
             committed_record = {
                 "operation_id": operation_id,
                 "asset_id": asset_id,
@@ -817,16 +892,24 @@ class WalletService:
         # 事件未持久化：提交未生效，回滚为 pending 与提交前资产状态
         if not isinstance(intent, dict):
             # 意图不可解析（正常原子写不会出现）：若账本仍是 pending/无操作，
-            # 说明本就处于中止态，仅清理意图；否则保留现场不强改。
+            # 说明本就处于中止态，仅清理意图；若已被改成 committed 却无
+            # 事件，且没有可解析意图恢复提交前状态，无法安全对账，fail-closed。
             op = self._store.get_asset_operation(wallet_id, operation_id)
             if op is None or op.get("state") == "pending":
                 self._store.delete_asset_commit_intent(wallet_id, operation_id)
-            return None
+                return None
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset operation {operation_id!r} "
+                "committed without event and intent is unreadable"
+            )
         pending = intent.get("pending")
         asset_id = intent.get("asset_id")
         old_asset = intent.get("old_asset")
         if not isinstance(pending, dict) or not isinstance(asset_id, str):
-            return None
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset operation {operation_id!r} "
+                "intent is malformed"
+            )
         self._store.restore_asset_operation(
             wallet_id,
             operation_id,
@@ -861,7 +944,7 @@ class WalletService:
         with self._wallet_lock(wallet_id):
             # 先自愈他进程崩溃遗留的任何提交意图，再基于一致账本判定，
             # 绝不基于半完成状态提交。
-            self._heal_asset_intents(wallet_id)
+            self._heal_wallet(wallet_id)
 
             record = self._store.get_asset_operation(wallet_id, operation_id)
             if record is None:
@@ -968,7 +1051,7 @@ class WalletService:
         self._validate_asset_id(asset_id)
         with self._wallet_lock(wallet_id):
             # 查询前先自愈他进程崩溃遗留的提交意图，绝不返回半完成余额
-            self._heal_asset_intents(wallet_id)
+            self._heal_wallet(wallet_id)
             asset = self._store.get_asset(wallet_id, asset_id)
             if asset is None:
                 raise ServiceError(404, f"asset {asset_id!r} not found")
@@ -1017,6 +1100,7 @@ class WalletService:
         self._validate_approver_id(approver_id)
         self._validate_reason(reason)
         with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
             record = self._fetch_request_or_404(wallet_id, request_id)
             # 懒过期可能在此原子记一次 E；过期后操作落入终态分支（409、不记 A/R）
             record = self._expire_if_needed(wallet_id, record)
@@ -1132,6 +1216,9 @@ class WalletService:
             )
 
         with self._wallet_lock(wallet_id):
+            # 先自愈他进程崩溃遗留的激活/提交现场，绝不基于半完成的钱包
+            # 公钥或份额做校验。
+            self._heal_wallet(wallet_id)
             # 锁内重读钱包元数据：份额轮换激活后，未首签的请求必须用新的
             # share_ids 与公钥校验，旧份额一律 400。
             wallet = self._store.get_wallet(wallet_id)

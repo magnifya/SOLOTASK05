@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .service import ServiceError, WalletService
+from .store import RecoveryError
 
 #: 请求体大小上限，防止异常大 body
 _MAX_BODY_BYTES = 1 * 1024 * 1024
@@ -118,6 +119,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 self._send_error(404, "not found")
+            except RecoveryError as exc:
+                # 崩溃现场无法对账到一致状态：拒绝暴露半完成数据
+                self._send_error(503, f"recovery incomplete: {exc}")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
 
@@ -220,6 +224,8 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
 
                 self._send_error(404, "not found")
+            except RecoveryError as exc:
+                self._send_error(503, f"recovery incomplete: {exc}")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
 
@@ -239,6 +245,8 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                 self._send_error(404, "not found")
+            except RecoveryError as exc:
+                self._send_error(503, f"recovery incomplete: {exc}")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
 

@@ -134,6 +134,33 @@ class AuditStore:
                 return dict(event)
         return None
 
+    def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
+        """返回该钱包已落盘的 share_rotation_activated 事件映射
+        ``{rotation_id: event}``。
+
+        启动/运行时轮换恢复据此判定激活是否已提交（事件在则前滚为
+        active，事件不在则回滚 prepared）。每个 rotation 至多一条激活事件；
+        纯只读，不分配 seq。
+        """
+        data = self._read(wallet_id)
+        result: dict[str, dict] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != TYPE_SHARE_ROTATION_ACTIVATED:
+                continue
+            details = event.get("details")
+            rotation_id = (
+                details.get("rotation_id")
+                if isinstance(details, dict)
+                else None
+            )
+            if isinstance(rotation_id, str):
+                result[rotation_id] = dict(event)
+        return result
+
     def list_events(
         self, wallet_id: str, from_seq: int = 1, limit: int = 1000
     ) -> list[dict]:
