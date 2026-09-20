@@ -23,8 +23,6 @@ from typing import Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from . import crypto
-
 DEFAULT_URL = "http://127.0.0.1:8080"
 DEFAULT_DATA_DIR = "./data"
 DEFAULT_HOST = "0.0.0.0"
@@ -264,32 +262,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         elif args.command == "share-sign":
             from .store import RecoveryError, WalletStore
-            from .service import WalletService
+            from .service import ServiceError, WalletService
 
-            # 经服务层构造（在该钱包事务锁外先做启动恢复编排），避免
-            # 在激活崩溃半完成时读到半换入/半删除的份额文件。恢复失败
-            # 直接报错退出，绝不基于不一致的份额签名。
+            # 经服务层构造（在该钱包事务锁外先做启动恢复编排），并在该
+            # 钱包事务锁内先懒恢复、再读取当前在用份额后签名，避免在激活
+            # 崩溃半完成时读到半换入/半删除的份额文件。恢复失败或份额
+            # 未知都打印单行 JSON 到 stderr 并非零退出，绝不基于不一致
+            # 的份额签名。
             try:
                 service = WalletService(WalletStore(args.data_dir))
             except RecoveryError as exc:
                 return _fail(f"recovery failed, refusing to sign: {exc}")
-            share = service._store.get_share(
-                args.wallet_id, args.share_id
-            )
-            if share is None:
-                return _fail(
-                    f"share {args.share_id!r} of wallet "
-                    f"{args.wallet_id!r} not found"
+            except OSError as exc:
+                return _fail(f"cannot open data dir, refusing to sign: {exc}")
+            try:
+                result = service.share_sign(
+                    args.wallet_id,
+                    args.share_id,
+                    args.signing_request_id,
+                    args.message,
                 )
-            payload = crypto.build_payload(
-                args.signing_request_id, args.message
-            )
-            signature = crypto.sign_share(
-                bytes.fromhex(share["private_key"]), payload
-            )
-            _print_json(
-                {"share_id": args.share_id, "signature": signature.hex()}
-            )
+            except RecoveryError as exc:
+                return _fail(f"recovery failed, refusing to sign: {exc}")
+            except ServiceError as exc:
+                return _fail(exc.message)
+            _print_json(result)
             return 0
 
         else:  # pragma: no cover - argparse 已保证不会到达

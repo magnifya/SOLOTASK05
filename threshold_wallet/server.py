@@ -4,6 +4,8 @@
 - POST /v1/wallets                                  建钱包
 - GET  /v1/wallets/<wallet_id>                      查询钱包
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
+- PUT  /v1/wallets/<wallet_id>/transaction-policy   设置冷热钱包交易策略
+- GET  /v1/wallets/<wallet_id>/transaction-policy   查询冷热钱包交易策略
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
@@ -116,6 +118,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             from_seq=query.get("from_seq", [None])[0],
                             limit=query.get("limit", [None])[0],
                         ),
+                    )
+                    return
+                if rest == ["transaction-policy"]:
+                    self._send_json(
+                        200, service.get_transaction_policy(wallet_id)
                     )
                     return
                 self._send_error(404, "not found")
@@ -241,6 +248,16 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             wallet_id,
                             body.get("required_approvals"),
                             body.get("timeout_seconds"),
+                        )
+                        self._send_json(200, result)
+                        return
+                    if rest == ["transaction-policy"]:
+                        body = self._read_json_body()
+                        result = service.put_transaction_policy(
+                            wallet_id,
+                            body.get("mode"),
+                            body.get("max_delta"),
+                            body.get("allowed_assets"),
                         )
                         self._send_json(200, result)
                         return

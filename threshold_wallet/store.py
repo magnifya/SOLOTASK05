@@ -23,6 +23,10 @@
                                     仅在 commit 事务窗口内存在，提交完成即删；
                                     崩溃后启动恢复据此判定提交是否已落事件，
                                     决定补齐账本或回滚为 pending
+    transaction-policies/<wallet_id>.json
+                                    该钱包的冷热钱包交易策略
+                                    （mode/max_delta/allowed_assets），
+                                    只含标识与整数，不含任何私钥材料
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -87,6 +91,9 @@ class WalletStore:
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
         self._assets_dir = os.path.join(data_dir, "assets")
         self._asset_intents_dir = os.path.join(data_dir, "asset-intents")
+        self._transaction_policies_dir = os.path.join(
+            data_dir, "transaction-policies"
+        )
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -96,6 +103,7 @@ class WalletStore:
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
         os.makedirs(self._assets_dir, exist_ok=True)
         os.makedirs(self._asset_intents_dir, exist_ok=True)
+        os.makedirs(self._transaction_policies_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -288,6 +296,37 @@ class WalletStore:
     def delete_policy(self, wallet_id: str) -> None:
         """删除钱包的审批策略文件（策略事件追加失败时回滚用）。"""
         path = self._policy_path(wallet_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    # ---- 冷热钱包交易策略 -----------------------------------------------
+
+    def _transaction_policy_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(
+            self._transaction_policies_dir, wallet_id + ".json"
+        )
+
+    def save_transaction_policy(self, wallet_id: str, policy: dict) -> None:
+        """原子地写入（或覆盖）钱包的冷热钱包交易策略。
+
+        文件只含 mode/max_delta/allowed_assets（标识与整数/字符串），
+        不含任何私钥材料。
+        """
+        path = self._transaction_policy_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, policy)
+
+    def get_transaction_policy(self, wallet_id: str) -> Optional[dict]:
+        """返回钱包的冷热钱包交易策略，未设置返回 None。"""
+        return self._read_json(self._transaction_policy_path(wallet_id))
+
+    def delete_transaction_policy(self, wallet_id: str) -> None:
+        """删除钱包的交易策略文件（首设时事件追加失败回滚用）。"""
+        path = self._transaction_policy_path(wallet_id)
         with self._lock:
             try:
                 os.unlink(path)

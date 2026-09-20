@@ -21,6 +21,8 @@
 | POST | `/v1/wallets` | 建钱包，请求体 `{"wallet_id", "shares"}`，`shares` 必须为 2 |
 | GET  | `/v1/wallets/{wallet_id}` | 返回 `public_key` 与 `created_at` |
 | PUT  | `/v1/wallets/{wallet_id}/approval-policy` | 设置审批策略 `{"required_approvals": 1\|2, "timeout_seconds": >0}` |
+| PUT  | `/v1/wallets/{wallet_id}/transaction-policy` | 设置冷热钱包交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
+| GET  | `/v1/wallets/{wallet_id}/transaction-policy` | 查询冷热钱包交易策略（未配置 404） |
 | POST | `/v1/wallets/{wallet_id}/sign-requests` | 创建签名请求审批单 `{"id", "message"}` |
 | GET  | `/v1/wallets/{wallet_id}/sign-requests/{id}` | 查询审批单 |
 | POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/approve` | 批准 `{"approver_id", "reason"?}` |
@@ -62,6 +64,39 @@
 - 设置策略后，`POST /sign` 要求存在同 id、同 message 且已 `approved`
   的审批单，两份额签名齐备返回 `201` 并把审批单推进为 `signed`；
   未设策略时行为不变（首签 `201`，重放 `200`）。
+
+## 冷热钱包交易策略（可选）
+
+`PUT /v1/wallets/{wallet_id}/transaction-policy` 设置每钱包的冷热钱包
+交易策略，请求体与成功响应（`200`）同为
+
+```json
+{"mode": "hot|cold", "max_delta": 正整数,
+ "allowed_assets": ["BTC", "ETH"]}
+```
+
+- `mode` 必须是字符串 `"hot"` 或 `"cold"`；`max_delta` 必须是正整数
+  （拒绝布尔、0、负数、小数）；`allowed_assets` 必须是**非空数组**，
+  每项匹配 `[A-Za-z0-9_-]{1,128}`，**去重**（重复项 `400`）。
+  类型错误、空值、重复或非法资产一律 `400`；钱包不存在 `404`。
+- 策略状态与 `transaction_policy_updated` 事件在每钱包事务锁内原子
+  持久化（失败回滚策略，不产生事件或 seq 缺口）；**同值更新也记事件**，
+  `details` 恰为 `mode`/`max_delta`/`allowed_assets` 三项。
+- `GET .../transaction-policy`：已配置 `200` 同体，未配置 `404`。
+  策略文件（`transaction-policies/<wallet_id>.json`）只含标识与整数，
+  重启后保持。
+- **对资产操作的影响**：未配置策略时行为完全不变。配置后，pending
+  资产操作**首次创建**按创建时刻的策略检查：`asset_id` 必须在
+  `allowed_assets` 白名单内且 `abs(delta) <= max_delta`，否则 `409`，
+  且账本、`version`、操作状态、审计与幂等结果均不变（检查先于任何
+  写入）；`committed` 重放 `200` 同体、不再校验；策略后续更新不影响
+  已存在的 pending 操作，重放也不按新策略复查。
+- **对签名的影响**：
+  - `hot` 沿用审批章节既有规则：配置了审批策略才要求 approved 审批单，
+    未配置审批策略时行为不变；
+  - `cold` 的**首签**必须存在同 `id`、同 `message` 且 `approved` 的
+    审批单；未配置审批策略（无法建单）、无单或单未 `approved` 一律
+    `409`；签名重放 `200` 且不再校验。
 
 ## 审计事件
 
@@ -159,6 +194,7 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 | 类型 | 何时记录 | request_id / actor_id / reason / details |
 | ---- | ---- | ---- |
 | `asset_operation_committed` | 操作**首次提交成功** | `rid=operation_id`，actor/reason 为 null；`d=R`（committed 视图）。重放与余额不足失败均不记 |
+| `transaction_policy_updated` | 交易策略设置成功，**同值更新也记** | rid/actor/reason 为 null；`d={mode, max_delta, allowed_assets}`。事件追加失败回滚策略，无事件、无 seq 缺口 |
 
 提交是一个**可恢复事务**（在每钱包跨进程事务锁内）：先写只含标识与
 整数的提交意图（`asset-intents/<wallet_id>/<operation_id>.json`），再
@@ -251,7 +287,9 @@ python -m threshold_wallet.cli request-show --wallet-id alice \
 ```
 
 可用 `--url` 指定服务地址（默认 `http://127.0.0.1:8080`），
-`share-sign` 用 `--data-dir` 指向服务端数据目录。
+`share-sign` 用 `--data-dir` 指向服务端数据目录：读取份额前会先在该
+钱包事务锁内做懒恢复（自愈轮换/资产提交崩溃现场），再按当前在用份额
+签名；恢复失败或份额不存在时输出单行 JSON 到 stderr 并非零退出。
 
 ## 测试
 
@@ -272,5 +310,7 @@ python -m unittest discover -s tests -v
   资产账本（`assets/<wallet_id>.json`）只含标识与整数，不含私钥。
   提交意图（`asset-intents/<wallet_id>/<operation_id>.json`）同样只含
   标识与整数，不含私钥。
+  冷热钱包交易策略（`transaction-policies/<wallet_id>.json`）只含
+  mode 标识、整数上限与资产标识，不含私钥。
   写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。
