@@ -134,6 +134,62 @@ class AuditStore:
                 return dict(event)
         return None
 
+    def find_rotation_event(
+        self,
+        wallet_id: str,
+        rotation_id: str,
+        event_type: str = TYPE_SHARE_ROTATION_ACTIVATED,
+    ) -> Optional[dict]:
+        """按 details.rotation_id 查找一条轮换事件，不存在返回 None。
+
+        份额轮换激活事件的 request_id 恒为 null，故提交判据不能用
+        find_event_by_request，而以 details 中的 rotation_id 匹配。
+        启动/懒恢复据此判定激活是否已越过失效点：激活事件在则该轮换
+        已是 active，须前滚补齐而非回滚。纯只读，不分配 seq。
+        """
+        data = self._read(wallet_id)
+        if not data:
+            return None
+        for event in data.get("events", []):
+            if not isinstance(event, dict) or event.get("type") != event_type:
+                continue
+            details = event.get("details")
+            if (
+                isinstance(details, dict)
+                and details.get("rotation_id") == rotation_id
+            ):
+                return dict(event)
+        return None
+
+    def rotation_events(
+        self,
+        wallet_id: str,
+        event_type: str = TYPE_SHARE_ROTATION_ACTIVATED,
+    ) -> dict:
+        """一次性返回 {rotation_id: event} 的全部某类轮换事件快照。
+
+        启动/锁内恢复在同一把钱包事务锁内据此为全部轮换记录判定提交点，
+        避免逐条读盘，并保证各记录基于同一事件快照。纯只读，不分配 seq。
+        若同一 rotation_id 异常地出现多条（正常流程不会），保留 seq 最大者。
+        """
+        result: dict[str, dict] = {}
+        data = self._read(wallet_id)
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict) or event.get("type") != event_type:
+                continue
+            details = event.get("details")
+            if not isinstance(details, dict):
+                continue
+            rotation_id = details.get("rotation_id")
+            if not isinstance(rotation_id, str):
+                continue
+            previous = result.get(rotation_id)
+            if previous is None or event.get("seq", 0) > previous.get("seq", 0):
+                result[rotation_id] = dict(event)
+        return result
+
     def list_events(
         self, wallet_id: str, from_seq: int = 1, limit: int = 1000
     ) -> list[dict]:

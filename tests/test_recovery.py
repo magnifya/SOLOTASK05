@@ -26,6 +26,7 @@ import time
 import unittest
 
 from threshold_wallet import crypto
+from threshold_wallet.audit import AuditStore
 from threshold_wallet.flock import FileLock, wallet_lock_path
 from threshold_wallet.service import ServiceError, WalletService
 from threshold_wallet.store import WalletStore
@@ -84,7 +85,10 @@ def _child_crash_mid_activation(data_dir, wallet_id, rotation_id, point,
 
     point="after_marker"：activating 标记 + 备份落盘后崩溃；
     point="after_swap"：新份额已换入、钱包元数据已改、旧份额已删后崩溃；
-    point="after_commit"：轮换状态已提交 active，暂存未清理。
+    point="after_commit"：轮换状态已提交 active，激活事件尚未落盘
+                           （按事件提交点契约，重启须回滚为 prepared）；
+    point="after_event"：激活事件已落盘，暂存/备份尚未清理
+                           （重启须保持 active 并清残留，不重复记事件）。
 
     就绪通知用 Event（信号量语义，立即对父进程可见）；不能用
     multiprocessing.Queue——os._exit 会跳过后台 feeder 线程的冲刷。
@@ -127,6 +131,24 @@ def _child_crash_mid_activation(data_dir, wallet_id, rotation_id, point,
     active["state"] = "active"
     active["previous_public_key"] = wallet["public_key"]
     store.update_rotation(wallet_id, rotation_id, active)
+    if point == "after_commit":
+        # 注意：此处刻意不写激活事件，模拟"active 已落盘但事件未持久化"
+        ready_event.set()
+        os._exit(1)
+    # after_event：把唯一的激活事件落盘，但保留暂存/备份不动
+    AuditStore(data_dir).append_event(wallet_id, {
+        "type": "share_rotation_activated",
+        "at": "2026-09-20T00:00:00Z",
+        "request_id": None,
+        "actor_id": None,
+        "reason": None,
+        "details": {
+            "rotation_id": rotation_id,
+            "share_ids": list(record["share_ids"]),
+            "public_key": record["public_key"],
+            "previous_public_key": wallet["public_key"],
+        },
+    })
     ready_event.set()
     os._exit(1)
 
@@ -413,9 +435,43 @@ class FaultPointRestartTest(unittest.TestCase):
             [e["type"] for e in events], ["share_rotation_prepared"]
         )
 
-    def test_crash_after_commit_keeps_active_and_cleans_staging(self):
+    def test_crash_after_commit_but_before_event_rolls_back_to_prepared(self):
+        # active 状态已写入、但 share_rotation_activated 事件尚未落盘：
+        # 提交点未越过，重启必须恢复旧公钥/旧份额、状态回 prepared，
+        # 保留有效暂存以便重试，且不记激活事件。
         self._crash_at("after_commit")
-        # 提交已完成：状态保持 active，不回退；暂存与备份被清理
+        service = _make_service(self.data_dir)
+        view = service.get_share_rotation("w1", "rot-1")
+        self.assertEqual(view["state"], "prepared")
+        store = WalletStore(self.data_dir)
+        self.assertEqual(store.get_wallet("w1"), self.wallet_before)
+        for sid, record in self.old_shares.items():
+            self.assertEqual(store.get_share("w1", sid), record)
+        for sid in ("rot-1-share-1", "rot-1-share-2"):
+            self.assertIsNone(store.get_share("w1", sid))
+        self.assertEqual(
+            sorted(os.listdir(self._staging_dir())),
+            ["rot-1-share-1.json", "rot-1-share-2.json"],
+        )
+        # 无激活事件（只有准备期一条）
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events], ["share_rotation_prepared"]
+        )
+        # 恢复后可重新激活，激活事件首提 201
+        status, active = service.activate_share_rotation("w1", "rot-1")
+        self.assertEqual(status, 201)
+        self.assertEqual(active["state"], "active")
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["share_rotation_prepared", "share_rotation_activated"],
+        )
+
+    def test_crash_after_event_keeps_active_and_cleans_staging(self):
+        # 激活事件已落盘：即使暂存/备份尚未清理，重启必须保持 active、
+        # 切换到新公钥/新份额、清理全部残留，且绝不重复记激活事件。
+        self._crash_at("after_event")
         service = _make_service(self.data_dir)
         view = service.get_share_rotation("w1", "rot-1")
         self.assertEqual(view["state"], "active")
@@ -433,8 +489,10 @@ class FaultPointRestartTest(unittest.TestCase):
         self.assertEqual(again["state"], "active")
         events = service.get_audit_events("w1")["events"]
         self.assertEqual(
-            [e["type"] for e in events], ["share_rotation_prepared"]
+            [e["type"] for e in events],
+            ["share_rotation_prepared", "share_rotation_activated"],
         )
+        self.assertEqual([e["seq"] for e in events], [1, 2])
 
 
 class StagingLeftoverValidityTest(unittest.TestCase):

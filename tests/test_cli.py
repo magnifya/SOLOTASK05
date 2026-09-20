@@ -137,6 +137,32 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("not found", json.loads(err)["error"])
 
+    def test_serve_refuses_to_start_when_recovery_fails(self):
+        # 构造一个无法对账为一致状态的 data-dir：钱包已切换到新份额、
+        # active 已落盘，但激活事件与全部备份都缺失。serve 必须在绑定
+        # 端口前以退出码 1 + 单行 JSON 失败，绝不静默带着半完成态就绪。
+        import os
+        import shutil
+        import tempfile
+
+        from tests.test_activation_recovery import _SceneBuilder
+
+        bad_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bad_dir, ignore_errors=True)
+        _SceneBuilder(bad_dir).scene_switched_without_backup_or_event()
+        # 场景里残留的暂存新份额文件保留无妨；关键是无事件、无旧份额备份
+        self.assertTrue(os.path.isdir(bad_dir))
+        code, out, err = self.run_cli(
+            "serve",
+            "--host", "127.0.0.1",
+            "--port", "0",
+            "--data-dir", bad_dir,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        payload = self.assertSingleLineJson(err)
+        self.assertIn("recovery", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

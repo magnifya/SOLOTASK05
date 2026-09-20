@@ -172,10 +172,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "serve":
             # 延迟导入：客户端命令不需要 store/server
             from .server import serve
-            from .store import WalletStore
+            from .store import RecoveryError, WalletStore
             from .service import WalletService
 
-            service = WalletService(WalletStore(args.data_dir))
+            try:
+                # 构造即完成启动恢复：任一钱包现场无法对账为一致状态时
+                # RecoveryError 向上抛出，服务不得就绪。
+                service = WalletService(WalletStore(args.data_dir))
+            except RecoveryError as exc:
+                return _fail(f"startup recovery failed; refusing to serve: {exc}")
             print(
                 json.dumps(
                     {
