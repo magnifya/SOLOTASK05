@@ -111,6 +111,28 @@ class AuditStore:
             WalletStore._atomic_write(path, data)
             return stamped
 
+    def find_event(
+        self, wallet_id: str, event_type: str, request_id: object
+    ) -> Optional[dict]:
+        """查找指定类型与 request_id 的首条事件，无则返回 None。
+
+        只读，不修改日志；供资产提交的崩溃恢复判定"事件是否已持久化"。
+        """
+        data = self._read(wallet_id)
+        if not data:
+            return None
+        events = data.get("events")
+        if not isinstance(events, list):
+            return None
+        for event in events:
+            if (
+                isinstance(event, dict)
+                and event.get("type") == event_type
+                and event.get("request_id") == request_id
+            ):
+                return dict(event)
+        return None
+
     def list_events(
         self, wallet_id: str, from_seq: int = 1, limit: int = 1000
     ) -> list[dict]:

@@ -147,6 +147,19 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
   改余额、`version+1`、状态转 `committed`，`201` 返回 R。并发提交
   恰一个 `201`，其余幂等重放 `200`；`committed` 重放 `200` 同体，
   不重复改账。操作不存在 `404`。
+- **提交即一个可恢复事务**：操作状态、余额、`version+1` 与唯一的
+  `asset_operation_committed` 事件（`request_id=operation_id`，
+  `actor_id`/`reason` 为 `null`，`details` 等于 R）要么全部生效，
+  要么全部不生效。提交前先把恢复意图（提交前/后的操作与资产记录，
+  仅标识与整数，不含私钥）原子写入
+  `asset-commit-journal/<wallet_id>.json`，再落账本、追加事件，
+  最后删除意图。普通写入或事件追加失败：恢复 `pending` 与提交前
+  余额、版本，不产生事件或 seq 缺口，之后可重试。进程在任一阶段
+  被强杀后，同一 data-dir 重启（或同钱包下一次操作）先在每钱包
+  跨进程事务锁内定论：事件已持久化则保留事件并补齐 committed
+  结果，未持久化则恢复 `pending` 与提交前资产状态；恢复不产生
+  审计事件，恢复后不会出现提交无事件、事件与余额不符、重复版本
+  或重复事件。
 - `GET assets/{asset_id}`：返回 `{asset_id, balance, version}`；
   资产无任何已提交操作 `404`，钱包不存在 `404`。
 - 重启后 `pending`/`committed` 状态与幂等性保持，`version` 单调
@@ -173,6 +186,11 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 - 崩溃时停留在 `activating` 的现场回滚为 `prepared`（恢复原钱包元
   数据与旧份额）；已提交 `active` 的暂存与备份被清理。恢复与孤儿
   清理不产生审计事件，审计 seq 跨重启接续、连续不重号。
+- 资产提交的崩溃恢复与提交同样按钱包跨进程串行：多进程同时启动
+  或提交同一操作时，恢复意图在每个钱包的事务锁内定论，最终仅一
+  个首次 `201`，其余 `200` 同体；重放不改余额、版本或审计。恢复
+  完成前查询与重放不会看到半完成状态，重启后 `version` 与审计
+  `seq` 连续。恢复意图文件只含标识与整数，不含任何私钥材料。
 
 ## 安装
 

@@ -18,6 +18,11 @@
     assets/<wallet_id>.json         该钱包的资产账本：asset-operations（操作
                                     状态机 pending/committed）与 assets（每个
                                     资产的 balance/version），同一文件原子写入
+    asset-commit-journal/<wallet_id>.json
+                                    资产提交的崩溃恢复意图：提交前落盘，含
+                                    提交前/后的操作与资产记录（仅标识与整数，
+                                    无私钥），提交完成后删除；崩溃残留由
+                                    启动/懒惰恢复结合审计事件定论
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -73,6 +78,7 @@ class WalletStore:
         self._rotations_dir = os.path.join(data_dir, "rotations")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
         self._assets_dir = os.path.join(data_dir, "assets")
+        self._asset_journal_dir = os.path.join(data_dir, "asset-commit-journal")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -81,6 +87,7 @@ class WalletStore:
         os.makedirs(self._rotations_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
         os.makedirs(self._assets_dir, exist_ok=True)
+        os.makedirs(self._asset_journal_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -407,6 +414,46 @@ class WalletStore:
             else:
                 ledger["assets"][asset_id] = asset_record
             self._atomic_write(path, ledger)
+
+    # ---- 资产提交恢复日志（崩溃一致性）------------------------------------
+
+    def _asset_journal_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._asset_journal_dir, wallet_id + ".json")
+
+    def save_asset_commit_intent(self, wallet_id: str, intent: dict) -> None:
+        """原子地写入资产提交意图（提交前落盘；崩溃恢复的定论依据）。
+
+        意图只含标识与整数（提交前/后的操作与资产记录），不含任何私钥
+        材料；每钱包同时至多一个在意图（提交在每钱包事务锁内串行）。
+        """
+        path = self._asset_journal_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, intent)
+
+    def get_asset_commit_intent(self, wallet_id: str) -> Optional[dict]:
+        """返回崩溃残留的资产提交意图，不存在返回 None。"""
+        _check_id("wallet_id", wallet_id)
+        return self._read_json(self._asset_journal_path(wallet_id))
+
+    def delete_asset_commit_intent(self, wallet_id: str) -> None:
+        """删除资产提交意图（提交完成或恢复定论后清理）。"""
+        path = self._asset_journal_path(wallet_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def list_asset_journal_wallet_ids(self) -> list[str]:
+        """返回留有资产提交意图文件的全部 wallet_id（启动恢复用）。"""
+        try:
+            names = os.listdir(self._asset_journal_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")] for name in names if name.endswith(".json")
+        )
 
     # ---- 份额文件与钱包元数据（轮换激活用）--------------------------------
 

@@ -118,18 +118,89 @@ class WalletService:
         )
 
     def _recover_on_startup(self) -> None:
-        """启动恢复编排：逐个钱包在其跨进程事务锁内恢复轮换现场。"""
+        """启动恢复编排：逐个钱包在其跨进程事务锁内恢复轮换现场、
+        定论崩溃残留的半完成资产提交。"""
         wallet_ids = sorted(
             set(self._store.list_rotation_wallet_ids())
             | set(self._store.list_staging_wallet_ids())
+            | set(self._store.list_asset_journal_wallet_ids())
         )
         for wallet_id in wallet_ids:
             try:
                 with self._wallet_lock(wallet_id):
                     self._store.recover_wallet_rotation(wallet_id)
+                    self._recover_asset_commit(wallet_id)
             except (ValueError, OSError):
                 # 单个钱包的恢复失败不影响其他钱包，尽力而为
                 continue
+
+    # ---- 资产提交崩溃恢复 ---------------------------------------------------
+
+    @staticmethod
+    def _committed_view_shape_ok(details: object) -> bool:
+        """committed 视图 R 的基本形状校验（恢复定论用）。"""
+        if not isinstance(details, dict):
+            return False
+        if details.get("state") != "committed":
+            return False
+        if not isinstance(details.get("asset_id"), str):
+            return False
+        for key in ("balance", "version"):
+            value = details.get(key)
+            if not isinstance(value, int) or isinstance(value, bool):
+                return False
+        return True
+
+    def _recover_asset_commit(self, wallet_id: str) -> None:
+        """定论崩溃残留的半完成资产提交（调用方须持有该钱包事务锁）。
+
+        恢复意图（asset-commit-journal）存在时按审计事件定论：
+        - asset_operation_committed 事件已持久化：保留事件，按事件
+          details 补齐唯一的 committed 结果（操作状态、余额、version）；
+        - 事件未持久化：恢复 pending 与提交前余额/版本。
+        定论后删除意图。恢复只写账本、不记事件，不产生 seq 缺口；
+        意图与恢复数据只含标识与整数，不含私钥。账本写入失败时意图
+        保留，留待下次恢复重试。
+        """
+        intent = self._store.get_asset_commit_intent(wallet_id)
+        if not isinstance(intent, dict):
+            return
+        operation_id = intent.get("operation_id")
+        event = None
+        if isinstance(operation_id, str):
+            event = self._audit.find_event(
+                wallet_id, audit.TYPE_ASSET_OPERATION_COMMITTED, operation_id
+            )
+        if event is not None and self._committed_view_shape_ok(
+            event.get("details")
+        ):
+            committed = event["details"]
+            self._store.commit_asset_operation(
+                wallet_id,
+                operation_id,
+                committed,
+                committed["asset_id"],
+                {
+                    "balance": committed["balance"],
+                    "version": committed["version"],
+                },
+            )
+            self._store.delete_asset_commit_intent(wallet_id)
+            return
+        asset_id = intent.get("asset_id")
+        operation_before = intent.get("operation_before")
+        asset_before = intent.get("asset_before")
+        if (
+            isinstance(operation_id, str)
+            and isinstance(asset_id, str)
+            and isinstance(operation_before, dict)
+            and (asset_before is None or isinstance(asset_before, dict))
+        ):
+            self._store.restore_asset_operation(
+                wallet_id, operation_id, operation_before, asset_id, asset_before
+            )
+        # 意图损坏且无法定论时仅清除意图，不改动账本
+        self._store.delete_asset_commit_intent(wallet_id)
 
     @staticmethod
     def _audit_event(
@@ -699,6 +770,9 @@ class WalletService:
         self._validate_asset_id(asset_id)
         self._validate_delta(delta)
         with self._wallet_lock(wallet_id):
+            # 懒惰恢复：先定论崩溃残留的半完成提交，R 的快照绝不取自
+            # 随后会被回滚或补齐的半完成账本
+            self._recover_asset_commit(wallet_id)
             # R 的 balance/version 快照资产在创建时刻的账本状态
             asset = self._store.get_asset(wallet_id, asset_id)
             record = {
@@ -739,6 +813,9 @@ class WalletService:
         self._get_wallet_or_404(wallet_id)
         self._validate_operation_id(operation_id)
         with self._wallet_lock(wallet_id):
+            # 懒惰恢复：另一进程崩溃残留的半完成提交先定论，保证恢复与
+            # 提交在每钱包跨进程锁内串行，查询/提交看不到半完成状态
+            self._recover_asset_commit(wallet_id)
             record = self._store.get_asset_operation(wallet_id, operation_id)
             if record is None:
                 raise ServiceError(
@@ -777,9 +854,22 @@ class WalletService:
                 "balance": new_balance,
                 "version": old_version + 1,
             }
+            # 操作状态、余额、version+1 与唯一 asset_operation_committed
+            # 事件构成一个可恢复事务：
+            # 1) 恢复意图先落盘（含提交前/后记录，仅标识与整数）；
+            # 2) 账本原子提交；3) 事件追加＝事务提交点；4) 清除意图。
+            # 进程在任一阶段被强杀后，同 data-dir 重启按事件是否持久化
+            # 定论：补齐 committed 结果或恢复 pending 与提交前状态。
+            intent = {
+                "operation_id": operation_id,
+                "asset_id": asset_id,
+                "operation_before": record,
+                "asset_before": asset,
+                "operation_after": committed_record,
+                "asset_after": asset_record,
+            }
             try:
-                # 状态/事件原子：操作记录、资产账本与事件在同一事务锁内
-                # 落盘；事件追加失败则回滚操作与资产记录
+                self._store.save_asset_commit_intent(wallet_id, intent)
                 self._store.commit_asset_operation(
                     wallet_id,
                     operation_id,
@@ -796,17 +886,30 @@ class WalletService:
                     ),
                 )
             except BaseException:
+                # 普通写入或事件追加失败：恢复 pending 与提交前余额、
+                # 版本，清除意图，不产生事件或 seq 缺口，之后可重试
                 self._store.restore_asset_operation(
                     wallet_id, operation_id, record, asset_id, asset
                 )
+                self._store.delete_asset_commit_intent(wallet_id)
                 raise
+            # 提交完成：清除恢复意图。清除失败不影响已提交事务——
+            # 残留意图会被启动/懒惰恢复按已持久化事件幂等定论。
+            try:
+                self._store.delete_asset_commit_intent(wallet_id)
+            except OSError:
+                pass
         return 201, committed_record
 
     def get_asset(self, wallet_id: str, asset_id: str) -> dict:
         """查询某资产的账本状态（balance/version）。"""
         self._get_wallet_or_404(wallet_id)
         self._validate_asset_id(asset_id)
-        asset = self._store.get_asset(wallet_id, asset_id)
+        with self._wallet_lock(wallet_id):
+            # 懒惰恢复：先定论崩溃残留的半完成提交，查询绝不看到
+            # 随后会被回滚或补齐的半完成余额
+            self._recover_asset_commit(wallet_id)
+            asset = self._store.get_asset(wallet_id, asset_id)
         if asset is None:
             raise ServiceError(404, f"asset {asset_id!r} not found")
         return {
