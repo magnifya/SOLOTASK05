@@ -13,6 +13,9 @@
 - POST /v1/wallets/<wallet_id>/share-rotations             准备份额轮换
 - GET  /v1/wallets/<wallet_id>/share-rotations/<id>        查询轮换
 - POST /v1/wallets/<wallet_id>/share-rotations/<id>/activate  激活轮换
+- POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
+- POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
+- GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -101,6 +104,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200, service.get_share_rotation(wallet_id, rest[1])
                     )
                     return
+                if len(rest) == 2 and rest[0] == "assets":
+                    self._send_json(200, service.get_asset(wallet_id, rest[1]))
+                    return
                 if rest == ["audit-events"]:
                     self._send_json(
                         200,
@@ -158,6 +164,28 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     body = self._read_json_body()
                     status, result = service.create_share_rotation(
                         wallet_id, body.get("rotation_id")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["asset-operations"]:
+                    body = self._read_json_body()
+                    status, result = service.create_asset_operation(
+                        wallet_id,
+                        body.get("operation_id"),
+                        body.get("asset_id"),
+                        body.get("delta"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "asset-operations"
+                    and rest[2] == "commit"
+                ):
+                    status, result = service.commit_asset_operation(
+                        wallet_id, rest[1]
                     )
                     self._send_json(status, result)
                     return

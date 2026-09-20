@@ -15,6 +15,9 @@
                                     激活成功后整目录删除
     audit/<wallet_id>.json          该钱包的审计事件日志（seq 从 1 起仅追加，
                                     由 audit.AuditStore 维护）
+    assets/<wallet_id>.json         该钱包的资产账本：asset-operations（操作
+                                    状态机 pending/committed）与 assets（每个
+                                    资产的 balance/version），同一文件原子写入
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -69,6 +72,7 @@ class WalletStore:
         self._requests_dir = os.path.join(data_dir, "requests")
         self._rotations_dir = os.path.join(data_dir, "rotations")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
+        self._assets_dir = os.path.join(data_dir, "assets")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -76,6 +80,7 @@ class WalletStore:
         os.makedirs(self._requests_dir, exist_ok=True)
         os.makedirs(self._rotations_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
+        os.makedirs(self._assets_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -307,6 +312,101 @@ class WalletStore:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
+
+    # ---- 资产账本（asset-operations 与 assets）-----------------------------
+
+    def _assets_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._assets_dir, wallet_id + ".json")
+
+    def _read_asset_ledger(self, wallet_id: str) -> dict:
+        """读取资产账本（无文件时返回空结构）。"""
+        ledger = self._read_json(self._assets_path(wallet_id))
+        if not isinstance(ledger, dict):
+            ledger = {}
+        operations = ledger.get("operations")
+        if not isinstance(operations, dict):
+            operations = {}
+        assets = ledger.get("assets")
+        if not isinstance(assets, dict):
+            assets = {}
+        return {"operations": operations, "assets": assets}
+
+    def create_asset_operation(
+        self, wallet_id: str, operation_id: str, record: dict
+    ) -> Optional[dict]:
+        """原子地创建一条资产操作记录。
+
+        在同一把锁内先查重：若该 operation_id 已存在，则不覆盖、
+        直接返回已有记录；否则写入并返回 None。
+        """
+        _check_id("operation_id", operation_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            existing = ledger["operations"].get(operation_id)
+            if isinstance(existing, dict):
+                return existing
+            ledger["operations"][operation_id] = record
+            self._atomic_write(path, ledger)
+            return None
+
+    def get_asset_operation(
+        self, wallet_id: str, operation_id: str
+    ) -> Optional[dict]:
+        """返回某条资产操作记录，不存在返回 None。"""
+        _check_id("operation_id", operation_id)
+        record = self._read_asset_ledger(wallet_id)["operations"].get(
+            operation_id
+        )
+        return dict(record) if isinstance(record, dict) else None
+
+    def get_asset(self, wallet_id: str, asset_id: str) -> Optional[dict]:
+        """返回某资产的账本记录（balance/version），不存在返回 None。"""
+        _check_id("asset_id", asset_id)
+        record = self._read_asset_ledger(wallet_id)["assets"].get(asset_id)
+        return dict(record) if isinstance(record, dict) else None
+
+    def commit_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        operation_record: dict,
+        asset_id: str,
+        asset_record: dict,
+    ) -> None:
+        """原子地提交一条资产操作：操作记录与资产 balance/version 同文件
+        一次写入（调用方须持有该钱包事务锁）。"""
+        _check_id("operation_id", operation_id)
+        _check_id("asset_id", asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger["operations"][operation_id] = operation_record
+            ledger["assets"][asset_id] = asset_record
+            self._atomic_write(path, ledger)
+
+    def restore_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        operation_record: dict,
+        asset_id: str,
+        asset_record: Optional[dict],
+    ) -> None:
+        """提交事件追加失败时回滚：恢复操作记录与资产记录
+        （asset_record 为 None 表示提交前该资产无账本记录，直接删除）。"""
+        _check_id("operation_id", operation_id)
+        _check_id("asset_id", asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger["operations"][operation_id] = operation_record
+            if asset_record is None:
+                ledger["assets"].pop(asset_id, None)
+            else:
+                ledger["assets"][asset_id] = asset_record
+            self._atomic_write(path, ledger)
 
     # ---- 份额文件与钱包元数据（轮换激活用）--------------------------------
 

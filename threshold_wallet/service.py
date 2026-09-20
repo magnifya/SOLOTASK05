@@ -656,6 +656,165 @@ class WalletService:
             self._store.delete_staging(wallet_id, rotation_id)
         return 201, self._rotation_view(active_record)
 
+    # ---- 资产账本 ---------------------------------------------------------
+
+    @staticmethod
+    def _validate_operation_id(operation_id: object) -> None:
+        if not isinstance(operation_id, str) or not ROTATION_ID_RE.match(
+            operation_id
+        ):
+            raise ServiceError(
+                400, "operation_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    @staticmethod
+    def _validate_asset_id(asset_id: object) -> None:
+        if not isinstance(asset_id, str) or not ROTATION_ID_RE.match(
+            asset_id
+        ):
+            raise ServiceError(
+                400, "asset_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    @staticmethod
+    def _validate_delta(delta: object) -> None:
+        # bool 是 int 的子类，必须先排除；0 不是合法的资产变动
+        if not isinstance(delta, int) or isinstance(delta, bool) or delta == 0:
+            raise ServiceError(400, "delta must be a non-zero integer")
+
+    def create_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: object,
+        asset_id: object,
+        delta: object,
+    ) -> tuple[int, dict]:
+        """创建一条资产操作（pending）。返回 (HTTP 状态码, 响应体 R)。
+
+        首次创建 201；同 operation_id 同参数幂等重放 200（返回当前记录，
+        不重复记事件）；同 operation_id 异参数 409。创建本身不记审计事件。
+        """
+        self._get_wallet_or_404(wallet_id)
+        self._validate_operation_id(operation_id)
+        self._validate_asset_id(asset_id)
+        self._validate_delta(delta)
+        with self._wallet_lock(wallet_id):
+            # R 的 balance/version 快照资产在创建时刻的账本状态
+            asset = self._store.get_asset(wallet_id, asset_id)
+            record = {
+                "operation_id": operation_id,
+                "asset_id": asset_id,
+                "state": "pending",
+                "delta": delta,
+                "balance": asset["balance"] if asset is not None else 0,
+                "version": asset["version"] if asset is not None else 0,
+            }
+            existing = self._store.create_asset_operation(
+                wallet_id, operation_id, record
+            )
+            if existing is not None:
+                if (
+                    existing.get("asset_id") != asset_id
+                    or existing.get("delta") != delta
+                ):
+                    raise ServiceError(
+                        409,
+                        f"asset operation {operation_id!r} already exists "
+                        "with different parameters",
+                    )
+                # 同参重放：原样返回磁盘中的当前记录，不改状态、不记事件
+                return 200, existing
+        return 201, record
+
+    def commit_asset_operation(
+        self, wallet_id: str, operation_id: str
+    ) -> tuple[int, dict]:
+        """提交一条 pending 的资产操作。返回 (HTTP 状态码, 响应体 R)。
+
+        锁内检查 balance+delta>=0：不足 409，状态不变、可重试；成功则原子
+        改余额、version+1、状态转 committed（201），并在同一事务内追加
+        asset_operation_committed 事件。committed 重放 200，不重复改账、
+        不记事件。
+        """
+        self._get_wallet_or_404(wallet_id)
+        self._validate_operation_id(operation_id)
+        with self._wallet_lock(wallet_id):
+            record = self._store.get_asset_operation(wallet_id, operation_id)
+            if record is None:
+                raise ServiceError(
+                    404, f"asset operation {operation_id!r} not found"
+                )
+            if record["state"] == "committed":
+                # 幂等重放：不重复改账、不记事件
+                return 200, record
+            if record["state"] != "pending":
+                raise ServiceError(
+                    409,
+                    f"asset operation {operation_id!r} is "
+                    f"{record['state']}, not pending",
+                )
+            asset_id = record["asset_id"]
+            asset = self._store.get_asset(wallet_id, asset_id)
+            old_balance = asset["balance"] if asset is not None else 0
+            old_version = asset["version"] if asset is not None else 0
+            new_balance = old_balance + record["delta"]
+            if new_balance < 0:
+                # 余额不足：状态不变（仍 pending），可重试，不记事件
+                raise ServiceError(
+                    409,
+                    f"asset {asset_id!r} has insufficient balance "
+                    "for this operation",
+                )
+            committed_record = {
+                "operation_id": operation_id,
+                "asset_id": asset_id,
+                "state": "committed",
+                "delta": record["delta"],
+                "balance": new_balance,
+                "version": old_version + 1,
+            }
+            asset_record = {
+                "balance": new_balance,
+                "version": old_version + 1,
+            }
+            try:
+                # 状态/事件原子：操作记录、资产账本与事件在同一事务锁内
+                # 落盘；事件追加失败则回滚操作与资产记录
+                self._store.commit_asset_operation(
+                    wallet_id,
+                    operation_id,
+                    committed_record,
+                    asset_id,
+                    asset_record,
+                )
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_ASSET_OPERATION_COMMITTED,
+                        request_id=operation_id,
+                        details=committed_record,
+                    ),
+                )
+            except BaseException:
+                self._store.restore_asset_operation(
+                    wallet_id, operation_id, record, asset_id, asset
+                )
+                raise
+        return 201, committed_record
+
+    def get_asset(self, wallet_id: str, asset_id: str) -> dict:
+        """查询某资产的账本状态（balance/version）。"""
+        self._get_wallet_or_404(wallet_id)
+        self._validate_asset_id(asset_id)
+        asset = self._store.get_asset(wallet_id, asset_id)
+        if asset is None:
+            raise ServiceError(404, f"asset {asset_id!r} not found")
+        return {
+            "asset_id": asset_id,
+            "balance": asset["balance"],
+            "version": asset["version"],
+        }
+
     # ---- 批准 / 拒绝 -----------------------------------------------------
 
     @staticmethod

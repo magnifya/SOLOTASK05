@@ -30,6 +30,9 @@
 | POST | `/v1/wallets/{wallet_id}/share-rotations` | 准备份额轮换 `{"rotation_id"}` |
 | GET  | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}` | 查询轮换状态 |
 | POST | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}/activate` | 激活轮换 |
+| POST | `/v1/wallets/{wallet_id}/asset-operations` | 创建资产操作 `{"operation_id", "asset_id", "delta"}` |
+| POST | `/v1/wallets/{wallet_id}/asset-operations/{operation_id}/commit` | 提交资产操作 |
+| GET  | `/v1/wallets/{wallet_id}/assets/{asset_id}` | 查询资产 `balance` 与 `version` |
 
 状态码：
 
@@ -125,6 +128,36 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 若事件落盘失败，则回滚本次状态（删除新建策略/审批单/签名，或恢复
 更新前的旧值/原 pending 状态），保证状态与事件一致。
 
+## 资产账本
+
+每个钱包维护一本资产账本（`assets/<wallet_id>.json`）：资产操作
+（asset-operations，状态机 `pending | committed`）与每个资产的
+`balance`/`version` 存放于同一文件、原子写入；文件只含标识与整数，
+不含任何私钥材料。
+
+- `POST asset-operations`：请求体 `{"operation_id", "asset_id",
+  "delta"}`。两个 ID 均须非空且匹配 `[A-Za-z0-9_-]{1,128}`，`delta`
+  必须是非布尔、非零整数；参数非法 `400`，钱包不存在 `404`。
+  首次创建 `201`，返回 `R={operation_id, asset_id, delta, state,
+  balance, version}`（`state: pending`，`balance`/`version` 为资产
+  在创建时刻的账本快照）；同 `operation_id` 同参数重放 `200` 同体，
+  异参数 `409`；`operation_id` 钱包内唯一。创建不记审计事件。
+- `POST .../commit`：仅 `pending` 可提交。在每钱包事务锁内检查
+  `balance + delta >= 0`：不足 `409`，状态不变、可重试；成功则原子
+  改余额、`version+1`、状态转 `committed`，`201` 返回 R。并发提交
+  恰一个 `201`，其余幂等重放 `200`；`committed` 重放 `200` 同体，
+  不重复改账。操作不存在 `404`。
+- `GET assets/{asset_id}`：返回 `{asset_id, balance, version}`；
+  资产无任何已提交操作 `404`，钱包不存在 `404`。
+- 重启后 `pending`/`committed` 状态与幂等性保持，`version` 单调
+  递增、不回退、不重号。
+
+账本审计事件（七字段，`seq` 连续）：
+
+| 类型 | 何时记录 | request_id / actor_id / reason / details |
+| ---- | ---- | ---- |
+| `asset_operation_committed` | 操作**首次提交成功** | `rid=operation_id`，actor/reason 为 null；`d=R`（committed 视图）。重放与余额不足失败均不记 |
+
 ## 多进程与故障恢复
 
 - 多个服务进程可**共用同一 data-dir**：策略、审批单、签名、份额轮换
@@ -210,5 +243,6 @@ python -m unittest discover -s tests -v
   （`shares/<wallet_id>/<share_id>.json`），轮换准备期的新份额私钥
   分文件暂存于 `rotation-staging/<wallet_id>/<rotation_id>/`，
   任何文件至多含一个份额私钥，从不存在两者拼接后的完整私钥。
+  资产账本（`assets/<wallet_id>.json`）只含标识与整数，不含私钥。
   写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。
