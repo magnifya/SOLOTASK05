@@ -382,5 +382,130 @@ class InterleavedReplayTest(unittest.TestCase):
         self.assertEqual(types.count("request_signed"), 1)
 
 
+class ConcurrentPolicyLinearizationTest(unittest.TestCase):
+    """并发更新审批策略 / 创建签名请求的线性一致性。
+
+    无论线程如何交错，落盘后的唯一串行化必须满足：
+    - 多个首设并发只有一个 policy_updated 的 operation=created，其余 updated；
+    - 每个 request_created 采用其 seq 之前最近一个 policy_updated 已生效的
+      required_approvals/timeout_seconds（req/t0/t1 与盘上记录一致）；
+    - 锁内判定无策略的 409 不留下请求或事件；事件 seq 连续，
+      盘上请求集合恰为 request_created 事件集合。
+    """
+
+    def setUp(self):
+        self.h = make_harness(tempfile.mkdtemp())
+        self.svc = self.h.service
+        self.svc.create_wallet("w1", 2)
+
+    def _events(self):
+        return self.svc.get_audit_events("w1")["events"]
+
+    def test_concurrent_first_put_yields_single_created(self):
+        n = 16
+        barrier = threading.Barrier(n)
+
+        def attempt(_):
+            barrier.wait()
+            return self.svc.put_policy("w1", 1, 3600)
+
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            list(pool.map(attempt, range(n)))
+
+        policies = [e for e in self._events() if e["type"] == "policy_updated"]
+        self.assertEqual(len(policies), n)
+        operations = [e["details"]["operation"] for e in policies]
+        self.assertEqual(operations.count("created"), 1, operations)
+        self.assertEqual(operations.count("updated"), n - 1, operations)
+        # created 必须是 seq 最小的那条（线性化顺序里的第一次提交）
+        self.assertEqual(policies[0]["details"]["operation"], "created")
+        self.assertTrue(
+            all(e["details"]["operation"] == "updated" for e in policies[1:])
+        )
+
+    def test_request_binds_policy_at_linearization_point(self):
+        n_writers, n_creators = 2, 4
+        per_writer, per_creator = 40, 20
+        barrier = threading.Barrier(n_writers + n_creators)
+        clock = {"i": 0}
+        clock_lock = threading.Lock()
+        conflicts = []
+
+        def write_policy(_):
+            barrier.wait()
+            for _ in range(per_writer):
+                with clock_lock:
+                    clock["i"] += 1
+                    timeout = 100 + clock["i"]
+                required = 1 if timeout % 2 else 2
+                self.svc.put_policy("w1", required, timeout)
+
+        def create_request(idx):
+            barrier.wait()
+            for k in range(per_creator):
+                rid = f"r-{idx}-{k}"
+                try:
+                    self.svc.create_sign_request("w1", rid, "m")
+                except ServiceError as exc:
+                    # 仅允许锁内无策略 409，且不留下请求
+                    self.assertEqual(exc.status, 409)
+                    conflicts.append(rid)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [
+                pool.submit(write_policy, i) for i in range(n_writers)
+            ]
+            futures += [
+                pool.submit(create_request, i) for i in range(n_creators)
+            ]
+            for f in futures:
+                f.result()
+
+        events = self._events()
+        # seq 连续不重号
+        self.assertEqual(
+            [e["seq"] for e in events], list(range(1, len(events) + 1))
+        )
+
+        # 每个 request_created 必须匹配其线性化时刻（前一个 policy_updated）
+        latest_policy = None
+        created_ids = []
+        for event in events:
+            if event["type"] == "policy_updated":
+                latest_policy = event["details"]
+            elif event["type"] == "request_created":
+                self.assertIsNotNone(latest_policy)
+                rid = event["request_id"]
+                created_ids.append(rid)
+                record = self.h.store.get_request("w1", rid)
+                self.assertIsNotNone(record, "C 事件必须有对应审批单")
+                self.assertEqual(
+                    record["req"], latest_policy["required_approvals"]
+                )
+                t0 = datetime.fromisoformat(record["t0"].replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(record["t1"].replace("Z", "+00:00"))
+                self.assertEqual(
+                    (t1 - t0).total_seconds(),
+                    float(latest_policy["timeout_seconds"]),
+                )
+
+        # 盘上请求集合恰为 C 事件集合：409 不留单、重放不重复建
+        import json
+        import os
+
+        path = os.path.join(self.h.tmpdir, "requests", "w1.json")
+        on_disk = json.load(open(path, encoding="utf-8"))
+        self.assertEqual(set(on_disk), set(created_ids))
+        # 所有 409 冲突 id 都不在盘上、也无事件
+        self.assertEqual(set(conflicts) & set(on_disk), set())
+        self.assertTrue(
+            all(
+                e["request_id"] not in conflicts
+                for e in events
+                if e["type"] == "request_created"
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

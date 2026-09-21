@@ -448,52 +448,67 @@ class WalletService:
         required_approvals: object,
         timeout_seconds: object,
     ) -> dict:
-        self._get_wallet_or_404(wallet_id)
-        # bool 是 int 的子类，必须先排除
-        if (
-            not isinstance(required_approvals, int)
-            or isinstance(required_approvals, bool)
-            or required_approvals not in ALLOWED_REQUIRED_APPROVALS
-        ):
-            raise ServiceError(
-                400,
-                "required_approvals must be one of "
-                + ", ".join(str(v) for v in ALLOWED_REQUIRED_APPROVALS),
-            )
-        if (
-            not isinstance(timeout_seconds, int)
-            or isinstance(timeout_seconds, bool)
-            or timeout_seconds <= 0
-        ):
-            raise ServiceError(400, "timeout_seconds must be a positive integer")
-        policy = {
-            "wallet_id": wallet_id,
-            "required_approvals": required_approvals,
-            "timeout_seconds": timeout_seconds,
-        }
-        # 同值更新也成功并记录（operation 区分首设/更新）
-        old_policy = self._store.get_policy(wallet_id)
-        operation = "created" if old_policy is None else "updated"
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
-            self._store.save_policy(wallet_id, policy)
-            event = self._audit_event(
-                audit.TYPE_POLICY_UPDATED,
-                details={
+        # 读取（钱包存在性、旧策略）、校验、持久化与事件追加全部在同一把
+        # 每钱包事务锁内完成：多个 serve 进程并发更新同一钱包策略时，
+        # operation(created|updated) 严格依据锁内旧值，policy_updated 的
+        # seq 顺序即策略线性化顺序，绝不基于锁外陈旧快照判定。
+        policy: dict | None = None
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：钱包存在性在锁内先于参数校验
+                self._get_wallet_or_404(wallet_id)
+                # bool 是 int 的子类，必须先排除
+                if (
+                    not isinstance(required_approvals, int)
+                    or isinstance(required_approvals, bool)
+                    or required_approvals not in ALLOWED_REQUIRED_APPROVALS
+                ):
+                    raise ServiceError(
+                        400,
+                        "required_approvals must be one of "
+                        + ", ".join(str(v) for v in ALLOWED_REQUIRED_APPROVALS),
+                    )
+                if (
+                    not isinstance(timeout_seconds, int)
+                    or isinstance(timeout_seconds, bool)
+                    or timeout_seconds <= 0
+                ):
+                    raise ServiceError(
+                        400, "timeout_seconds must be a positive integer"
+                    )
+                policy = {
+                    "wallet_id": wallet_id,
                     "required_approvals": required_approvals,
                     "timeout_seconds": timeout_seconds,
-                    "operation": operation,
-                },
-            )
-            try:
-                self._emit(wallet_id, event)
-            except BaseException:
-                # 状态/事件原子：事件未落盘则回滚策略状态
-                if old_policy is None:
-                    self._store.delete_policy(wallet_id)
-                else:
-                    self._store.save_policy(wallet_id, old_policy)
-                raise
+                }
+                # 同值更新也成功并记录；operation 必须依据锁内旧值
+                old_policy = self._store.get_policy(wallet_id)
+                operation = "created" if old_policy is None else "updated"
+                self._store.save_policy(wallet_id, policy)
+                event = self._audit_event(
+                    audit.TYPE_POLICY_UPDATED,
+                    details={
+                        "required_approvals": required_approvals,
+                        "timeout_seconds": timeout_seconds,
+                        "operation": operation,
+                    },
+                )
+                try:
+                    self._emit(wallet_id, event)
+                except BaseException:
+                    # 状态/事件原子：事件未落盘则回滚策略状态
+                    if old_policy is None:
+                        self._store.delete_policy(wallet_id)
+                    else:
+                        self._store.save_policy(wallet_id, old_policy)
+                    raise
+        except CorruptDataError:
+            # 钱包元数据/策略损坏：fail-closed（由 HTTP 边界转 503）
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
         return policy
 
     # ---- 冷热钱包交易策略 -------------------------------------------------
@@ -668,61 +683,83 @@ class WalletService:
     def create_sign_request(
         self, wallet_id: str, request_id: object, message: object
     ) -> tuple[int, dict]:
-        """返回 (HTTP 状态码, 响应体)。"""
-        self._get_wallet_or_404(wallet_id)
-        self._validate_request_body(request_id, message)
+        """返回 (HTTP 状态码, 响应体)。
+
+        读取、校验、幂等判定、策略读取、req/t0/t1 取值与持久化、事件追加
+        全部在同一把每钱包事务锁内完成。多个 serve 进程并发更新同一钱包
+        审批策略与创建签名请求时，请求单只能采用**锁提交时已生效**的
+        required_approvals/timeout_seconds；锁内判定仍无审批策略则 409 且
+        不留下请求或事件；request_created 与 policy_updated 的 seq 顺序即
+        该钱包的线性化顺序。
+        """
+        record: dict | None = None
         try:
-            self._store.get_request(wallet_id, request_id)
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：钱包存在性在锁内先于请求体/id 校验
+                self._get_wallet_or_404(wallet_id)
+                self._validate_request_body(request_id, message)
+                # 锁内查重：同 id 同文 200、异文 409 均不记事件、不改状态，
+                # 也不依赖此刻是否仍有策略（既有幂等语义保持）。
+                try:
+                    existing = self._store.get_request(
+                        wallet_id, request_id
+                    )
+                except CorruptDataError:
+                    # 审批单文件损坏：fail-closed（由 HTTP 边界转 503）
+                    raise
+                except ValueError:
+                    raise ServiceError(400, "invalid signing_request_id")
+                if existing is not None:
+                    # POST 不是懒过期触发点：原样返回磁盘中持久化的状态
+                    # （pending/approved/rejected/expired/signed），绝不在响应里
+                    # 把磁盘仍是 pending 的单临时呈现成 expired。
+                    if existing["message"] != message:
+                        raise ServiceError(
+                            409,
+                            f"signing request {request_id!r} already exists "
+                            "with a different message",
+                        )
+                    return 200, self._request_view(existing)
+                # 首次创建：按锁提交时刻已生效的策略决定可否建单与参数。
+                # 锁内判定仍无策略：409 且不留下任何请求或事件。
+                policy = self._store.get_policy(wallet_id)
+                if policy is None:
+                    raise ServiceError(
+                        409, f"wallet {wallet_id!r} has no approval policy"
+                    )
+                now = datetime.now(timezone.utc)
+                record = {
+                    "id": request_id,
+                    "message": message,
+                    "state": "pending",
+                    "approvers": [],
+                    "req": policy["required_approvals"],
+                    "t0": now.isoformat().replace("+00:00", "Z"),
+                    "t1": (now + timedelta(seconds=policy["timeout_seconds"]))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "reason": None,
+                }
+                # 锁内已确认不存在；存储层仍原子查重兜底
+                self._store.create_request(wallet_id, request_id, record)
+                # 首次创建：状态 + C 事件原子
+                event = self._audit_event(
+                    audit.TYPE_REQUEST_CREATED,
+                    request_id=request_id,
+                    details={"message": message},
+                )
+                try:
+                    self._emit(wallet_id, event)
+                except BaseException:
+                    self._store.delete_request(wallet_id, request_id)
+                    raise
         except CorruptDataError:
+            # 钱包元数据/审批单/策略损坏：fail-closed（由 HTTP 边界转 503）
             raise
         except ValueError:
-            raise ServiceError(400, "invalid signing_request_id")
-        policy = self._store.get_policy(wallet_id)
-        if policy is None:
-            raise ServiceError(
-                409, f"wallet {wallet_id!r} has no approval policy"
-            )
-
-        now = datetime.now(timezone.utc)
-        record = {
-            "id": request_id,
-            "message": message,
-            "state": "pending",
-            "approvers": [],
-            "req": policy["required_approvals"],
-            "t0": now.isoformat().replace("+00:00", "Z"),
-            "t1": (now + timedelta(seconds=policy["timeout_seconds"]))
-            .isoformat()
-            .replace("+00:00", "Z"),
-            "reason": None,
-        }
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
-            existing = self._store.create_request(wallet_id, request_id, record)
-            if existing is not None:
-                # 重放（无论同文幂等还是异文 409）均不记事件、不改状态。
-                # POST 不是懒过期触发点：原样返回磁盘中持久化的状态
-                # （pending/approved/rejected/expired/signed），绝不在响应里
-                # 把磁盘仍是 pending 的单临时呈现成 expired。
-                if existing["message"] != message:
-                    raise ServiceError(
-                        409,
-                        f"signing request {request_id!r} already exists "
-                        "with a different message",
-                    )
-                # 同 id 同文：幂等重放
-                return 200, self._request_view(existing)
-            # 首次创建：状态 + C 事件原子
-            event = self._audit_event(
-                audit.TYPE_REQUEST_CREATED,
-                request_id=request_id,
-                details={"message": message},
-            )
-            try:
-                self._emit(wallet_id, event)
-            except BaseException:
-                self._store.delete_request(wallet_id, request_id)
-                raise
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
         return 201, self._request_view(record)
 
     def get_sign_request(self, wallet_id: str, request_id: str) -> dict:
