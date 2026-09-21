@@ -74,6 +74,35 @@ def _valid_safe_id(value: object) -> bool:
     return isinstance(value, str) and bool(_SAFE_ID.match(value))
 
 
+def approval_policy_shape_ok(policy: object) -> bool:
+    """审批策略条目形状：wallet_id 为合法标识、required_approvals 为
+    非布尔整数 1/2、timeout_seconds 为非布尔正整数。"""
+    if not isinstance(policy, dict):
+        return False
+    if not _valid_safe_id(policy.get("wallet_id")):
+        return False
+    required = policy.get("required_approvals")
+    if not _is_plain_int(required) or required not in (1, 2):
+        return False
+    timeout = policy.get("timeout_seconds")
+    return _is_plain_int(timeout) and timeout > 0
+
+
+def transaction_policy_shape_ok(policy: object) -> bool:
+    """交易策略条目形状：mode 仅 hot/cold、max_delta 为非布尔正整数、
+    allowed_assets 为非空数组且每项匹配安全 id。"""
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("mode") not in ("hot", "cold"):
+        return False
+    if not _is_plain_int(policy.get("max_delta")) or policy["max_delta"] <= 0:
+        return False
+    assets = policy.get("allowed_assets")
+    if not isinstance(assets, list) or not assets:
+        return False
+    return all(_valid_safe_id(asset) for asset in assets)
+
+
 def _asset_entry_shape_ok(entry: object) -> bool:
     """资产条目形状：恰需非布尔整数 balance/version。"""
     if not isinstance(entry, dict):
@@ -304,8 +333,17 @@ class WalletStore:
             self._atomic_write(path, policy)
 
     def get_policy(self, wallet_id: str) -> Optional[dict]:
-        """返回钱包的审批策略，未设置返回 None。"""
-        return self._read_json(self._policy_path(wallet_id))
+        """返回钱包的审批策略，未设置返回 None。
+
+        文件存在但形状损坏（标识/整数字段缺失或类型非法）时抛
+        CorruptDataError（ValueError 子类），绝不返回残缺策略让下游
+        读到“旧/坏策略”后按 KeyError/TypeError 继续判定。"""
+        policy = self._read_json(self._policy_path(wallet_id))
+        if policy is not None and not approval_policy_shape_ok(policy):
+            raise CorruptDataError(
+                f"approval policy for wallet {wallet_id!r} is malformed"
+            )
+        return policy
 
     # ---- 签名请求审批单 ---------------------------------------------------
 
@@ -379,8 +417,16 @@ class WalletStore:
             self._atomic_write(path, policy)
 
     def get_transaction_policy(self, wallet_id: str) -> Optional[dict]:
-        """返回钱包的冷热钱包交易策略，未设置返回 None。"""
-        return self._read_json(self._transaction_policy_path(wallet_id))
+        """返回钱包的冷热钱包交易策略，未设置返回 None。
+
+        文件存在但形状损坏时抛 CorruptDataError：绝不把残缺策略交给
+        上层用于白名单/冷热判定或直接回显，统一 fail-closed（503）。"""
+        policy = self._read_json(self._transaction_policy_path(wallet_id))
+        if policy is not None and not transaction_policy_shape_ok(policy):
+            raise CorruptDataError(
+                f"transaction policy for wallet {wallet_id!r} is malformed"
+            )
+        return policy
 
     def delete_transaction_policy(self, wallet_id: str) -> None:
         """删除钱包的交易策略文件（首设时事件追加失败回滚用）。"""
