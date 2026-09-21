@@ -80,10 +80,10 @@ class RecoveryError(Exception):
 class CorruptDataError(ValueError):
     """本应是 JSON 对象的持久化文件无法解析（损坏或被外部篡改）。
 
-    是 ValueError 的子类：既有的宽松 ``except ValueError``（如把不可解析
-    意图纳入对账、把损坏暂存判为无效）行为不变；业务/HTTP 边界则可据此
-    把"解析异常"与"非法 id"区分开——前者 fail-closed（503/阻止就绪），
-    后者才是 400。
+    是 ValueError 的子类：既有的宽松 ``except ValueError``（如把损坏
+    暂存判为无效）行为不变；业务/HTTP 边界则可据此把"解析异常"与
+    "非法 id"区分开——前者 fail-closed（503/阻止就绪），后者才是 400。
+    资产账本与资产提交意图的损坏同样经此类型上抛，绝不归一为空。
     """
 
 
@@ -389,18 +389,98 @@ class WalletStore:
         _check_id("wallet_id", wallet_id)
         return os.path.join(self._assets_dir, wallet_id + ".json")
 
+    @staticmethod
+    def _is_plain_int(value: object) -> bool:
+        """非布尔整数（bool 是 int 的子类，必须先排除）。"""
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    @classmethod
+    def _asset_record_shape_ok(cls, record: object) -> bool:
+        """资产条目形状：对象且 balance/version 均为非布尔整数。"""
+        return (
+            isinstance(record, dict)
+            and cls._is_plain_int(record.get("balance"))
+            and cls._is_plain_int(record.get("version"))
+        )
+
+    @classmethod
+    def _operation_record_shape_ok(cls, record: object) -> bool:
+        """操作条目形状：对象且含合法 operation_id/asset_id/delta/state。"""
+        if not isinstance(record, dict):
+            return False
+        if record.get("state") not in ("pending", "committed"):
+            return False
+        operation_id = record.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            return False
+        asset_id = record.get("asset_id")
+        if not isinstance(asset_id, str) or not asset_id:
+            return False
+        return cls._is_plain_int(record.get("delta"))
+
     def _read_asset_ledger(self, wallet_id: str) -> dict:
-        """读取资产账本（无文件时返回空结构）。"""
+        """读取资产账本（无文件时返回空结构）。
+
+        文件一旦存在就必须完整合法：JSON 可解析、顶层为对象、
+        operations 与 assets 均存在且为对象，且每条资产条目
+        （balance/version 为非布尔整数）与每条操作条目（合法
+        operation_id/asset_id/delta，state 为 pending/committed）
+        形状合法。任何损坏都抛 CorruptDataError（fail-closed）：
+        绝不把损坏账本归一为空、绝不覆盖或删除原数据。
+        """
         ledger = self._read_json(self._assets_path(wallet_id))
+        if ledger is None:
+            # 文件不存在：唯一合法的"空账本"
+            return {"operations": {}, "assets": {}}
+        path = self._assets_path(wallet_id)
         if not isinstance(ledger, dict):
-            ledger = {}
+            raise CorruptDataError(
+                f"asset ledger {path!r} is not a JSON object"
+            )
         operations = ledger.get("operations")
-        if not isinstance(operations, dict):
-            operations = {}
         assets = ledger.get("assets")
-        if not isinstance(assets, dict):
-            assets = {}
+        if not isinstance(operations, dict) or not isinstance(assets, dict):
+            raise CorruptDataError(
+                f"asset ledger {path!r} is missing object "
+                "'operations'/'assets'"
+            )
+        for asset_id, record in assets.items():
+            if not self._asset_record_shape_ok(record):
+                raise CorruptDataError(
+                    f"asset ledger {path!r} has malformed asset "
+                    f"{asset_id!r}"
+                )
+        for operation_id, record in operations.items():
+            if not self._operation_record_shape_ok(record):
+                raise CorruptDataError(
+                    f"asset ledger {path!r} has malformed operation "
+                    f"{operation_id!r}"
+                )
         return {"operations": operations, "assets": assets}
+
+    def check_asset_ledger(self, wallet_id: str) -> None:
+        """严格校验资产账本完整性（无文件视为合法空账本）。
+
+        启动/持锁恢复与审计读取等对账入口使用：账本损坏时抛
+        CorruptDataError（fail-closed），绝不静默归一为空。
+        """
+        self._read_asset_ledger(wallet_id)
+
+    def list_asset_ledger_wallet_ids(self) -> list[str]:
+        """返回存在资产账本文件的全部 wallet_id（启动恢复扫描用）。
+
+        只纳入匹配安全 id 的正式账本文件，忽略原子写残留的临时文件。
+        """
+        try:
+            names = os.listdir(self._assets_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
 
     def create_asset_operation(
         self, wallet_id: str, operation_id: str, record: dict
@@ -529,12 +609,42 @@ class WalletStore:
             and os.path.isdir(os.path.join(self._asset_intents_dir, name))
         )
 
-    def list_asset_intents(self, wallet_id: str) -> list[tuple[str, Optional[dict]]]:
-        """返回某钱包全部提交意图 (operation_id, intent|None)。
+    @classmethod
+    def asset_commit_intent_shape_ok(cls, intent: object) -> bool:
+        """提交意图形状校验：恢复所需的标识与整数必须齐备且类型合法。
 
-        intent 为 None 表示文件存在但 JSON 不可解析（原子写使正常流程
-        不会出现，仅外部损坏时）：调用方据文件名的 operation_id 与账本/
-        审计对账即可，不依赖意图内容。
+        合法意图恰为 ``commit_asset_operation`` 持久化的结构：
+        operation_id/asset_id 为非空字符串，delta/new_balance/new_version
+        为非布尔整数，pending 为对象（回滚要恢复的操作记录），old_asset
+        为 None（提交前无资产条目）或含非布尔整数 balance/version 的对象。
+        """
+        if not isinstance(intent, dict):
+            return False
+        operation_id = intent.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            return False
+        asset_id = intent.get("asset_id")
+        if not isinstance(asset_id, str) or not asset_id:
+            return False
+        if not cls._is_plain_int(intent.get("delta")):
+            return False
+        if not cls._is_plain_int(intent.get("new_balance")):
+            return False
+        if not cls._is_plain_int(intent.get("new_version")):
+            return False
+        if not isinstance(intent.get("pending"), dict):
+            return False
+        old_asset = intent.get("old_asset")
+        if old_asset is not None and not cls._asset_record_shape_ok(old_asset):
+            return False
+        return True
+
+    def list_asset_intents(self, wallet_id: str) -> list[tuple[str, dict]]:
+        """返回某钱包全部提交意图 (operation_id, intent)。
+
+        意图文件存在但 JSON 不可解析、或解析结果不是对象时，抛
+        CorruptDataError（fail-closed）：损坏意图绝不归一为空意图后继续
+        提交/回滚/清理，现场必须保留，由调用方阻止就绪或返回 503。
         """
         _check_id("wallet_id", wallet_id)
         base = os.path.join(self._asset_intents_dir, wallet_id)
@@ -542,7 +652,7 @@ class WalletStore:
             names = os.listdir(base)
         except (FileNotFoundError, NotADirectoryError):
             return []
-        result: list[tuple[str, Optional[dict]]] = []
+        result: list[tuple[str, dict]] = []
         for name in names:
             if not name.endswith(".json"):
                 continue
@@ -550,12 +660,14 @@ class WalletStore:
             if not _SAFE_ID.match(operation_id):
                 # 非预期文件：不纳入恢复，也不删除业务数据
                 continue
-            try:
-                data = self._read_json(os.path.join(base, name))
-            except ValueError:
-                # JSON 不可解析（原子写使正常流程不会出现，仅外部损坏）
-                data = None
-            result.append((operation_id, data if isinstance(data, dict) else None))
+            path = os.path.join(base, name)
+            # JSON 不可解析时 _read_json 抛 CorruptDataError，直接上抛
+            data = self._read_json(path)
+            if not isinstance(data, dict):
+                raise CorruptDataError(
+                    f"asset commit intent {path!r} is not a JSON object"
+                )
+            result.append((operation_id, data))
         return sorted(result, key=lambda item: item[0])
 
     # ---- 份额文件与钱包元数据（轮换激活用）--------------------------------
