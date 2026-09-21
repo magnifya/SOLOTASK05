@@ -136,6 +136,7 @@ class WalletService:
             set(self._store.list_rotation_wallet_ids())
             | set(self._store.list_staging_wallet_ids())
             | set(self._store.list_asset_intent_wallet_ids())
+            | set(self._store.list_asset_ledger_wallet_ids())
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
@@ -155,6 +156,8 @@ class WalletService:
         fail-closed，统一转成 RecoveryError，绝不把 ValueError 漏给调用方
         当成普通参数错误。"""
         try:
+            # 先校验资产账本：账本损坏时任何对账都不可信，直接 fail-closed。
+            self._store.check_asset_ledger(wallet_id)
             self._store.recover_wallet_rotation(
                 wallet_id, self._activated_rotations(wallet_id)
             )
@@ -186,6 +189,10 @@ class WalletService:
         交由 _recover_wallet fail-closed。
         """
         try:
+            # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状损坏时
+            # 无法与意图/事件对账，绝不能静默当成空账本。任何持锁访问都
+            # 先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
+            self._store.check_asset_ledger(wallet_id)
             if self._store.list_asset_intents(wallet_id):
                 self._recover_wallet(wallet_id)
                 return
@@ -1135,6 +1142,14 @@ class WalletService:
         self, wallet_id: str, operation_id: str, intent: object
     ) -> Optional[dict]:
         """对账单条提交意图，返回 committed 视图 R（前滚）或 None（回滚）。"""
+        # 无论提交事件是否已落盘，损坏/非对象/缺少恢复所需标识与整数的
+        # 意图都无法安全对账：先 fail-closed 并保留意图现场原样，绝不借
+        # "事件在即可前滚"之名把损坏意图删除或继续提交/回滚/清理。
+        if not self._store.valid_asset_commit_intent(operation_id, intent):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset operation {operation_id!r} "
+                "commit intent is missing or malformed and cannot be reconciled"
+            )
         event = self._audit.find_event_by_request(
             wallet_id,
             audit.TYPE_ASSET_OPERATION_COMMITTED,
@@ -1183,27 +1198,13 @@ class WalletService:
             self._store.delete_asset_commit_intent(wallet_id, operation_id)
             return committed_record
 
-        # 事件未持久化：提交未生效，回滚为 pending 与提交前资产状态
-        if not isinstance(intent, dict):
-            # 意图不可解析（正常原子写不会出现）：若账本仍是 pending/无操作，
-            # 说明本就处于中止态，仅清理意图；若已被改成 committed 却无
-            # 事件，且没有可解析意图恢复提交前状态，无法安全对账，fail-closed。
-            op = self._store.get_asset_operation(wallet_id, operation_id)
-            if op is None or op.get("state") == "pending":
-                self._store.delete_asset_commit_intent(wallet_id, operation_id)
-                return None
-            raise RecoveryError(
-                f"wallet {wallet_id!r} asset operation {operation_id!r} "
-                "committed without event and intent is unreadable"
-            )
-        pending = intent.get("pending")
-        asset_id = intent.get("asset_id")
-        old_asset = intent.get("old_asset")
-        if not isinstance(pending, dict) or not isinstance(asset_id, str):
-            raise RecoveryError(
-                f"wallet {wallet_id!r} asset operation {operation_id!r} "
-                "intent is malformed"
-            )
+        # 事件未持久化：提交未生效，凭意图记录的提交前快照把操作恢复为
+        # pending、资产恢复提交前 balance/version（意图已在方法入口通过
+        # 严格校验，标识/整数/守恒均可信）。提交前不存在该资产条目时
+        # 直接删除；事件从未分配 seq，故无事件、无 seq 缺口、可重试。
+        pending = intent["pending"]
+        asset_id = intent["asset_id"]
+        old_asset = intent["old_asset"]
         self._store.restore_asset_operation(
             wallet_id,
             operation_id,

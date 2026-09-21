@@ -188,6 +188,18 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
   资产无任何已提交操作 `404`，钱包不存在 `404`。
 - 重启后 `pending`/`committed` 状态与幂等性保持，`version` 单调
   递增、不回退、不重号。
+- 账本文件（`assets/<wallet_id>.json`）存在却 JSON 损坏、顶层不是
+  对象、缺少 `operations`/`assets` 或二者类型错误、资产条目
+  `balance`/`version` 不是非布尔整数、操作条目缺合法
+  `operation_id`/`asset_id`/`delta`/`state`（`state` 仅
+  pending/committed）时，任何资产创建、提交、查询、审计读取以及
+  启动/持锁恢复一律 fail-closed：常驻请求返回统一 `503` JSON，
+  `serve` 拒绝就绪（非零退出）；绝不把文件归一为空账本，也不覆盖
+  或删除原数据。文件**不存在**仍是正常的空状态，行为不变。
+- `asset-intents` 中残留损坏 JSON、非对象或缺少恢复所需标识与整数
+  的意图时同样保留现场：阻止就绪或返回 `503`，绝不转换成空意图后
+  继续提交、回滚或清理（即使对应提交事件已落盘，也只在意图形状
+  完整时才前滚）。
 
 账本审计事件（七字段，`seq` 连续）：
 

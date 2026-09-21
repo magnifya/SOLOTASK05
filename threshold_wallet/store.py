@@ -65,6 +65,48 @@ def _check_share_id(value: str) -> None:
         raise ValueError(f"invalid share_id: {value!r}")
 
 
+def _is_plain_int(value: object) -> bool:
+    """真·整数：bool 是 int 子类，必须排除（余额/版本/delta 均不接受布尔）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_safe_id(value: object) -> bool:
+    return isinstance(value, str) and bool(_SAFE_ID.match(value))
+
+
+def _asset_entry_shape_ok(entry: object) -> bool:
+    """资产条目形状：恰需非布尔整数 balance/version。"""
+    if not isinstance(entry, dict):
+        return False
+    return _is_plain_int(entry.get("balance")) and _is_plain_int(
+        entry.get("version")
+    )
+
+
+def _asset_operation_shape_ok(key: str, record: object) -> bool:
+    """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
+    delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
+    balance/version 快照，若存在则同样必须为非布尔整数。"""
+    if not isinstance(record, dict):
+        return False
+    operation_id = record.get("operation_id")
+    asset_id = record.get("asset_id")
+    if not _valid_safe_id(operation_id) or operation_id != key:
+        return False
+    if not _valid_safe_id(asset_id):
+        return False
+    if not _is_plain_int(record.get("delta")) or record.get("delta") == 0:
+        return False
+    if record.get("state") not in ("pending", "committed"):
+        return False
+    for optional_int in ("balance", "version"):
+        if optional_int in record and not _is_plain_int(
+            record[optional_int]
+        ):
+            return False
+    return True
+
+
 class DuplicateWalletError(Exception):
     """wallet_id 已存在。"""
 
@@ -390,17 +432,71 @@ class WalletStore:
         return os.path.join(self._assets_dir, wallet_id + ".json")
 
     def _read_asset_ledger(self, wallet_id: str) -> dict:
-        """读取资产账本（无文件时返回空结构）。"""
-        ledger = self._read_json(self._assets_path(wallet_id))
+        """读取并**严格校验**资产账本（无文件时返回空结构）。
+
+        文件存在但出现以下任一情况都视为数据损坏，抛 CorruptDataError
+        （ValueError 子类），绝不把文件静默归一为空账本：
+        JSON 不可解析、顶层不是对象、缺少 operations/assets、二者类型
+        不是对象、操作条目字段形状非法（operation_id/asset_id 合法、
+        delta/balance/version 为非布尔整数、state 仅 pending/committed）、
+        资产条目 balance/version 不是非布尔整数。
+        """
+        path = self._assets_path(wallet_id)
+        ledger = self._read_json(path)
+        if ledger is None:
+            # 文件尚不存在：正常的空状态（与"存在但损坏"严格区分）
+            return {"operations": {}, "assets": {}}
         if not isinstance(ledger, dict):
-            ledger = {}
+            raise CorruptDataError(
+                f"asset ledger {path!r} top-level value is not an object"
+            )
         operations = ledger.get("operations")
-        if not isinstance(operations, dict):
-            operations = {}
         assets = ledger.get("assets")
-        if not isinstance(assets, dict):
-            assets = {}
+        if "operations" not in ledger or not isinstance(operations, dict):
+            raise CorruptDataError(
+                f"asset ledger {path!r} has no object-valued 'operations'"
+            )
+        if "assets" not in ledger or not isinstance(assets, dict):
+            raise CorruptDataError(
+                f"asset ledger {path!r} has no object-valued 'assets'"
+            )
+        for operation_id, record in operations.items():
+            if not _valid_safe_id(operation_id) or not (
+                _asset_operation_shape_ok(operation_id, record)
+            ):
+                raise CorruptDataError(
+                    f"asset ledger {path!r} has malformed operation "
+                    f"{operation_id!r}"
+                )
+        for asset_id, entry in assets.items():
+            if not _valid_safe_id(asset_id) or not _asset_entry_shape_ok(entry):
+                raise CorruptDataError(
+                    f"asset ledger {path!r} has malformed asset {asset_id!r}"
+                )
         return {"operations": operations, "assets": assets}
+
+    def check_asset_ledger(self, wallet_id: str) -> None:
+        """只读校验资产账本形状；损坏时抛 CorruptDataError/OSError。
+        文件不存在（尚无账本）视为正常空状态，不报错。"""
+        _check_id("wallet_id", wallet_id)
+        self._read_asset_ledger(wallet_id)
+
+    def list_asset_ledger_wallet_ids(self) -> list[str]:
+        """返回存在资产账本文件的全部 wallet_id（启动恢复扫描用）。
+
+        只纳入匹配安全 id 的正式账本文件，忽略原子写残留的临时文件，
+        避免把临时文件名当成 wallet_id。
+        """
+        try:
+            names = os.listdir(self._assets_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
 
     def create_asset_operation(
         self, wallet_id: str, operation_id: str, record: dict
@@ -529,12 +625,60 @@ class WalletStore:
             and os.path.isdir(os.path.join(self._asset_intents_dir, name))
         )
 
+    @staticmethod
+    def valid_asset_commit_intent(operation_id: str, intent: object) -> bool:
+        """校验提交意图是否具备安全回滚/前滚所需的全部标识与整数。
+
+        正常提交写入的意图含 operation_id/asset_id/delta、提交前资产
+        快照 old_asset（None 或 {balance,version}）、pending 操作记录、
+        提交结果 new_balance/new_version。任一字段缺失、类型错误、布尔
+        冒整、标识不匹配或前后账目不守恒都判定为无效：调用方必须
+        fail-closed（保留意图现场，不回滚/前滚/清理），绝不把损坏意图
+        当成空意图继续。
+        """
+        if not isinstance(intent, dict):
+            return False
+        if intent.get("operation_id") != operation_id:
+            return False
+        asset_id = intent.get("asset_id")
+        if not _valid_safe_id(asset_id):
+            return False
+        delta = intent.get("delta")
+        if not _is_plain_int(delta) or delta == 0:
+            return False
+        new_balance = intent.get("new_balance")
+        new_version = intent.get("new_version")
+        if not _is_plain_int(new_balance) or not _is_plain_int(new_version):
+            return False
+        old_asset = intent.get("old_asset")
+        if old_asset is not None and not _asset_entry_shape_ok(old_asset):
+            return False
+        pending = intent.get("pending")
+        if not _asset_operation_shape_ok(operation_id, pending):
+            return False
+        # pending 是创建时刻的操作快照 R，服务正常写入必带非布尔整数
+        # balance/version；恢复据此还原操作，缺失即不可安全对账。
+        if not _is_plain_int(pending.get("balance")) or not (
+            _is_plain_int(pending.get("version"))
+        ):
+            return False
+        if pending["state"] != "pending" or pending["asset_id"] != asset_id:
+            return False
+        if pending["delta"] != delta:
+            return False
+        old_balance = old_asset["balance"] if old_asset is not None else 0
+        old_version = old_asset["version"] if old_asset is not None else 0
+        return (
+            new_balance == old_balance + delta
+            and new_version == old_version + 1
+        )
+
     def list_asset_intents(self, wallet_id: str) -> list[tuple[str, Optional[dict]]]:
         """返回某钱包全部提交意图 (operation_id, intent|None)。
 
-        intent 为 None 表示文件存在但 JSON 不可解析（原子写使正常流程
-        不会出现，仅外部损坏时）：调用方据文件名的 operation_id 与账本/
-        审计对账即可，不依赖意图内容。
+        intent 为 None 表示文件存在但 JSON 不可解析或不是对象（原子写使
+        正常流程不会出现，仅外部损坏时）：调用方必须按不可对账处理
+        （fail-closed、保留现场），不得把它当成空意图清理。
         """
         _check_id("wallet_id", wallet_id)
         base = os.path.join(self._asset_intents_dir, wallet_id)
