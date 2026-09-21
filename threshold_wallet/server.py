@@ -30,12 +30,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .service import ServiceError, WalletService
-from .store import RecoveryError
+from .store import CorruptDataError, RecoveryError
 
 #: 请求体大小上限，防止异常大 body
 _MAX_BODY_BYTES = 1 * 1024 * 1024
 
 _WALLETS_PREFIX = "/v1/wallets/"
+
+#: 恢复/文件系统/解析失败时对外的统一 503 文案：绝不回显内部异常细节，
+#: 避免泄露半完成公钥、余额、version、策略或私钥材料。
+_SERVICE_UNAVAILABLE = "service temporarily unavailable"
 
 
 def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
@@ -56,6 +60,24 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         def _send_error(self, status: int, message: str) -> None:
             self._send_json(status, {"error": message})
+
+        def _send_failure(self, exc: BaseException) -> None:
+            """把业务/基础设施异常统一映射为 JSON 错误响应。
+
+            - ServiceError：按其携带的状态码与信息（400/404/409/413 等）；
+            - RecoveryError / CorruptDataError / OSError / ValueError：
+              无法安全对账或文件系统/解析异常，一律 503 且只回泛化文案，
+              绝不泄露半完成公钥、余额、version、策略或私钥。
+            任何情况下都不让异常逃逸成无响应体的 500/traceback。
+            """
+            if isinstance(exc, ServiceError):
+                self._send_error(exc.status, exc.message)
+            elif isinstance(
+                exc, (RecoveryError, CorruptDataError, OSError, ValueError)
+            ):
+                self._send_error(503, _SERVICE_UNAVAILABLE)
+            else:  # pragma: no cover - 兜底：不暴露内部细节
+                self._send_error(503, _SERVICE_UNAVAILABLE)
 
         def log_message(self, fmt: str, *args: object) -> None:
             # 只记录方法、路径与状态码；不记录任何请求体/响应体
@@ -126,11 +148,12 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 self._send_error(404, "not found")
-            except RecoveryError as exc:
-                # 崩溃现场无法对账到一致状态：拒绝暴露半完成数据
-                self._send_error(503, f"recovery incomplete: {exc}")
-            except ServiceError as exc:
-                self._send_error(exc.status, exc.message)
+            except Exception as exc:
+                # fail-closed 边界：业务错误按其状态码；恢复不可对账 /
+                # 文件系统 / 持久化 JSON 解析或形状异常 / 任何未预期错误
+                # 都转 JSON 503 泛化文案，绝不抛 traceback 或断连，绝不
+                # 暴露半完成公钥、余额、version、策略或私钥。
+                self._send_failure(exc)
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
@@ -231,10 +254,12 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
 
                 self._send_error(404, "not found")
-            except RecoveryError as exc:
-                self._send_error(503, f"recovery incomplete: {exc}")
-            except ServiceError as exc:
-                self._send_error(exc.status, exc.message)
+            except Exception as exc:
+                # fail-closed 边界：业务错误按其状态码；恢复不可对账 /
+                # 文件系统 / 持久化 JSON 解析或形状异常 / 任何未预期错误
+                # 都转 JSON 503 泛化文案，绝不抛 traceback 或断连，绝不
+                # 暴露半完成公钥、余额、version、策略或私钥。
+                self._send_failure(exc)
 
         def do_PUT(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
@@ -262,10 +287,12 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                 self._send_error(404, "not found")
-            except RecoveryError as exc:
-                self._send_error(503, f"recovery incomplete: {exc}")
-            except ServiceError as exc:
-                self._send_error(exc.status, exc.message)
+            except Exception as exc:
+                # fail-closed 边界：业务错误按其状态码；恢复不可对账 /
+                # 文件系统 / 持久化 JSON 解析或形状异常 / 任何未预期错误
+                # 都转 JSON 503 泛化文案，绝不抛 traceback 或断连，绝不
+                # 暴露半完成公钥、余额、version、策略或私钥。
+                self._send_failure(exc)
 
         # ---- 路径匹配 ---------------------------------------------------
 

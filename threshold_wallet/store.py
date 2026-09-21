@@ -77,6 +77,16 @@ class RecoveryError(Exception):
     """
 
 
+class CorruptDataError(ValueError):
+    """本应是 JSON 对象的持久化文件无法解析（损坏或被外部篡改）。
+
+    是 ValueError 的子类：既有的宽松 ``except ValueError``（如把不可解析
+    意图纳入对账、把损坏暂存判为无效）行为不变；业务/HTTP 边界则可据此
+    把"解析异常"与"非法 id"区分开——前者 fail-closed（503/阻止就绪），
+    后者才是 400。
+    """
+
+
 class WalletStore:
     """钱包、份额与已完成签名请求的文件存储。"""
 
@@ -159,6 +169,12 @@ class WalletStore:
                 return json.load(f)
         except FileNotFoundError:
             return None
+        except json.JSONDecodeError as exc:
+            # 文件存在但损坏/被外部篡改：区别于"文件不存在"，按不可对账
+            # 的数据损坏处理（CorruptDataError 是 ValueError 子类）。
+            raise CorruptDataError(
+                f"cannot parse JSON file {path!r}: {exc.msg}"
+            ) from exc
 
     # ---- 钱包与份额 -----------------------------------------------------
 

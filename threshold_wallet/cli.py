@@ -261,33 +261,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
         elif args.command == "share-sign":
-            from .store import RecoveryError, WalletStore
+            from .store import CorruptDataError, RecoveryError, WalletStore
             from .service import ServiceError, WalletService
 
-            # 经服务层构造（在该钱包事务锁外先做启动恢复编排），并在该
-            # 钱包事务锁内先懒恢复、再读取当前在用份额后签名，避免在激活
-            # 崩溃半完成时读到半换入/半删除的份额文件。恢复失败或份额
-            # 未知都打印单行 JSON 到 stderr 并非零退出，绝不基于不一致
-            # 的份额签名。
+            # share-sign 的统一错误边界：构造 WalletService（启动恢复）、
+            # 钱包锁内懒恢复、读取当前份额、签名四个阶段都可能失败。无论
+            # RecoveryError / OSError / ValueError（含损坏 JSON、非法私钥
+            # hex 等 CorruptDataError）/ ServiceError 还是任何意外异常，都：
+            #   - stdout 为空；
+            #   - stderr 仅一行 {"error": ...}；
+            #   - 退出码非零；
+            #   - 绝不打印 traceback、私钥或签名载荷。
             try:
-                service = WalletService(WalletStore(args.data_dir))
-            except RecoveryError as exc:
-                return _fail(f"recovery failed, refusing to sign: {exc}")
-            except OSError as exc:
-                return _fail(f"cannot open data dir, refusing to sign: {exc}")
-            try:
-                result = service.share_sign(
-                    args.wallet_id,
-                    args.share_id,
-                    args.signing_request_id,
-                    args.message,
-                )
-            except RecoveryError as exc:
-                return _fail(f"recovery failed, refusing to sign: {exc}")
-            except ServiceError as exc:
-                return _fail(exc.message)
-            _print_json(result)
-            return 0
+                try:
+                    service = WalletService(WalletStore(args.data_dir))
+                except RecoveryError as exc:
+                    return _fail(
+                        f"recovery failed, refusing to sign: {exc}"
+                    )
+                except OSError as exc:
+                    return _fail(
+                        f"cannot open data dir, refusing to sign: {exc}"
+                    )
+                except ValueError:
+                    # data-dir 内持久化 JSON 损坏等：不回显解析细节
+                    return _fail(
+                        "wallet data is corrupt, refusing to sign"
+                    )
+                try:
+                    result = service.share_sign(
+                        args.wallet_id,
+                        args.share_id,
+                        args.signing_request_id,
+                        args.message,
+                    )
+                except RecoveryError as exc:
+                    return _fail(
+                        f"recovery failed, refusing to sign: {exc}"
+                    )
+                except (OSError, CorruptDataError, ValueError):
+                    # 文件系统异常 / 份额文件损坏 / 私钥 hex 或长度非法：
+                    # 统一泛化信息，绝不回显底层异常、私钥或签名载荷。
+                    return _fail(
+                        "share is unavailable, refusing to sign"
+                    )
+                except ServiceError as exc:
+                    return _fail(exc.message)
+                _print_json(result)
+                return 0
+            except Exception:
+                # 兜底：任何未预期异常也只落一行泛化 JSON，杜绝 traceback
+                return _fail("share-sign failed, refusing to sign")
 
         else:  # pragma: no cover - argparse 已保证不会到达
             return _fail(f"unknown command {args.command!r}")
