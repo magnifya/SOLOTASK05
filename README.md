@@ -35,6 +35,9 @@
 | POST | `/v1/wallets/{wallet_id}/asset-operations` | 创建资产操作 `{"operation_id", "asset_id", "delta"}` |
 | POST | `/v1/wallets/{wallet_id}/asset-operations/{operation_id}/commit` | 提交资产操作 |
 | GET  | `/v1/wallets/{wallet_id}/assets/{asset_id}` | 查询资产 `balance` 与 `version` |
+| POST | `/v1/wallets/{wallet_id}/sign-sessions` | 创建可恢复签名会话 `{"id", "message", "timeout_seconds"}` |
+| GET  | `/v1/wallets/{wallet_id}/sign-sessions/{id}` | 查询签名会话 |
+| POST | `/v1/wallets/{wallet_id}/sign-sessions/{id}/shares` | 投递一份额签名 `{"share_id", "signature"}` |
 
 状态码：
 
@@ -119,6 +122,7 @@
 | `request_rejected` (R) | **首次**拒绝 | `rid=id, a=approver_id, r=传入\|null`；`d={count, req, state: rejected}` |
 | `request_expired` (E) | pending 单超时被懒过期 | `rid=id`，actor/reason 为 null；`d={state: expired}`。GET 审批单、approve、reject、sign 触发，每个单只记一次 |
 | `request_signed` (S) | **首次**签名成功 | `rid=id`，actor/reason 为 null；`d={message, state: signed}`。重放 `200` 不记 |
+| `session_event` | 签名会话的创建/收份额/过期/签名 | `rid=id`，actor/reason 为 null；`d` 以 `action` 区分（见"可恢复签名会话"），**不含任何签名**。重放不记 |
 
 对终态单（approved/rejected/expired/signed）再 approve/reject 返回 `409`
 且不记事件；签名重放、审批单创建重放均不产生事件。
@@ -217,6 +221,63 @@ details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
 唯一 committed 结果；**事件未持久化则恢复 pending 与提交前余额/版本**，
 事件从未分配 seq，故无事件、无 seq 缺口、可重试。恢复后不会出现提交
 无事件、事件与余额不符、重复 version 或重复事件；意图文件不含私钥。
+
+## 可恢复签名会话
+
+`POST /v1/wallets/{wallet_id}/sign-sessions` 创建一个**可恢复**的两方门限
+签名会话，请求体 `{"id", "message", "timeout_seconds"}`：
+
+- `id` 沿用安全标识（`[A-Za-z0-9_-]{1,128}`）、`message` 为非空字符串、
+  `timeout_seconds` 为正整数（拒绝布尔、0、负数、小数）；参数非法 `400`，
+  钱包不存在 `404`。
+- 首次创建 `201`，会话进入 `collecting`；同 `id` 同 `message` 同
+  `timeout_seconds` 重放 `200`（不记事件、不触发懒过期），同 `id` 异参
+  `409`。
+
+会话状态机为 `collecting | ready | signed | expired`。会话视图含
+原文 `message`、状态、`received_shares`/`missing_shares`（按钱包当前在用
+份额）、到期时间 `expires_at`；**聚合 `signature` 仅在 `signed` 时存在**。
+
+- `GET .../sign-sessions/{id}` 返回视图，未知会话 `404`。查询（GET）或
+  投递份额时都会**懒过期**：`collecting`/`ready` 超过 `expires_at` 即持久
+  化为 `expired`（每会话只记一次），过期会话投递份额返回 `409`。
+- `POST .../sign-sessions/{id}/shares`，请求体 `{"share_id", "signature"}`，
+  **仅接受当前在用份额**对 `id` 与 `message` **直接拼接**载荷的有效
+  Ed25519 份额签名（64 字节 hex）。首收一份 `201`；同份额同值重放 `200`；
+  同份额异值 `409`；份额未知/签名非法/载荷不符 `400`；会话未知 `404`。
+- 两份齐备时会话转 `ready`，随即按**既有审批与 hot/cold 门控**尝试聚合
+  （cold 或配置了审批策略时要求存在同 `id`、同 `message` 且 `approved`
+  的审批单）。门控失败返回 `409` 且**保留 `ready`** 供后续投递重试；门控
+  通过则校验、拼接两份签名并转 `signed`（该次投递 `201`）。审批单在此
+  **只作门控**、状态不被会话改写；会话是独立资源，其提交只记
+  `session_event`。此后任何重放（创建/投递/查询）均 `200` 同体，聚合
+  签名保持不变。
+- 会话状态、（沿用既有审批语义时的）审批单 `signed` 推进与审计事件都在
+  该钱包的跨进程事务锁内原子持久化；进程重启后续作，跨进程并发投递下
+  **恰一个首次聚合**（一个 `201`，其余 `200` 同体）。
+
+会话文件（`sign-sessions/<wallet_id>.json`）只含标识、原文、状态、到期
+时间与至多两份**分属不同份额**的份额签名，绝不含任何份额私钥或两份私钥
+的拼接；写入采用临时文件 + 原子替换。会话文件 JSON 损坏或形状异常时，
+对该钱包的会话及其他持锁访问统一 `503`（常驻）或阻止服务就绪（启动），
+**保留现场**，绝不归一为空或覆盖。份额轮换激活后：已 `signed` 会话的旧
+份额签名重放仍 `200` 同体；进行中会话投影到新的在用份额，旧份额签名在
+收到第一份新份额时被剪枝，会话须用两份新份额齐备。
+
+会话审计事件统一为 `session_event`（七字段 `seq, type, at, request_id,
+actor_id, reason, details`，`seq` 连续），`request_id=id`、
+`actor_id`/`reason` 为 `null`，`details` 以 `action` 区分且**不含签名**：
+
+| action | 何时记录 | details |
+| ---- | ---- | ---- |
+| `created` | 会话首次创建 | `{action, state: collecting}` |
+| `share_received` | 首次收到某一份额 | `{action, share_id, state}`（state 为 collecting/ready） |
+| `expired` | 会话被懒过期 | `{action, state: expired}`，每会话一次 |
+| `signed` | 首次聚合成功 | `{action, state: signed}` |
+
+创建重放、份额同值重放、签名后重放均不记事件。聚合仅门控于（不改动）
+审批单，因此不额外产生 `request_signed`；既有 `sign`、`share-sign` 与
+份额轮换行为保持不变。
 
 ## 多进程与故障恢复
 
@@ -324,5 +385,7 @@ python -m unittest discover -s tests -v
   标识与整数，不含私钥。
   冷热钱包交易策略（`transaction-policies/<wallet_id>.json`）只含
   mode 标识、整数上限与资产标识，不含私钥。
+  可恢复签名会话（`sign-sessions/<wallet_id>.json`）只含标识、原文、
+  状态、到期时间与至多两份分属不同份额的份额签名，不含任何份额私钥。
   写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。
