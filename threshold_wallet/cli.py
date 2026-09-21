@@ -182,6 +182,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return _fail(f"recovery failed, refusing to serve: {exc}")
             except OSError as exc:
                 return _fail(f"cannot open data dir, refusing to serve: {exc}")
+            except ValueError:
+                return _fail(
+                    "cannot read wallet state, refusing to serve: "
+                    "unreadable or corrupted state"
+                )
+            except Exception:
+                return _fail("failed to open wallet state, refusing to serve")
             print(
                 json.dumps(
                     {
@@ -268,13 +275,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # 钱包事务锁内先懒恢复、再读取当前在用份额后签名，避免在激活
             # 崩溃半完成时读到半换入/半删除的份额文件。恢复失败或份额
             # 未知都打印单行 JSON 到 stderr 并非零退出，绝不基于不一致
-            # 的份额签名。
+            # 的份额签名。错误输出只含标识级信息，绝不含私钥/签名载荷。
             try:
                 service = WalletService(WalletStore(args.data_dir))
             except RecoveryError as exc:
                 return _fail(f"recovery failed, refusing to sign: {exc}")
-            except OSError as exc:
-                return _fail(f"cannot open data dir, refusing to sign: {exc}")
+            except (OSError, ValueError):
+                return _fail(
+                    "cannot read wallet state, refusing to sign: "
+                    "unreadable or corrupted state"
+                )
+            except Exception:
+                return _fail("failed to open wallet state, refusing to sign")
             try:
                 result = service.share_sign(
                     args.wallet_id,
@@ -286,6 +298,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return _fail(f"recovery failed, refusing to sign: {exc}")
             except ServiceError as exc:
                 return _fail(exc.message)
+            except (OSError, ValueError):
+                # 文件系统/JSON 解析异常：不回显任何路径内容，更不回显
+                # 私钥或签名载荷，仅给单行可枚举错误。
+                return _fail(
+                    "cannot read wallet state, refusing to sign: "
+                    "unreadable or corrupted state"
+                )
+            except Exception:
+                # 兜底：任何未预期异常都变成单行 JSON 而非 traceback，
+                # stdout 保持为空、绝不泄露私钥或签名载荷。
+                return _fail("failed to produce share signature")
             _print_json(result)
             return 0
 

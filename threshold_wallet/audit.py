@@ -30,7 +30,7 @@ import os
 import threading
 from typing import Optional
 
-from .store import WalletStore, _check_id
+from .store import RecoveryError, WalletStore, _check_id
 
 #: 审计事件类型
 TYPE_POLICY_UPDATED = "policy_updated"
@@ -69,6 +69,30 @@ class AuditStore:
 
     def _read(self, wallet_id: str) -> Optional[dict]:
         return WalletStore._read_json(self._path(wallet_id))
+
+    def assert_readable(self, wallet_id: str) -> None:
+        """对账探针：审计日志文件存在时必须可解析为预期结构。
+
+        供运行时自愈在持锁后、任何读取前调用：日志 JSON 不可解析、顶层
+        非对象或 events 非数组时抛 RecoveryError（fail-closed），绝不把
+        损坏日志当空日志而掩盖 seq 断裂/丢事件。无日志文件时静默通过。
+        """
+        _check_id("wallet_id", wallet_id)
+        try:
+            data = self._read(wallet_id)
+        except ValueError as exc:
+            # json.JSONDecodeError：日志文件存在但 JSON 损坏（仅外部损坏）
+            raise RecoveryError(
+                f"wallet {wallet_id!r} audit log is corrupted"
+            ) from exc
+        if data is None:
+            return
+        if not isinstance(data, dict) or not isinstance(
+            data.get("events"), list
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} audit log is malformed"
+            )
 
     def append_event(self, wallet_id: str, event: dict) -> dict:
         """原子追加一条事件，分配下一个 seq 并持久化，返回含 seq/at 的记录。

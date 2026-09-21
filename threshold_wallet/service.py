@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,12 @@ from datetime import datetime, timedelta, timezone
 from . import audit, crypto
 from .audit import AuditStore
 from .flock import FileLock, wallet_lock_path
-from .store import DuplicateWalletError, RecoveryError, WalletStore
+from .store import (
+    DuplicateWalletError,
+    RecoveryError,
+    WalletStore,
+    _check_id,
+)
 
 #: 两方门限：份额数固定为 2
 REQUIRED_SHARES = 2
@@ -127,14 +133,21 @@ class WalletService:
 
         任一钱包恢复失败（RecoveryError/OSError）都向上抛出，由调用方阻止
         服务就绪（fail-closed）：绝不静默跳过带着损坏现场对外服务。"""
-        wallet_ids = sorted(
+        artifact_wallets = (
             set(self._store.list_rotation_wallet_ids())
             | set(self._store.list_staging_wallet_ids())
             | set(self._store.list_asset_intent_wallet_ids())
         )
+        # 所有已建钱包都要纳入：即使没有轮换/意图残留，也要对资产账本与
+        # 审计日志做对账探针，损坏即阻止就绪。
+        wallet_ids = sorted(artifact_wallets | set(self._store.list_wallet_ids()))
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
-                self._recover_wallet(wallet_id)
+                if wallet_id in artifact_wallets:
+                    self._recover_wallet(wallet_id)
+                # 跨切面状态文件损坏同样阻止服务就绪（fail-closed）
+                self._store.assert_asset_ledger_readable(wallet_id)
+                self._audit.assert_readable(wallet_id)
 
     def _activated_rotations(self, wallet_id: str) -> dict[str, dict]:
         """该钱包已落盘的 share_rotation_activated 事件映射。"""
@@ -166,43 +179,80 @@ class WalletService:
         静止现场不触发恢复：prepared（暂存完整待激活）与干净完成的
         active（事件在、暂存已清空）。对账失败向上抛出
         RecoveryError/OSError，绝不静默继续。
+
+        最后对资产账本与审计日志做只读对账探针：即使没有崩溃残留，
+        这两个跨切面文件损坏（JSON 不可解析或结构非法）也必须 fail-closed，
+        使访问该钱包的任何路由（含审计查询）统一 503，绝不把损坏账本/
+        日志当空数据呈现半完成余额、version 或事件。
         """
-        if self._store.list_asset_intents(wallet_id):
-            self._recover_wallet(wallet_id)
-            return
-        rotations = self._store.list_rotations(wallet_id)
-        staging_ids = set(self._store.list_staging_rotation_ids(wallet_id))
-        needs_recovery = False
-        active_check = False
-        for record in rotations:
-            state = record.get("state")
-            rid = record.get("rotation_id")
-            if state == "activating":
-                needs_recovery = True
-            elif state == "active":
-                # 干净完成的 active：事件在且暂存已清空。暂存残留或
-                # 事件缺失才是崩溃现场（后者需读审计判定）。
-                if rid in staging_ids:
-                    needs_recovery = True
-                else:
-                    active_check = True
-            elif state == "prepared" and isinstance(rid, str):
-                # prepared 的暂存目录是预期现场，不算孤儿
-                staging_ids.discard(rid)
-        if not needs_recovery and active_check:
-            activated = self._activated_rotations(wallet_id)
-            for record in rotations:
-                if (
-                    record.get("state") == "active"
-                    and record.get("rotation_id") not in activated
-                ):
-                    needs_recovery = True
-                    break
-        if not needs_recovery and staging_ids:
-            # 无对应 prepared 记录的孤儿暂存目录
-            needs_recovery = True
+        needs_recovery = bool(self._store.list_asset_intents(wallet_id))
         if needs_recovery:
             self._recover_wallet(wallet_id)
+        else:
+            rotations = self._store.list_rotations(wallet_id)
+            staging_ids = set(self._store.list_staging_rotation_ids(wallet_id))
+            active_check = False
+            for record in rotations:
+                state = record.get("state")
+                rid = record.get("rotation_id")
+                if state == "activating":
+                    needs_recovery = True
+                elif state == "active":
+                    # 干净完成的 active：事件在且暂存已清空。暂存残留或
+                    # 事件缺失才是崩溃现场（后者需读审计判定）。
+                    if rid in staging_ids:
+                        needs_recovery = True
+                    else:
+                        active_check = True
+                elif state == "prepared" and isinstance(rid, str):
+                    # prepared 的暂存目录是预期现场，不算孤儿
+                    staging_ids.discard(rid)
+            if not needs_recovery and active_check:
+                activated = self._activated_rotations(wallet_id)
+                for record in rotations:
+                    if (
+                        record.get("state") == "active"
+                        and record.get("rotation_id") not in activated
+                    ):
+                        needs_recovery = True
+                        break
+            if not needs_recovery and staging_ids:
+                # 无对应 prepared 记录的孤儿暂存目录
+                needs_recovery = True
+            if needs_recovery:
+                self._recover_wallet(wallet_id)
+
+        # 跨切面状态文件损坏：任何钱包路由（含审计查询）都 fail-closed。
+        self._store.assert_asset_ledger_readable(wallet_id)
+        self._audit.assert_readable(wallet_id)
+
+    def _with_wallet_recovery(self, wallet_id: str, action):
+        """在该钱包事务锁内先懒恢复再执行 action（fail-closed）。
+
+        所有会访问钱包状态的入口（含审计查询）都经此封装：拿锁、自愈
+        他进程崩溃遗留的轮换/资产提交现场、再执行实际读取或变更，因此
+        多进程共用 data-dir 时恢复与业务操作按钱包严格串行，任何读都
+        接触不到半完成状态。恢复/对账无法完成时 RecoveryError/OSError
+        原样向上抛出，由 HTTP 层统一转成 503（绝不静默）；钱包状态文件
+        JSON 损坏（JSONDecodeError）或结构缺字段（KeyError）同样转成
+        RecoveryError，绝不以裸 500 暴露半完成数据。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                return action()
+        except json.JSONDecodeError as exc:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} state is corrupted"
+            ) from exc
+        except (KeyError, AttributeError, TypeError) as exc:
+            # 记录结构与预期不符（字段缺失/类型错误/顶层不是对象）：
+            # 无法安全对账，fail-closed，绝不让其冒泡成裸 500。
+            raise RecoveryError(
+                f"wallet {wallet_id!r} state is malformed"
+            ) from exc
+
+    # ---- 建钱包 ---------------------------------------------------------
 
     @staticmethod
     def _audit_event(
@@ -261,15 +311,25 @@ class WalletService:
 
     def get_wallet(self, wallet_id: str) -> dict:
         try:
-            with self._wallet_lock(wallet_id):
-                # 查询前先自愈他进程崩溃遗留的激活现场，绝不把换了一半
-                # 的公钥/份额经 GET 暴露出去
-                self._heal_wallet(wallet_id)
-                record = self._store.get_wallet(wallet_id)
+            _check_id("wallet_id", wallet_id)
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+
+        def _read() -> dict | None:
+            # 自愈已由 _with_wallet_recovery 在锁内完成；这里绝不把换了
+            # 一半的公钥/份额经 GET 暴露出去。
+            return self._store.get_wallet(wallet_id)
+
+        record = self._with_wallet_recovery(wallet_id, _read)
         if record is None:
             raise ServiceError(404, f"wallet {wallet_id!r} not found")
+        if not isinstance(record, dict) or not isinstance(
+            record.get("public_key"), str
+        ):
+            # 钱包元数据文件结构损坏：无法安全呈现，fail-closed
+            raise RecoveryError(
+                f"wallet {wallet_id!r} metadata is malformed"
+            )
         return {
             "wallet_id": record["wallet_id"],
             "public_key": record["public_key"],
@@ -287,9 +347,12 @@ class WalletService:
 
         在该钱包的事务锁内先做懒恢复（``_heal_wallet``），再依据钱包
         元数据中当前在用的 share_id 读取份额私钥并签名：绝不在轮换激活
-        半完成、或份额已轮换失效时读到半换入/已删除的份额。恢复无法
-        对账时向上抛 RecoveryError/OSError（fail-closed），由调用方输出
-        JSON 错误并非零退出。
+        半完成、或份额已轮换失效时读到半换入/已删除的份额。
+
+        错误边界：参数非法为 ServiceError（400/404）；恢复无法对账、
+        份额文件 JSON 损坏、私钥 hex 非法或长度不对等数据层异常统一转成
+        RecoveryError（消息只含标识，绝不含私钥/载荷），由 CLI 输出单行
+        JSON 并非零退出。
         """
         if (
             not isinstance(signing_request_id, str)
@@ -300,12 +363,30 @@ class WalletService:
             )
         if not isinstance(message, str):
             raise ServiceError(400, "message must be a string")
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        try:
+            _check_id("wallet_id", wallet_id)
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+        def _sign() -> dict:
             wallet = self._store.get_wallet(wallet_id)
             if wallet is None:
                 raise ServiceError(404, f"wallet {wallet_id!r} not found")
-            in_use = [s["share_id"] for s in wallet["shares"]]
+            if not isinstance(wallet, dict) or not isinstance(
+                wallet.get("shares"), list
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} metadata is malformed"
+                )
+            in_use: list[str] = []
+            for entry in wallet["shares"]:
+                if not isinstance(entry, dict) or not isinstance(
+                    entry.get("share_id"), str
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} metadata is malformed"
+                    )
+                in_use.append(entry["share_id"])
             if not isinstance(share_id, str) or share_id not in in_use:
                 raise ServiceError(
                     404,
@@ -313,28 +394,86 @@ class WalletService:
                 )
             try:
                 share = self._store.get_share(wallet_id, share_id)
+            except json.JSONDecodeError:
+                # 份额文件 JSON 损坏：无法判定私钥，fail-closed
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {share_id!r} file is "
+                    "corrupted"
+                )
             except ValueError:
                 raise ServiceError(400, "invalid share_id")
-            if share is None:
-                raise ServiceError(
-                    404,
-                    f"share {share_id!r} of wallet {wallet_id!r} not found",
+            if not isinstance(share, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {share_id!r} record is "
+                    "malformed"
+                )
+            private_hex = share.get("private_key")
+            if not isinstance(private_hex, str):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {share_id!r} private key "
+                    "is missing or malformed"
+                )
+            try:
+                private_bytes = bytes.fromhex(private_hex)
+            except ValueError:
+                # 错误信息绝不回显私钥串本身
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {share_id!r} private key "
+                    "is not valid hex"
+                )
+            if len(private_bytes) != 32:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {share_id!r} private key "
+                    "must be 32 bytes"
                 )
             payload = crypto.build_payload(signing_request_id, message)
-            signature = crypto.sign_share(
-                bytes.fromhex(share["private_key"]), payload
-            )
+            try:
+                signature = crypto.sign_share(private_bytes, payload)
+            except ValueError:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {share_id!r} private key "
+                    "is invalid"
+                )
             return {"share_id": share_id, "signature": signature.hex()}
+
+        try:
+            return self._with_wallet_recovery(wallet_id, _sign)
+        except (ServiceError, RecoveryError, OSError):
+            raise
+        except ValueError as exc:
+            # 锁内恢复/读取出现的任何其它解析异常（含损坏 JSON）都视为
+            # 数据损坏：fail-closed，绝不降级为参数错误继续签名。
+            raise RecoveryError(
+                f"wallet {wallet_id!r} state is corrupted"
+            ) from exc
 
     # ---- 审批策略 -------------------------------------------------------
 
-    def _get_wallet_or_404(self, wallet_id: str) -> dict:
+    @staticmethod
+    def _require_valid_wallet_id(wallet_id: str) -> None:
+        """仅做 wallet_id 格式校验（锁外廉价参数检查，非法 400）。"""
         try:
-            wallet = self._store.get_wallet(wallet_id)
+            _check_id("wallet_id", wallet_id)
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+
+    def _get_wallet_locked(self, wallet_id: str) -> dict:
+        """在已持有钱包事务锁（且已 heal）后读取钱包并校验存在性。
+
+        不存在 404；元数据 JSON 结构损坏抛 RecoveryError（fail-closed，
+        由 HTTP 层转 503），绝不把损坏/半完成的公钥暴露出去。
+        """
+        wallet = self._store.get_wallet(wallet_id)
         if wallet is None:
             raise ServiceError(404, f"wallet {wallet_id!r} not found")
+        if (
+            not isinstance(wallet, dict)
+            or not isinstance(wallet.get("public_key"), str)
+            or not isinstance(wallet.get("shares"), list)
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} metadata is malformed"
+            )
         return wallet
 
     def put_policy(
@@ -343,34 +482,39 @@ class WalletService:
         required_approvals: object,
         timeout_seconds: object,
     ) -> dict:
-        self._get_wallet_or_404(wallet_id)
-        # bool 是 int 的子类，必须先排除
-        if (
-            not isinstance(required_approvals, int)
-            or isinstance(required_approvals, bool)
-            or required_approvals not in ALLOWED_REQUIRED_APPROVALS
-        ):
-            raise ServiceError(
-                400,
-                "required_approvals must be one of "
-                + ", ".join(str(v) for v in ALLOWED_REQUIRED_APPROVALS),
-            )
-        if (
-            not isinstance(timeout_seconds, int)
-            or isinstance(timeout_seconds, bool)
-            or timeout_seconds <= 0
-        ):
-            raise ServiceError(400, "timeout_seconds must be a positive integer")
+        self._require_valid_wallet_id(wallet_id)
         policy = {
             "wallet_id": wallet_id,
             "required_approvals": required_approvals,
             "timeout_seconds": timeout_seconds,
         }
-        # 同值更新也成功并记录（operation 区分首设/更新）
-        old_policy = self._store.get_policy(wallet_id)
-        operation = "created" if old_policy is None else "updated"
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+
+        def _put() -> dict:
+            # 存在性先于参数判定（沿用 404 优先于 400 的旧语义），且全部
+            # 在同一把锁 + 自愈之后：绝不在他进程崩溃遗留的半完成现场上
+            # 更新策略。
+            self._get_wallet_locked(wallet_id)
+            # bool 是 int 的子类，必须先排除
+            if (
+                not isinstance(required_approvals, int)
+                or isinstance(required_approvals, bool)
+                or required_approvals not in ALLOWED_REQUIRED_APPROVALS
+            ):
+                raise ServiceError(
+                    400,
+                    "required_approvals must be one of "
+                    + ", ".join(str(v) for v in ALLOWED_REQUIRED_APPROVALS),
+                )
+            if (
+                not isinstance(timeout_seconds, int)
+                or isinstance(timeout_seconds, bool)
+                or timeout_seconds <= 0
+            ):
+                raise ServiceError(
+                    400, "timeout_seconds must be a positive integer"
+                )
+            old_policy = self._store.get_policy(wallet_id)
+            operation = "created" if old_policy is None else "updated"
             self._store.save_policy(wallet_id, policy)
             event = self._audit_event(
                 audit.TYPE_POLICY_UPDATED,
@@ -389,7 +533,9 @@ class WalletService:
                 else:
                     self._store.save_policy(wallet_id, old_policy)
                 raise
-        return policy
+            return policy
+
+        return self._with_wallet_recovery(wallet_id, _put)
 
     # ---- 冷热钱包交易策略 -------------------------------------------------
 
@@ -443,15 +589,18 @@ class WalletService:
         transaction_policy_updated 事件在每钱包事务锁内原子持久化，
         同值更新也记事件（details 即策略三项）。
         """
-        self._get_wallet_or_404(wallet_id)
-        self._validate_transaction_policy(mode, max_delta, allowed_assets)
-        policy = {
-            "mode": mode,
-            "max_delta": max_delta,
-            "allowed_assets": list(allowed_assets),
-        }
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _put() -> dict:
+            # 存在性先于参数判定（404 优先于 400），且与旧策略读取、
+            # 写入、事件同在一把锁 + 自愈之后。
+            self._get_wallet_locked(wallet_id)
+            self._validate_transaction_policy(mode, max_delta, allowed_assets)
+            policy = {
+                "mode": mode,
+                "max_delta": max_delta,
+                "allowed_assets": list(allowed_assets),
+            }
             old_policy = self._store.get_transaction_policy(wallet_id)
             self._store.save_transaction_policy(wallet_id, policy)
             event = self._audit_event(
@@ -473,23 +622,42 @@ class WalletService:
                         wallet_id, old_policy
                     )
                 raise
-        return policy
+            return policy
+
+        return self._with_wallet_recovery(wallet_id, _put)
 
     def get_transaction_policy(self, wallet_id: str) -> dict:
-        """读取交易策略：已配置 200 同体，未配置 404。"""
-        self._get_wallet_or_404(wallet_id)
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        """读取交易策略：已配置 200 同体，未配置 404。
+
+        与所有钱包状态读取一样，在钱包事务锁内先自愈再读取；策略文件
+        JSON 损坏时 fail-closed（RecoveryError -> 503），不暴露半完成策略。
+        """
+        self._require_valid_wallet_id(wallet_id)
+
+        def _get() -> dict:
+            self._get_wallet_locked(wallet_id)
             policy = self._store.get_transaction_policy(wallet_id)
-        if policy is None:
-            raise ServiceError(
-                404, f"wallet {wallet_id!r} has no transaction policy"
-            )
-        return {
-            "mode": policy["mode"],
-            "max_delta": policy["max_delta"],
-            "allowed_assets": list(policy["allowed_assets"]),
-        }
+            if policy is None:
+                raise ServiceError(
+                    404, f"wallet {wallet_id!r} has no transaction policy"
+                )
+            if (
+                not isinstance(policy, dict)
+                or not isinstance(policy.get("mode"), str)
+                or not isinstance(policy.get("max_delta"), int)
+                or isinstance(policy.get("max_delta"), bool)
+                or not isinstance(policy.get("allowed_assets"), list)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} transaction policy is malformed"
+                )
+            return {
+                "mode": policy["mode"],
+                "max_delta": policy["max_delta"],
+                "allowed_assets": list(policy["allowed_assets"]),
+            }
+
+        return self._with_wallet_recovery(wallet_id, _get)
 
     # ---- 签名请求审批单 ---------------------------------------------------
 
@@ -534,14 +702,26 @@ class WalletService:
         return record
 
     def _fetch_request_or_404(self, wallet_id: str, request_id: str) -> dict:
-        """只读取审批单（404），不做懒过期；调用方自行在钱包事务锁内过期。"""
+        """只读取审批单（404），不做懒过期；调用方自行在钱包事务锁内过期。
+
+        request_id 非法（路径不安全）为 400；审批单文件 JSON 损坏为
+        RecoveryError（fail-closed -> 503），绝不把损坏状态当参数错误。
+        """
         try:
             record = self._store.get_request(wallet_id, request_id)
+        except json.JSONDecodeError:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} signing requests are corrupted"
+            )
         except ValueError:
             raise ServiceError(400, "invalid signing_request_id")
         if record is None:
             raise ServiceError(
                 404, f"signing request {request_id!r} not found"
+            )
+        if not isinstance(record, dict):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} signing requests are corrupted"
             )
         return record
 
@@ -562,39 +742,58 @@ class WalletService:
         self, wallet_id: str, request_id: object, message: object
     ) -> tuple[int, dict]:
         """返回 (HTTP 状态码, 响应体)。"""
-        self._get_wallet_or_404(wallet_id)
-        self._validate_request_body(request_id, message)
-        try:
-            self._store.get_request(wallet_id, request_id)
-        except ValueError:
-            raise ServiceError(400, "invalid signing_request_id")
-        policy = self._store.get_policy(wallet_id)
-        if policy is None:
-            raise ServiceError(
-                409, f"wallet {wallet_id!r} has no approval policy"
-            )
+        self._require_valid_wallet_id(wallet_id)
 
-        now = datetime.now(timezone.utc)
-        record = {
-            "id": request_id,
-            "message": message,
-            "state": "pending",
-            "approvers": [],
-            "req": policy["required_approvals"],
-            "t0": now.isoformat().replace("+00:00", "Z"),
-            "t1": (now + timedelta(seconds=policy["timeout_seconds"]))
-            .isoformat()
-            .replace("+00:00", "Z"),
-            "reason": None,
-        }
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        def _create() -> tuple[int, dict]:
+            # 存在性 -> 报文 -> 策略判定与查重全部在锁 + 自愈之后，
+            # 且状态写入与 C 事件在同一事务内完成。
+            self._get_wallet_locked(wallet_id)
+            self._validate_request_body(request_id, message)
+            # 路径安全字符校验（不做多余的磁盘预读；真正查重在
+            # create_request 的锁内原子完成）
+            try:
+                _check_id("signing_request_id", request_id)
+            except ValueError:
+                raise ServiceError(400, "invalid signing_request_id")
+            policy = self._store.get_policy(wallet_id)
+            if policy is None:
+                raise ServiceError(
+                    409, f"wallet {wallet_id!r} has no approval policy"
+                )
+            if (
+                not isinstance(policy, dict)
+                or not isinstance(policy.get("required_approvals"), int)
+                or not isinstance(policy.get("timeout_seconds"), int)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} approval policy is malformed"
+                )
+
+            now = datetime.now(timezone.utc)
+            record = {
+                "id": request_id,
+                "message": message,
+                "state": "pending",
+                "approvers": [],
+                "req": policy["required_approvals"],
+                "t0": now.isoformat().replace("+00:00", "Z"),
+                "t1": (now + timedelta(seconds=policy["timeout_seconds"]))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "reason": None,
+            }
             existing = self._store.create_request(wallet_id, request_id, record)
             if existing is not None:
                 # 重放（无论同文幂等还是异文 409）均不记事件、不改状态。
                 # POST 不是懒过期触发点：原样返回磁盘中持久化的状态
                 # （pending/approved/rejected/expired/signed），绝不在响应里
                 # 把磁盘仍是 pending 的单临时呈现成 expired。
+                if not isinstance(existing, dict) or not isinstance(
+                    existing.get("message"), str
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} signing requests are corrupted"
+                    )
                 if existing["message"] != message:
                     raise ServiceError(
                         409,
@@ -614,15 +813,20 @@ class WalletService:
             except BaseException:
                 self._store.delete_request(wallet_id, request_id)
                 raise
-        return 201, self._request_view(record)
+            return 201, self._request_view(record)
+
+        return self._with_wallet_recovery(wallet_id, _create)
 
     def get_sign_request(self, wallet_id: str, request_id: str) -> dict:
-        self._get_wallet_or_404(wallet_id)
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _get() -> dict:
+            self._get_wallet_locked(wallet_id)
             record = self._fetch_request_or_404(wallet_id, request_id)
             record = self._expire_if_needed(wallet_id, record)
             return self._request_view(record)
+
+        return self._with_wallet_recovery(wallet_id, _get)
 
     # ---- 审计事件查询 ---------------------------------------------------
 
@@ -652,23 +856,44 @@ class WalletService:
         from_seq: object = None,
         limit: object = None,
     ) -> dict:
-        """返回 {wallet_id, events}（seq 升序）。纯只读：不触发懒过期。"""
-        self._get_wallet_or_404(wallet_id)
-        seq = (
-            1
-            if from_seq is None
-            else self._parse_positive_int(from_seq, "from_seq")
-        )
-        size = (
-            self.AUDIT_DEFAULT_LIMIT
-            if limit is None
-            else self._parse_positive_int(limit, "limit")
-        )
-        if size > self.AUDIT_MAX_LIMIT:
-            raise ServiceError(
-                400, f"limit must be at most {self.AUDIT_MAX_LIMIT}"
+        """返回 {wallet_id, events}（seq 升序）。
+
+        审计查询对审批单仍是纯只读：**不触发** pending 懒过期、不产生任何
+        审计事件。但与所有访问钱包状态的入口一致，它必须先在该钱包事务
+        锁内自愈他进程崩溃遗留的轮换/资产提交现场（多进程共用 data-dir
+        时与写入按钱包串行），再读取事件；审计日志 JSON 损坏时 fail-closed
+        （RecoveryError -> 503）。
+        """
+        self._require_valid_wallet_id(wallet_id)
+
+        def _read_events() -> list[dict]:
+            # 锁内自愈崩溃现场（不触发审批懒过期、不记事件）。存在性沿用
+            # 旧的 404 优先语义：先判钱包存在，再校验分页参数（400）。
+            self._get_wallet_locked(wallet_id)
+            seq = (
+                1
+                if from_seq is None
+                else self._parse_positive_int(from_seq, "from_seq")
             )
-        events = self._audit.list_events(wallet_id, from_seq=seq, limit=size)
+            size = (
+                self.AUDIT_DEFAULT_LIMIT
+                if limit is None
+                else self._parse_positive_int(limit, "limit")
+            )
+            if size > self.AUDIT_MAX_LIMIT:
+                raise ServiceError(
+                    400, f"limit must be at most {self.AUDIT_MAX_LIMIT}"
+                )
+            try:
+                return self._audit.list_events(
+                    wallet_id, from_seq=seq, limit=size
+                )
+            except json.JSONDecodeError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} audit log is corrupted"
+                ) from exc
+
+        events = self._with_wallet_recovery(wallet_id, _read_events)
         return {"wallet_id": wallet_id, "events": events}
 
     # ---- 份额轮换 ---------------------------------------------------------
@@ -700,15 +925,29 @@ class WalletService:
         返回 (HTTP 状态码, 响应体)。同 rotation_id 重放返回 200 且不重新
         生成；每钱包同时只允许一个 prepared 轮换，冲突返回 409。
         """
-        self._get_wallet_or_404(wallet_id)
-        self._validate_rotation_id(rotation_id)
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
-            existing = self._store.get_rotation(wallet_id, rotation_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _create() -> tuple[int, dict]:
+            # 存在性先于 rotation_id 校验（404 优先于 400）；查重、暂存
+            # 写入、记录与事件全部在锁 + 自愈之后串行完成。
+            self._get_wallet_locked(wallet_id)
+            self._validate_rotation_id(rotation_id)
+            try:
+                existing = self._store.get_rotation(wallet_id, rotation_id)
+            except json.JSONDecodeError:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation records are corrupted"
+                )
             if existing is not None:
                 # 幂等重放：原样返回，不重新生成、不记事件
                 return 200, self._rotation_view(existing)
-            for record in self._store.list_rotations(wallet_id):
+            try:
+                all_rotations = self._store.list_rotations(wallet_id)
+            except json.JSONDecodeError:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation records are corrupted"
+                )
+            for record in all_rotations:
                 if record.get("state") in ("prepared", "activating"):
                     raise ServiceError(
                         409,
@@ -761,22 +1000,35 @@ class WalletService:
                 self._store.delete_rotation(wallet_id, rotation_id)
                 self._store.delete_staging(wallet_id, rotation_id)
                 raise
-        return 201, self._rotation_view(record)
+            return 201, self._rotation_view(record)
+
+        return self._with_wallet_recovery(wallet_id, _create)
 
     def get_share_rotation(self, wallet_id: str, rotation_id: str) -> dict:
-        self._get_wallet_or_404(wallet_id)
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _get() -> dict:
+            self._get_wallet_locked(wallet_id)
             # 锁内读取：并发激活期间不会读到瞬态 activating
             try:
                 record = self._store.get_rotation(wallet_id, rotation_id)
+            except json.JSONDecodeError:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation records are corrupted"
+                )
             except ValueError:
                 raise ServiceError(400, "invalid rotation_id")
             if record is None:
                 raise ServiceError(
                     404, f"share rotation {rotation_id!r} not found"
                 )
+            if not isinstance(record, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation records are corrupted"
+                )
             return self._rotation_view(record)
+
+        return self._with_wallet_recovery(wallet_id, _get)
 
     def activate_share_rotation(
         self, wallet_id: str, rotation_id: str
@@ -786,14 +1038,26 @@ class WalletService:
         仅 prepared 可激活（201）；active 重放返回 200；其余状态 409。
         失败时回滚份额文件、公钥与状态并清理备份；激活成功后删除暂存。
         """
-        self._get_wallet_or_404(wallet_id)
-        self._validate_rotation_id(rotation_id)
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
-            record = self._store.get_rotation(wallet_id, rotation_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _activate() -> tuple[int, dict]:
+            self._get_wallet_locked(wallet_id)
+            self._validate_rotation_id(rotation_id)
+            try:
+                record = self._store.get_rotation(wallet_id, rotation_id)
+            except json.JSONDecodeError:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation records are corrupted"
+                )
             if record is None:
                 raise ServiceError(
                     404, f"share rotation {rotation_id!r} not found"
+                )
+            if not isinstance(record, dict) or not isinstance(
+                record.get("state"), str
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation records are malformed"
                 )
             if record["state"] == "active":
                 # 幂等重放：不重复替换、不记事件
@@ -813,7 +1077,13 @@ class WalletService:
             old_share_ids = [s["share_id"] for s in wallet["shares"]]
             old_share_records = []
             for share_id in old_share_ids:
-                share_record = self._store.get_share(wallet_id, share_id)
+                try:
+                    share_record = self._store.get_share(wallet_id, share_id)
+                except json.JSONDecodeError:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} share {share_id!r} file is "
+                        "corrupted"
+                    )
                 if share_record is None:
                     raise ServiceError(
                         409, f"wallet {wallet_id!r} share files are incomplete"
@@ -821,9 +1091,15 @@ class WalletService:
                 old_share_records.append(share_record)
             new_share_records = []
             for share_id in record["share_ids"]:
-                staged = self._store.get_staging_share(
-                    wallet_id, rotation_id, share_id
-                )
+                try:
+                    staged = self._store.get_staging_share(
+                        wallet_id, rotation_id, share_id
+                    )
+                except json.JSONDecodeError:
+                    raise RecoveryError(
+                        f"share rotation {rotation_id!r} staging file "
+                        f"{share_id!r} is corrupted"
+                    )
                 if staged is None:
                     raise ServiceError(
                         409,
@@ -898,7 +1174,9 @@ class WalletService:
                 self._store.delete_staging(wallet_id, rotation_id)
             except OSError:
                 pass
-        return 201, self._rotation_view(active_record)
+            return 201, self._rotation_view(active_record)
+
+        return self._with_wallet_recovery(wallet_id, _activate)
 
     # ---- 资产账本 ---------------------------------------------------------
 
@@ -945,20 +1223,23 @@ class WalletService:
         幂等结果均不变（检查发生在任何写入之前）。策略后续更新不影响
         已存在的 pending 操作；未配置策略时行为完全不变。
         """
-        self._get_wallet_or_404(wallet_id)
-        self._validate_operation_id(operation_id)
-        self._validate_asset_id(asset_id)
-        self._validate_delta(delta)
-        with self._wallet_lock(wallet_id):
-            # 快照前先自愈他进程崩溃遗留的提交意图，balance/version 才准确
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _create() -> tuple[int, dict]:
+            # 存在性先于参数判定（404 优先于 400）；查重、策略检查、快照
+            # 与写入全部在锁 + 自愈之后串行完成。
+            self._get_wallet_locked(wallet_id)
+            self._validate_operation_id(operation_id)
+            self._validate_asset_id(asset_id)
+            self._validate_delta(delta)
+            # 快照前已自愈他进程崩溃遗留的提交意图，balance/version 才准确
             existing = self._store.get_asset_operation(
                 wallet_id, operation_id
             )
             if existing is not None:
                 # 重放：原样返回磁盘中的当前记录，不按更新后的策略重新
                 # 校验、不改状态、不记事件（幂等结果不变）
-                if (
+                if not isinstance(existing, dict) or (
                     existing.get("asset_id") != asset_id
                     or existing.get("delta") != delta
                 ):
@@ -971,6 +1252,12 @@ class WalletService:
             # 首次创建：按创建时刻的交易策略检查白名单与单笔变动上限
             policy = self._store.get_transaction_policy(wallet_id)
             if policy is not None:
+                if not isinstance(policy, dict) or not isinstance(
+                    policy.get("allowed_assets"), list
+                ) or not isinstance(policy.get("max_delta"), int):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} transaction policy is malformed"
+                    )
                 if asset_id not in policy["allowed_assets"]:
                     raise ServiceError(
                         409,
@@ -985,6 +1272,13 @@ class WalletService:
                     )
             # R 的 balance/version 快照资产在创建时刻的账本状态
             asset = self._store.get_asset(wallet_id, asset_id)
+            if asset is not None and (
+                not isinstance(asset.get("balance"), int)
+                or not isinstance(asset.get("version"), int)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset ledger is malformed"
+                )
             record = {
                 "operation_id": operation_id,
                 "asset_id": asset_id,
@@ -995,7 +1289,9 @@ class WalletService:
             }
             # 锁内已确认不存在；存储层仍原子查重兜底
             self._store.create_asset_operation(wallet_id, operation_id, record)
-        return 201, record
+            return 201, record
+
+        return self._with_wallet_recovery(wallet_id, _create)
 
     # ---- 资产提交的崩溃恢复 ----------------------------------------------
 
@@ -1117,12 +1413,14 @@ class WalletService:
 
         余额不足 409 且无副作用；committed 重放 200 同体，不改账、不记事件。
         """
-        self._get_wallet_or_404(wallet_id)
-        self._validate_operation_id(operation_id)
-        with self._wallet_lock(wallet_id):
-            # 先自愈他进程崩溃遗留的任何提交意图，再基于一致账本判定，
-            # 绝不基于半完成状态提交。
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _commit() -> tuple[int, dict]:
+            # 存在性先于 operation_id 校验（404 优先于 400）；先自愈他进程
+            # 崩溃遗留的任何提交意图，再基于一致账本判定，绝不基于半完成
+            # 状态提交。
+            self._get_wallet_locked(wallet_id)
+            self._validate_operation_id(operation_id)
 
             record = self._store.get_asset_operation(wallet_id, operation_id)
             if record is None:
@@ -1217,7 +1515,9 @@ class WalletService:
                 self._store.delete_asset_commit_intent(wallet_id, operation_id)
                 raise
             self._store.delete_asset_commit_intent(wallet_id, operation_id)
-        return 201, committed_record
+            return 201, committed_record
+
+        return self._with_wallet_recovery(wallet_id, _commit)
 
     def get_asset(self, wallet_id: str, asset_id: str) -> dict:
         """查询某资产的账本状态（balance/version）。
@@ -1225,19 +1525,29 @@ class WalletService:
         在每钱包事务锁内读取：提交事务进行中（账本已改、事件尚未落盘）的
         查询会被挡到事务结束，绝不会读到随后可能回滚的半完成余额。
         """
-        self._get_wallet_or_404(wallet_id)
-        self._validate_asset_id(asset_id)
-        with self._wallet_lock(wallet_id):
-            # 查询前先自愈他进程崩溃遗留的提交意图，绝不返回半完成余额
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _get() -> dict:
+            # 存在性先于 asset_id 校验（404 优先于 400）；查询前先自愈
+            # 他进程崩溃遗留的提交意图，绝不返回半完成余额。
+            self._get_wallet_locked(wallet_id)
+            self._validate_asset_id(asset_id)
             asset = self._store.get_asset(wallet_id, asset_id)
             if asset is None:
                 raise ServiceError(404, f"asset {asset_id!r} not found")
+            if not isinstance(asset.get("balance"), int) or not isinstance(
+                asset.get("version"), int
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset ledger is malformed"
+                )
             return {
                 "asset_id": asset_id,
                 "balance": asset["balance"],
                 "version": asset["version"],
             }
+
+        return self._with_wallet_recovery(wallet_id, _get)
 
     # ---- 批准 / 拒绝 -----------------------------------------------------
 
@@ -1274,11 +1584,13 @@ class WalletService:
         reason: object,
         action: str,
     ) -> dict:
-        self._get_wallet_or_404(wallet_id)
-        self._validate_approver_id(approver_id)
-        self._validate_reason(reason)
-        with self._wallet_lock(wallet_id):
-            self._heal_wallet(wallet_id)
+        self._require_valid_wallet_id(wallet_id)
+
+        def _decide_locked() -> dict:
+            # 存在性先于 approver/reason 校验（404 优先于 400）。
+            self._get_wallet_locked(wallet_id)
+            self._validate_approver_id(approver_id)
+            self._validate_reason(reason)
             record = self._fetch_request_or_404(wallet_id, request_id)
             # 懒过期可能在此原子记一次 E；过期后操作落入终态分支（409、不记 A/R）
             record = self._expire_if_needed(wallet_id, record)
@@ -1344,6 +1656,8 @@ class WalletService:
                 raise
             return self._request_view(new_record)
 
+        return self._with_wallet_recovery(wallet_id, _decide_locked)
+
     def approve(
         self,
         wallet_id: str,
@@ -1372,36 +1686,28 @@ class WalletService:
         signatures: object,
     ) -> tuple[int, dict]:
         """返回 (HTTP 状态码, 响应体)。"""
-        try:
-            wallet = self._store.get_wallet(wallet_id)
-        except ValueError:
-            raise ServiceError(400, "invalid wallet_id")
-        if wallet is None:
-            raise ServiceError(404, f"wallet {wallet_id!r} not found")
+        self._require_valid_wallet_id(wallet_id)
 
-        if (
-            not isinstance(signing_request_id, str)
-            or not signing_request_id
-        ):
-            raise ServiceError(
-                400, "signing_request_id must be a non-empty string"
-            )
-        if not isinstance(message, str):
-            raise ServiceError(400, "message must be a string")
-        if not isinstance(signatures, list) or len(signatures) != REQUIRED_SHARES:
-            raise ServiceError(
-                400, f"exactly {REQUIRED_SHARES} share signatures are required"
-            )
-
-        with self._wallet_lock(wallet_id):
-            # 先自愈他进程崩溃遗留的激活/提交现场，绝不基于半完成的钱包
-            # 公钥或份额做校验。
-            self._heal_wallet(wallet_id)
+        def _sign() -> tuple[int, dict]:
+            # 锁 + 自愈之后：存在性先于参数判定（404 优先于 400），绝不
+            # 基于半完成的钱包公钥或份额做校验。
+            self._get_wallet_locked(wallet_id)
+            if (
+                not isinstance(signing_request_id, str)
+                or not signing_request_id
+            ):
+                raise ServiceError(
+                    400, "signing_request_id must be a non-empty string"
+                )
+            if not isinstance(message, str):
+                raise ServiceError(400, "message must be a string")
+            if not isinstance(signatures, list) or len(signatures) != REQUIRED_SHARES:
+                raise ServiceError(
+                    400, f"exactly {REQUIRED_SHARES} share signatures are required"
+                )
             # 锁内重读钱包元数据：份额轮换激活后，未首签的请求必须用新的
             # share_ids 与公钥校验，旧份额一律 400。
             wallet = self._store.get_wallet(wallet_id)
-            if wallet is None:
-                raise ServiceError(404, f"wallet {wallet_id!r} not found")
             expected_share_ids = [s["share_id"] for s in wallet["shares"]]
             share_pub = {s["share_id"]: s["public_key"] for s in wallet["shares"]}
             # 幂等查重的唯一检查点：必须在每钱包事务锁内、且在任何份额校验
@@ -1412,6 +1718,10 @@ class WalletService:
             try:
                 existing = self._store.get_signature(
                     wallet_id, signing_request_id
+                )
+            except json.JSONDecodeError:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} signatures are corrupted"
                 )
             except ValueError:
                 raise ServiceError(400, "invalid signing_request_id")
@@ -1475,6 +1785,10 @@ class WalletService:
                 try:
                     approval_record = self._store.get_request(
                         wallet_id, signing_request_id
+                    )
+                except json.JSONDecodeError:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} signing requests are corrupted"
                     )
                 except ValueError:
                     raise ServiceError(400, "invalid signing_request_id")
@@ -1543,4 +1857,6 @@ class WalletService:
                             wallet_id, signing_request_id, approval_record
                         )
                 raise
-        return 201, {"signature": aggregate.hex()}
+            return 201, {"signature": aggregate.hex()}
+
+        return self._with_wallet_recovery(wallet_id, _sign)

@@ -57,6 +57,16 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
         def _send_error(self, status: int, message: str) -> None:
             self._send_json(status, {"error": message})
 
+        def _send_unavailable(self, exc: Exception) -> None:
+            """无法安全对账 / 文件系统 / 解析异常：统一 JSON 503。
+
+            响应体只给固定文案，绝不泄露半完成公钥、余额、version、策略、
+            私钥或签名载荷，也不回显异常消息。访问日志仍只记录
+            "方法 路径 -> 状态码"（由 send_response 的常规请求日志完成），
+            不额外写入异常类型或任何请求/响应体。
+            """
+            self._send_error(503, "service temporarily unavailable")
+
         def log_message(self, fmt: str, *args: object) -> None:
             # 只记录方法、路径与状态码；不记录任何请求体/响应体
             status = args[1] if len(args) > 1 else "-"
@@ -126,11 +136,14 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 self._send_error(404, "not found")
-            except RecoveryError as exc:
-                # 崩溃现场无法对账到一致状态：拒绝暴露半完成数据
-                self._send_error(503, f"recovery incomplete: {exc}")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
+            except (RecoveryError, OSError, ValueError) as exc:
+                # 崩溃现场无法对账 / 文件系统或解析异常：拒绝暴露半完成数据
+                self._send_unavailable(exc)
+            except Exception as exc:  # noqa: BLE001
+                # 任何未预期异常也绝不冒泡成裸 500/traceback
+                self._send_unavailable(exc)
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
@@ -231,10 +244,12 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
 
                 self._send_error(404, "not found")
-            except RecoveryError as exc:
-                self._send_error(503, f"recovery incomplete: {exc}")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
+            except (RecoveryError, OSError, ValueError) as exc:
+                self._send_unavailable(exc)
+            except Exception as exc:  # noqa: BLE001
+                self._send_unavailable(exc)
 
         def do_PUT(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
@@ -262,10 +277,12 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                 self._send_error(404, "not found")
-            except RecoveryError as exc:
-                self._send_error(503, f"recovery incomplete: {exc}")
             except ServiceError as exc:
                 self._send_error(exc.status, exc.message)
+            except (RecoveryError, OSError, ValueError) as exc:
+                self._send_unavailable(exc)
+            except Exception as exc:  # noqa: BLE001
+                self._send_unavailable(exc)
 
         # ---- 路径匹配 ---------------------------------------------------
 

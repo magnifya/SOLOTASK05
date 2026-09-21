@@ -202,6 +202,22 @@ class WalletStore:
     def has_wallet(self, wallet_id: str) -> bool:
         return os.path.exists(self._wallet_path(wallet_id))
 
+    def list_wallet_ids(self) -> list[str]:
+        """返回存在钱包元数据文件的全部 wallet_id（启动恢复扫描用）。
+
+        只纳入匹配安全 id 的正式元数据文件，忽略原子写残留的临时文件。
+        """
+        try:
+            names = os.listdir(self._wallets_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
+
     def get_share(self, wallet_id: str, share_id: str) -> Optional[dict]:
         """返回单个份额记录（含该份额私钥 hex），不存在返回 None。"""
         return self._read_json(self._share_path(wallet_id, share_id))
@@ -374,17 +390,48 @@ class WalletStore:
         return os.path.join(self._assets_dir, wallet_id + ".json")
 
     def _read_asset_ledger(self, wallet_id: str) -> dict:
-        """读取资产账本（无文件时返回空结构）。"""
-        ledger = self._read_json(self._assets_path(wallet_id))
+        """读取资产账本（无文件时返回空结构）。
+
+        文件存在但 JSON 不可解析、顶层不是 JSON 对象、或 operations/assets
+        不是对象时，属于无法安全对账的损坏：抛 RecoveryError（fail-closed），
+        绝不把它静默当成空账本而覆盖/丢失既有余额与 version。
+        """
+        try:
+            ledger = self._read_json(self._assets_path(wallet_id))
+        except ValueError as exc:
+            # json.JSONDecodeError：文件存在但 JSON 损坏（原子写使正常
+            # 流程不会出现，仅外部损坏/篡改时）
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset ledger is corrupted"
+            ) from exc
+        if ledger is None:
+            return {"operations": {}, "assets": {}}
         if not isinstance(ledger, dict):
-            ledger = {}
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset ledger is not a JSON object"
+            )
         operations = ledger.get("operations")
-        if not isinstance(operations, dict):
-            operations = {}
         assets = ledger.get("assets")
-        if not isinstance(assets, dict):
+        if operations is None:
+            operations = {}
+        if assets is None:
             assets = {}
+        if not isinstance(operations, dict) or not isinstance(assets, dict):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset ledger sections are malformed"
+            )
         return {"operations": operations, "assets": assets}
+
+    def assert_asset_ledger_readable(self, wallet_id: str) -> None:
+        """惰性对账探针：确认该钱包资产账本文件存在时可解析为预期结构。
+
+        供运行时自愈在持锁后、任何业务读取前调用：账本 JSON 损坏（无法
+        解析、顶层非对象或 operations/assets 非对象）时抛
+        RecoveryError，调用方据此 fail-closed 返回 503，绝不把损坏账本
+        当空账本处理而丢失余额/version。无账本文件时静默通过。
+        """
+        _check_id("wallet_id", wallet_id)
+        self._read_asset_ledger(wallet_id)
 
     def create_asset_operation(
         self, wallet_id: str, operation_id: str, record: dict
