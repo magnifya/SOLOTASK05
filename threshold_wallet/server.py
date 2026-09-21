@@ -18,6 +18,9 @@
 - POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
+- POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
+- GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
+- POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -132,6 +135,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if len(rest) == 2 and rest[0] == "assets":
                     self._send_json(200, service.get_asset(wallet_id, rest[1]))
                     return
+                if len(rest) == 2 and rest[0] == "sign-sessions":
+                    self._send_json(
+                        200, service.get_sign_session(wallet_id, rest[1])
+                    )
+                    return
                 if rest == ["audit-events"]:
                     self._send_json(
                         200,
@@ -198,6 +206,32 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     body = self._read_json_body()
                     status, result = service.create_share_rotation(
                         wallet_id, body.get("rotation_id")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["sign-sessions"]:
+                    body = self._read_json_body()
+                    status, result = service.create_sign_session(
+                        wallet_id,
+                        body.get("id"),
+                        body.get("message"),
+                        body.get("timeout_seconds"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "sign-sessions"
+                    and rest[2] == "shares"
+                ):
+                    body = self._read_json_body()
+                    status, result = service.submit_sign_session_share(
+                        wallet_id,
+                        rest[1],
+                        body.get("share_id"),
+                        body.get("signature"),
                     )
                     self._send_json(status, result)
                     return

@@ -43,6 +43,7 @@ TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
+TYPE_SESSION_EVENT = "session_event"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -134,6 +135,39 @@ class AuditStore:
             ):
                 return dict(event)
         return None
+
+    def find_session_event(
+        self, wallet_id: str, request_id: str, action: str
+    ) -> Optional[dict]:
+        """按 (request_id, details.action) 查找一条 session_event。
+
+        签名会话崩溃恢复据此判定创建/签名是否已提交：事件在则状态不可
+        撤回（前滚），事件不在则回滚。纯只读，不分配 seq。
+        """
+        for event in self.session_events(wallet_id).get(request_id, []):
+            details = event.get("details")
+            if isinstance(details, dict) and details.get("action") == action:
+                return dict(event)
+        return None
+
+    def session_events(self, wallet_id: str) -> dict[str, list[dict]]:
+        """返回该钱包全部 session_event，按 request_id（会话 id）分组。
+
+        签名会话崩溃恢复一次性读取审计文件，据此判定每个会话哪些动作
+        （created/share_received/expired/signed）已经提交。纯只读。"""
+        data = self._read(wallet_id)
+        result: dict[str, list[dict]] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != TYPE_SESSION_EVENT:
+                continue
+            request_id = event.get("request_id")
+            if isinstance(request_id, str):
+                result.setdefault(request_id, []).append(dict(event))
+        return result
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射

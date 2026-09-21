@@ -137,6 +137,7 @@ class WalletService:
             | set(self._store.list_staging_wallet_ids())
             | set(self._store.list_asset_intent_wallet_ids())
             | set(self._store.list_asset_ledger_wallet_ids())
+            | set(self._store.list_sign_session_wallet_ids())
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
@@ -162,6 +163,7 @@ class WalletService:
                 wallet_id, self._activated_rotations(wallet_id)
             )
             self._recover_wallet_asset_commits(wallet_id)
+            self._recover_sign_sessions(wallet_id)
         except RecoveryError:
             raise
         except (OSError, ValueError) as exc:
@@ -193,9 +195,14 @@ class WalletService:
             # 无法与意图/事件对账，绝不能静默当成空账本。任何持锁访问都
             # 先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
             self._store.check_asset_ledger(wallet_id)
+            # 签名会话文件形状损坏同样 fail-closed，绝不把坏会话当空会话。
+            self._store.check_sign_sessions(wallet_id)
             if self._store.list_asset_intents(wallet_id):
                 self._recover_wallet(wallet_id)
                 return
+            # 他进程崩溃可能留下"会话记录已写、created/signed 事件未落盘"
+            # 等半完成会话：持锁访问前对账（无会话文件时立即返回，零开销）。
+            self._recover_sign_sessions(wallet_id)
             rotations = self._store.list_rotations(wallet_id)
             staging_ids = set(self._store.list_staging_rotation_ids(wallet_id))
             needs_recovery = False
@@ -1646,6 +1653,64 @@ class WalletService:
 
     # ---- 份额签名聚合 ---------------------------------------------------
 
+    def _signing_approval_gate(
+        self, wallet_id: str, signing_request_id: str, message: str
+    ) -> dict | None:
+        """既有 /sign 与可恢复签名会话共用的审批 + 冷热门控。
+
+        调用方须持有钱包事务锁。返回 approved 审批单记录（无审批要求时
+        返回 None），门控不通过抛 ServiceError(409/404)。可能原子地把超时
+        pending 单懒过期为 expired 并记一次 request_expired 事件。
+
+        - cold 模式：首签必须存在同 id、同 message 且 approved 的审批单。
+          未配置审批策略（无法建单）、无单或未 approved 一律 409；
+        - hot（或未配交易策略）且配置了审批策略：沿用原审批规则
+          （无单 404，message 不符/未 approved 409）；
+        - 其余情形不要求审批单。
+        """
+        approval_record = None
+        approval_policy = self._store.get_policy(wallet_id)
+        transaction_policy = self._store.get_transaction_policy(wallet_id)
+        cold_mode = (
+            transaction_policy is not None
+            and transaction_policy.get("mode") == "cold"
+        )
+        if cold_mode:
+            try:
+                approval_record = self._store.get_request(
+                    wallet_id, signing_request_id
+                )
+            except CorruptDataError:
+                raise
+            except ValueError:
+                raise ServiceError(400, "invalid signing_request_id")
+            if approval_record is None:
+                raise ServiceError(
+                    409,
+                    f"cold wallet requires an approved signing request "
+                    f"{signing_request_id!r}",
+                )
+        elif approval_policy is not None:
+            approval_record = self._fetch_request_or_404(
+                wallet_id, signing_request_id
+            )
+
+        if approval_record is not None:
+            approval_record = self._expire_if_needed(
+                wallet_id, approval_record
+            )
+            if approval_record["message"] != message:
+                raise ServiceError(
+                    409, "message does not match the signing request"
+                )
+            if approval_record["state"] != "approved":
+                raise ServiceError(
+                    409,
+                    f"signing request {signing_request_id!r} is "
+                    f"{approval_record['state']}, not approved",
+                )
+        return approval_record
+
     def sign(
         self,
         wallet_id: str,
@@ -1759,54 +1824,12 @@ class WalletService:
             )
             record = {"message": message, "signature": aggregate.hex()}
 
-            # 审批单要求：
-            # - cold 模式：首签必须存在同 id、同 message 且 approved 的审批单。
-            #   未配置审批策略（无法创建审批单）、无单或未 approved 一律 409；
-            # - hot（或未配交易策略）且配置了审批策略：沿用原审批规则
-            #   （无单 404，message 不符/未 approved 409）；
-            # - 其余情形不要求审批单，行为不变。
-            # 这一步可能原子地把超时 pending 单记一次 E 并转为 expired。
-            approval_record = None
-            approval_policy = self._store.get_policy(wallet_id)
-            transaction_policy = self._store.get_transaction_policy(wallet_id)
-            cold_mode = (
-                transaction_policy is not None
-                and transaction_policy.get("mode") == "cold"
+            # 审批与冷热门控：与既有 /sign 完全同一套规则（见
+            # _signing_approval_gate）。这一步可能原子地把超时 pending 单
+            # 记一次 E 并转为 expired。
+            approval_record = self._signing_approval_gate(
+                wallet_id, signing_request_id, message
             )
-            if cold_mode:
-                try:
-                    approval_record = self._store.get_request(
-                        wallet_id, signing_request_id
-                    )
-                except CorruptDataError:
-                    raise
-                except ValueError:
-                    raise ServiceError(400, "invalid signing_request_id")
-                if approval_record is None:
-                    raise ServiceError(
-                        409,
-                        f"cold wallet requires an approved signing request "
-                        f"{signing_request_id!r}",
-                    )
-            elif approval_policy is not None:
-                approval_record = self._fetch_request_or_404(
-                    wallet_id, signing_request_id
-                )
-
-            if approval_record is not None:
-                approval_record = self._expire_if_needed(
-                    wallet_id, approval_record
-                )
-                if approval_record["message"] != message:
-                    raise ServiceError(
-                        409, "message does not match the signing request"
-                    )
-                if approval_record["state"] != "approved":
-                    raise ServiceError(
-                        409,
-                        f"signing request {signing_request_id!r} is "
-                        f"{approval_record['state']}, not approved",
-                    )
 
             # 事务提交：签名记录、审批单 signed 状态与 request_signed 事件
             # 必须在本钱包事务锁内一致落盘。任一写入或事件追加失败，都
@@ -1848,3 +1871,511 @@ class WalletService:
                         )
                 raise
         return 201, {"signature": aggregate.hex()}
+
+    # ---- 可恢复签名会话 ---------------------------------------------------
+
+    @staticmethod
+    def _session_view(record: dict) -> dict:
+        """签名会话对外视图：原文、状态、已收/缺失份额、到期时间；
+        aggregate_signature 仅在 signed 时出现。绝不返回份额签名本身。"""
+        expected = list(record["share_ids"])
+        received = [
+            entry["share_id"]
+            for sid in expected
+            for entry in record["shares"]
+            if entry["share_id"] == sid
+        ]
+        missing = [sid for sid in expected if sid not in received]
+        view = {
+            "id": record["id"],
+            "message": record["message"],
+            "state": record["state"],
+            "received_shares": received,
+            "missing_shares": missing,
+            "expires_at": record["expires_at"],
+        }
+        if record["state"] == "signed":
+            view["aggregate_signature"] = record["aggregate_signature"]
+        return view
+
+    @staticmethod
+    def _validate_session_id(session_id: object) -> None:
+        if not isinstance(session_id, str) or not ROTATION_ID_RE.match(
+            session_id
+        ):
+            raise ServiceError(400, "id must match [A-Za-z0-9_-]{1,128}")
+
+    @staticmethod
+    def _validate_session_message(message: object) -> None:
+        if not isinstance(message, str) or not message:
+            raise ServiceError(400, "message must be a non-empty string")
+
+    @staticmethod
+    def _validate_session_timeout(timeout_seconds: object) -> None:
+        # bool 是 int 的子类，必须先排除
+        if (
+            not isinstance(timeout_seconds, int)
+            or isinstance(timeout_seconds, bool)
+            or timeout_seconds <= 0
+        ):
+            raise ServiceError(
+                400, "timeout_seconds must be a positive integer"
+            )
+
+    @staticmethod
+    def _validate_share_signature(signature_hex: object) -> bytes:
+        if not isinstance(signature_hex, str):
+            raise ServiceError(400, "signature must be hex")
+        try:
+            signature = bytes.fromhex(signature_hex)
+        except ValueError:
+            raise ServiceError(400, "signature must be hex")
+        if len(signature) != 64:
+            raise ServiceError(
+                400, "signature must be a 64-byte Ed25519 signature"
+            )
+        return signature
+
+    def _session_expire_if_needed(
+        self, wallet_id: str, record: dict
+    ) -> dict:
+        """懒过期：collecting 会话到点则持久化为 expired 并原子记一次
+        action=expired 的 session_event。ready/signed 不再受到期时间约束
+        （两份已齐备，等待/重试门控）。调用方须持钱包事务锁。"""
+        if record["state"] == "collecting" and datetime.now(timezone.utc) >= (
+            _parse_iso(record["expires_at"])
+        ):
+            expired = dict(record)
+            expired["state"] = "expired"
+            self._store.update_sign_session(wallet_id, record["id"], expired)
+            try:
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_SESSION_EVENT,
+                        request_id=record["id"],
+                        details={"action": "expired", "state": "expired"},
+                    ),
+                )
+            except BaseException:
+                # 状态/事件原子：事件未落盘恢复为 collecting
+                self._store.update_sign_session(wallet_id, record["id"], record)
+                raise
+            record = expired
+        return record
+
+    def create_sign_session(
+        self,
+        wallet_id: str,
+        session_id: object,
+        message: object,
+        timeout_seconds: object,
+    ) -> tuple[int, dict]:
+        """创建可恢复签名会话，返回 (状态码, 视图)。
+
+        首建 201；同 id 且 message/timeout_seconds 同参重放 200；同 id
+        异参 409；参数非法 400；钱包不存在 404。会话状态与 created 事件在
+        每钱包跨进程事务锁内原子持久化，事件追加失败回滚会话记录。
+        """
+        record: dict | None = None
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：钱包存在性在锁内先于参数校验
+                wallet = self._get_wallet_or_404(wallet_id)
+                self._validate_session_id(session_id)
+                self._validate_session_message(message)
+                self._validate_session_timeout(timeout_seconds)
+                existing = self._store.get_sign_session(wallet_id, session_id)
+                if existing is not None:
+                    # 重放前先自愈"会话记录已落盘但 created 事件未落盘"的
+                    # 他进程创建崩溃残留：按未提交处理，删除后走首次创建。
+                    if self._audit.find_session_event(
+                        wallet_id, session_id, "created"
+                    ) is None:
+                        self._store.delete_sign_session(wallet_id, session_id)
+                    else:
+                        # 同参（message 与 timeout_seconds）重放 200；异参 409。
+                        # 原样返回磁盘状态，重放不触发懒过期、不记事件。
+                        if (
+                            existing["message"] != message
+                            or existing["timeout_seconds"] != timeout_seconds
+                        ):
+                            raise ServiceError(
+                                409,
+                                f"sign session {session_id!r} already exists "
+                                "with different parameters",
+                            )
+                        return 200, self._session_view(existing)
+                now = datetime.now(timezone.utc)
+                share_ids = [s["share_id"] for s in wallet["shares"]]
+                record = {
+                    "id": session_id,
+                    "message": message,
+                    "timeout_seconds": timeout_seconds,
+                    "created_at": now.isoformat().replace("+00:00", "Z"),
+                    "expires_at": (
+                        now + timedelta(seconds=timeout_seconds)
+                    )
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "state": "collecting",
+                    "share_ids": share_ids,
+                    "shares": [],
+                }
+                self._store.create_sign_session(wallet_id, session_id, record)
+                try:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_SESSION_EVENT,
+                            request_id=session_id,
+                            details={
+                                "action": "created",
+                                "message": message,
+                                "timeout_seconds": timeout_seconds,
+                            },
+                        ),
+                    )
+                except BaseException:
+                    self._store.delete_sign_session(wallet_id, session_id)
+                    raise
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return 201, self._session_view(record)
+
+    def get_sign_session(self, wallet_id: str, session_id: str) -> dict:
+        """查询会话视图；未知 404。查询时对到点 collecting 会话懒过期。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400
+                self._get_wallet_or_404(wallet_id)
+                self._validate_session_id(session_id)
+                record = self._store.get_sign_session(wallet_id, session_id)
+                if record is None:
+                    raise ServiceError(
+                        404, f"sign session {session_id!r} not found"
+                    )
+                record = self._session_expire_if_needed(wallet_id, record)
+                return self._session_view(record)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    @staticmethod
+    def _session_shares_map(record: dict) -> dict[str, bytes]:
+        return {
+            entry["share_id"]: bytes.fromhex(entry["signature"])
+            for entry in record["shares"]
+        }
+
+    @staticmethod
+    def _aggregate_session_shares(record: dict) -> bytes:
+        """按会话记录的 share_ids 顺序拼接两份已存份额签名（128 字节）。"""
+        received = {
+            entry["share_id"]: bytes.fromhex(entry["signature"])
+            for entry in record["shares"]
+        }
+        return crypto.combine_signatures(
+            [received[sid] for sid in record["share_ids"]]
+        )
+
+    def _commit_session_signed(
+        self,
+        wallet_id: str,
+        ready_record: dict,
+    ) -> dict:
+        """ready 会话聚合提交：转 signed 并原子记 action=signed 事件。
+
+        审批/hot-cold 门控由调用方在只读校验中完成；本方法只负责会话状态
+        与唯一 signed 事件的原子落盘。任一写入失败，以 signed 事件是否真正
+        落盘为唯一判据：事件在则前滚补齐为唯一 signed；事件不在则回滚为
+        ready（两份份额保留，可重试），并向上抛出。"""
+        aggregate = self._aggregate_session_shares(ready_record)
+        signed_record = dict(ready_record)
+        signed_record["state"] = "signed"
+        signed_record["aggregate_signature"] = aggregate.hex()
+        try:
+            self._store.update_sign_session(
+                wallet_id, ready_record["id"], signed_record
+            )
+            self._emit(
+                wallet_id,
+                self._audit_event(
+                    audit.TYPE_SESSION_EVENT,
+                    request_id=ready_record["id"],
+                    details={"action": "signed", "state": "signed"},
+                ),
+            )
+        except BaseException:
+            landed = self._audit.find_session_event(
+                wallet_id, ready_record["id"], "signed"
+            )
+            if landed is not None:
+                # 事件已落盘：前滚补齐，绝不回滚、不重复记事件
+                self._store.update_sign_session(
+                    wallet_id, ready_record["id"], signed_record
+                )
+                return signed_record
+            self._store.update_sign_session(
+                wallet_id, ready_record["id"], ready_record
+            )
+            raise
+        return signed_record
+
+    def submit_sign_session_share(
+        self,
+        wallet_id: str,
+        session_id: str,
+        share_id: object,
+        signature_hex: object,
+    ) -> tuple[int, dict]:
+        """向会话投递一份额签名，返回 (状态码, 视图)。
+
+        - 首收 201；同份额同值重放 200、异值 409；签名非法/份额非在用 400；
+        - 未知会话 404；expired（含投递时懒过期）409；
+        - 两份齐备转 ready，按既有审批及 hot/cold 门控聚合；门控失败 409
+          并保留 ready 供重试（重放在用份额即重试门控）；成功转 signed。
+        """
+        try:
+            return self._submit_sign_session_share_tx(
+                wallet_id, session_id, share_id, signature_hex
+            )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _submit_sign_session_share_tx(
+        self,
+        wallet_id: str,
+        session_id: str,
+        share_id: object,
+        signature_hex: object,
+    ) -> tuple[int, dict]:
+        with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
+            # 404 优先于 400：锁内先判定钱包存在性
+            wallet = self._store.get_wallet(wallet_id)
+            if wallet is None:
+                raise ServiceError(404, f"wallet {wallet_id!r} not found")
+            self._validate_session_id(session_id)
+            record = self._store.get_sign_session(wallet_id, session_id)
+            if record is None:
+                raise ServiceError(
+                    404, f"sign session {session_id!r} not found"
+                )
+            # 投递时懒过期：到点 collecting 持久化为 expired（记一次事件）
+            record = self._session_expire_if_needed(wallet_id, record)
+            if record["state"] == "expired":
+                # 状态判定优先于载荷校验：已过期一律 409（含畸形载荷）
+                raise ServiceError(
+                    409, f"sign session {session_id!r} has expired"
+                )
+            state = record["state"]
+
+            # 会话存在且未过期后再校验载荷：share_id 非空、signature 为
+            # 64 字节 hex，非法 400
+            if not isinstance(share_id, str) or not share_id:
+                raise ServiceError(
+                    400, "share_id must be a non-empty string"
+                )
+            signature = self._validate_share_signature(signature_hex)
+
+            share_pub = {
+                s["share_id"]: s["public_key"] for s in wallet["shares"]
+            }
+            session_ids = list(record["share_ids"])
+
+            received = self._session_shares_map(record)
+
+            # 已收份额的重放分支必须先于"在用份额"判定：轮换后旧份额不再
+            # 在用，但已存（含已 signed）会话的同值重放仍 200 同体，
+            # 与既有 /sign 的"已首签请求重放不受轮换影响"一致。
+            if share_id in received:
+                if signature != received[share_id]:
+                    raise ServiceError(
+                        409,
+                        f"share {share_id!r} was already submitted with a "
+                        "different signature",
+                    )
+                if state == "ready":
+                    # ready 上重放在用份额即重试门控/聚合；signed 成功 200，
+                    # 门控失败 409（ready 保留）。聚合只拼接收齐时已校验的
+                    # 存量份额，不因轮换后旧份额而失败。
+                    return self._retry_session_aggregation(wallet_id, record)
+                # collecting 重复投递 / signed 重放：200 同体，不记事件
+                return 200, self._session_view(record)
+
+            # 未收过的新份额：仅接受会话在用（创建时快照）且当前仍在钱包
+            # 在用的份额；轮换后的旧份额与不属于本会话的份额一律 400。
+            if share_id not in session_ids or share_id not in share_pub:
+                raise ServiceError(
+                    400, f"unknown or inactive share_id {share_id!r}"
+                )
+
+            # 新份额：必须是在用份额私钥对 id 与 message 直接拼接载荷的
+            # 有效 Ed25519 签名
+            payload = crypto.build_payload(session_id, record["message"])
+            if not crypto.verify_share(
+                bytes.fromhex(share_pub[share_id]), payload, signature
+            ):
+                raise ServiceError(
+                    400, f"signature verification failed for {share_id}"
+                )
+
+            new_shares = list(record["shares"]) + [
+                {"share_id": share_id, "signature": signature.hex()}
+            ]
+            completes = len(new_shares) == 2
+            updated = dict(record)
+            updated["shares"] = new_shares
+            updated["state"] = "ready" if completes else "collecting"
+            # 提交点 1：份额落盘（齐备时转 ready）+ share_received 事件原子
+            self._store.update_sign_session(wallet_id, session_id, updated)
+            try:
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_SESSION_EVENT,
+                        request_id=session_id,
+                        details={
+                            "action": "share_received",
+                            "share_id": share_id,
+                            "state": updated["state"],
+                        },
+                    ),
+                )
+            except BaseException:
+                self._store.update_sign_session(
+                    wallet_id, session_id, record
+                )
+                raise
+            record = updated
+
+            if not completes:
+                return 201, self._session_view(record)
+
+            # 两份齐备：按既有审批及 hot/cold 门控聚合。门控失败 409 且
+            # 保留 ready 供重试（可能原子懒过期审批单）。会话聚合只读取
+            # 门控结果，不改动审批单状态（签名对象是会话本身）。
+            try:
+                self._signing_approval_gate(
+                    wallet_id, session_id, record["message"]
+                )
+            except ServiceError:
+                return 409, self._session_view(record)
+            signed_record = self._commit_session_signed(wallet_id, record)
+            return 201, self._session_view(signed_record)
+
+    def _retry_session_aggregation(
+        self, wallet_id: str, record: dict
+    ) -> tuple[int, dict]:
+        """ready 会话重试门控与聚合（重放在用份额触发）。
+
+        门控失败 409、ready 保留；成功转 signed 返回 200（非首次收份额，
+        故不是 201），signed 事件只在首次聚合成功时记一次。"""
+        try:
+            self._signing_approval_gate(
+                wallet_id, record["id"], record["message"]
+            )
+        except ServiceError:
+            return 409, self._session_view(record)
+        signed_record = self._commit_session_signed(wallet_id, record)
+        return 200, self._session_view(signed_record)
+
+    def _recover_sign_sessions(self, wallet_id: str) -> None:
+        """启动/持锁恢复签名会话崩溃现场（调用方须持钱包事务锁）。
+
+        严格校验由存储层完成（损坏即 CorruptDataError -> 503/阻止就绪，
+        保留现场）。对账以 session_event 为唯一提交点，按事件重建现场，
+        恢复本身不记事件：
+
+        - 无 created 事件：创建未提交，删除残留会话记录；
+        - 已落盘份额若无对应 share_received 事件：份额提交未完成，丢弃
+          （份额写入先于事件追加，正常原子流程不会出现，仅崩溃/篡改）；
+        - 有 share_received 事件却找不到对应已存份额：无法安全对账，
+          fail-closed；
+        - signed 事件：以两份已提交份额重算聚合签名，前滚为唯一 signed；
+        - expired 事件：终态 expired（此时已提交份额必不足两份，否则与
+          ready 不可过期矛盾，矛盾现场 fail-closed）；
+        - 否则按已提交份额数恢复为 collecting（<2）或 ready（2）：磁盘
+          误写的 signed/ready/expired 随事件回滚，ready 可重试，collecting
+          到点后由下一次访问重新懒过期（事件未落盘，过期从未生效）。
+        """
+        records = self._store.list_sign_sessions(wallet_id)
+        if not records:
+            return
+        events = self._audit.session_events(wallet_id)
+        for record in records:
+            session_id = record["id"]
+            session_events = sorted(
+                (
+                    event
+                    for event in events.get(session_id, [])
+                    if isinstance(event.get("details"), dict)
+                ),
+                key=lambda event: event.get("seq", 0),
+            )
+            actions = [event["details"]["action"] for event in session_events]
+            if "created" not in actions:
+                self._store.delete_sign_session(wallet_id, session_id)
+                continue
+            # 已提交（事件落盘）的份额，按 share_received 事件的 share_id 去重
+            committed_share_ids: list[str] = []
+            for event in session_events:
+                details = event["details"]
+                if details.get("action") != "share_received":
+                    continue
+                sid = details.get("share_id")
+                if isinstance(sid, str) and sid not in committed_share_ids:
+                    committed_share_ids.append(sid)
+            stored = {
+                entry["share_id"]: entry for entry in record["shares"]
+            }
+            committed_entries = []
+            for sid in record["share_ids"]:  # 顺序固定为 share-1, share-2
+                if sid in committed_share_ids:
+                    if sid not in stored:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} sign session {session_id!r} "
+                            f"has a committed share {sid!r} but no stored "
+                            "signature"
+                        )
+                    committed_entries.append(stored[sid])
+            signed_landed = "signed" in actions
+            expired_landed = "expired" in actions
+            rebuilt = dict(record)
+            rebuilt["shares"] = committed_entries
+            rebuilt.pop("aggregate_signature", None)
+            if signed_landed:
+                if len(committed_entries) != 2:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has a signed event without both committed shares"
+                    )
+                rebuilt["state"] = "signed"
+                rebuilt["aggregate_signature"] = (
+                    self._aggregate_session_shares(rebuilt).hex()
+                )
+            elif expired_landed:
+                if len(committed_entries) >= 2:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "is expired but both shares committed"
+                    )
+                rebuilt["state"] = "expired"
+            else:
+                rebuilt["state"] = (
+                    "ready" if len(committed_entries) == 2 else "collecting"
+                )
+            if rebuilt != record:
+                self._store.update_sign_session(
+                    wallet_id, session_id, rebuilt
+                )

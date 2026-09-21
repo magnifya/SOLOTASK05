@@ -27,6 +27,11 @@
                                     该钱包的冷热钱包交易策略
                                     （mode/max_delta/allowed_assets），
                                     只含标识与整数，不含任何私钥材料
+    sign-sessions/<wallet_id>.json  该钱包的可恢复签名会话（状态机
+                                    collecting/ready/signed/expired）：
+                                    原文、到期时间、已收份额签名（每份一个
+                                    64 字节 Ed25519 签名，绝无私钥）与
+                                    signed 时的 128 字节聚合签名
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -175,6 +180,7 @@ class WalletStore:
         self._transaction_policies_dir = os.path.join(
             data_dir, "transaction-policies"
         )
+        self._sign_sessions_dir = os.path.join(data_dir, "sign-sessions")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -185,6 +191,7 @@ class WalletStore:
         os.makedirs(self._assets_dir, exist_ok=True)
         os.makedirs(self._asset_intents_dir, exist_ok=True)
         os.makedirs(self._transaction_policies_dir, exist_ok=True)
+        os.makedirs(self._sign_sessions_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -471,8 +478,206 @@ class WalletStore:
                 except FileNotFoundError:
                     pass
 
-    # ---- 资产账本（asset-operations 与 assets）-----------------------------
+    # ---- 可恢复签名会话 ---------------------------------------------------
 
+    def _sign_sessions_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._sign_sessions_dir, wallet_id + ".json")
+
+    @staticmethod
+    def _session_share_shape_ok(entry: object) -> bool:
+        """已收份额条目形状：share_id 为合法标识、signature 为 hex 字符串
+        且解码恰为 64 字节 Ed25519 份额签名。"""
+        if not isinstance(entry, dict):
+            return False
+        share_id = entry.get("share_id")
+        signature_hex = entry.get("signature")
+        if not isinstance(share_id, str) or not _SAFE_SHARE_ID.match(share_id):
+            return False
+        if not isinstance(signature_hex, str):
+            return False
+        try:
+            signature = bytes.fromhex(signature_hex)
+        except ValueError:
+            return False
+        return len(signature) == 64
+
+    def _session_record_shape_ok(self, key: str, record: object) -> bool:
+        """签名会话记录形状的严格校验（损坏文件 fail-closed 用）。
+
+        要求：id 为安全标识且与键一致；message 为非空字符串；
+        timeout_seconds 为非布尔正整数；expires_at 为字符串；state 仅
+        collecting/ready/signed/expired；shares 为条目数组，share_id
+        不重复且为当前记录的份额；signed 时必须带 128 字节聚合签名；
+        collecting/ready/expired 不得带签名。"""
+        if not isinstance(record, dict):
+            return False
+        if record.get("id") != key or not _valid_safe_id(key):
+            return False
+        message = record.get("message")
+        if not isinstance(message, str) or not message:
+            return False
+        timeout = record.get("timeout_seconds")
+        if not _is_plain_int(timeout) or timeout <= 0:
+            return False
+        if not isinstance(record.get("expires_at"), str):
+            return False
+        if not isinstance(record.get("created_at"), str):
+            return False
+        state = record.get("state")
+        if state not in ("collecting", "ready", "signed", "expired"):
+            return False
+        expected = record.get("share_ids")
+        if not isinstance(expected, list) or len(expected) != 2:
+            return False
+        if any(
+            not isinstance(sid, str) or not _SAFE_SHARE_ID.match(sid)
+            for sid in expected
+        ):
+            return False
+        if len(set(expected)) != 2:
+            return False
+        shares = record.get("shares")
+        if not isinstance(shares, list):
+            return False
+        seen: set[str] = set()
+        for entry in shares:
+            if not self._session_share_shape_ok(entry):
+                return False
+            sid = entry["share_id"]
+            if sid in seen or sid not in expected:
+                return False
+            seen.add(sid)
+        aggregate_hex = record.get("aggregate_signature")
+        if state == "signed":
+            if len(seen) != 2:
+                return False
+            if not isinstance(aggregate_hex, str):
+                return False
+            try:
+                aggregate = bytes.fromhex(aggregate_hex)
+            except ValueError:
+                return False
+            if len(aggregate) != 128:
+                return False
+        elif state == "ready":
+            if len(seen) != 2:
+                return False
+            if aggregate_hex is not None:
+                return False
+        elif state == "collecting":
+            if len(seen) >= 2:
+                return False
+            if aggregate_hex is not None:
+                return False
+        else:
+            # expired：超时只发生在收齐之前（collecting），故不足两份且无签名
+            if len(seen) >= 2 or aggregate_hex is not None:
+                return False
+        return True
+
+    def _read_sign_sessions(self, wallet_id: str) -> dict:
+        """读取并严格校验全部签名会话；文件不存在为空映射。
+
+        文件存在但 JSON 损坏、顶层不是对象、键非安全标识或任一会话记录
+        形状非法时抛 CorruptDataError：绝不静默归一为空会话，保留现场由
+        上层 fail-closed（503/阻止就绪）。"""
+        path = self._sign_sessions_path(wallet_id)
+        data = self._read_json(path)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise CorruptDataError(
+                f"sign sessions file {path!r} top-level value is not an object"
+            )
+        for session_id, record in data.items():
+            if not _valid_safe_id(session_id) or not self._session_record_shape_ok(
+                session_id, record
+            ):
+                raise CorruptDataError(
+                    f"sign sessions file {path!r} has malformed session "
+                    f"{session_id!r}"
+                )
+        return data
+
+    def check_sign_sessions(self, wallet_id: str) -> None:
+        """只读校验签名会话文件形状；损坏时抛 CorruptDataError/OSError。
+        文件不存在（尚无会话）视为正常空状态。"""
+        _check_id("wallet_id", wallet_id)
+        self._read_sign_sessions(wallet_id)
+
+    def list_sign_session_wallet_ids(self) -> list[str]:
+        """返回存在签名会话文件的全部 wallet_id（启动恢复扫描用）。"""
+        try:
+            names = os.listdir(self._sign_sessions_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
+
+    def create_sign_session(
+        self, wallet_id: str, session_id: str, record: dict
+    ) -> Optional[dict]:
+        """原子地创建一条签名会话（调用方须持钱包事务锁并已查重）。
+
+        同 id 已存在则不覆盖、直接返回已有记录；否则写入并返回 None。
+        """
+        _check_id("session_id", session_id)
+        path = self._sign_sessions_path(wallet_id)
+        with self._lock:
+            all_records = self._read_sign_sessions(wallet_id)
+            existing = all_records.get(session_id)
+            if existing is not None:
+                return existing
+            all_records[session_id] = record
+            self._atomic_write(path, all_records)
+            return None
+
+    def get_sign_session(
+        self, wallet_id: str, session_id: str
+    ) -> Optional[dict]:
+        """返回某条签名会话记录（严格校验），不存在返回 None。"""
+        _check_id("session_id", session_id)
+        return self._read_sign_sessions(wallet_id).get(session_id)
+
+    def list_sign_sessions(self, wallet_id: str) -> list[dict]:
+        """返回某钱包全部签名会话记录（严格校验，按 id 排序）。"""
+        records = self._read_sign_sessions(wallet_id)
+        return [dict(records[key]) for key in sorted(records)]
+
+    def update_sign_session(
+        self, wallet_id: str, session_id: str, record: dict
+    ) -> None:
+        """原子覆盖一条已存在的签名会话（收份额/懒过期/聚合提交用）。"""
+        _check_id("session_id", session_id)
+        path = self._sign_sessions_path(wallet_id)
+        with self._lock:
+            all_records = self._read_sign_sessions(wallet_id)
+            all_records[session_id] = record
+            self._atomic_write(path, all_records)
+
+    def delete_sign_session(self, wallet_id: str, session_id: str) -> None:
+        """删除一条签名会话（创建事件追加失败回滚用）。"""
+        _check_id("session_id", session_id)
+        path = self._sign_sessions_path(wallet_id)
+        with self._lock:
+            all_records = self._read_sign_sessions(wallet_id)
+            if session_id not in all_records:
+                return
+            del all_records[session_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    # ---- 资产账本（asset-operations 与 assets）-----------------------------
     def _assets_path(self, wallet_id: str) -> str:
         _check_id("wallet_id", wallet_id)
         return os.path.join(self._assets_dir, wallet_id + ".json")
