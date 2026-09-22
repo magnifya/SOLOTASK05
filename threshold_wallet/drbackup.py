@@ -130,8 +130,11 @@ def _scan_staging_dir(data_dir: str, wallet_id: str) -> list[str]:
     """递归枚举 rotation-staging/<W>/ 下的全部成员并严格校验。
 
     结构只能是 ``<rotation_id>/<file>`` 两层：rotation_id 为安全标识；
-    文件名只能是 ``<share_id>.json``、``<share_id>.bak.json`` 或
-    ``wallet.bak.json``。符号链接、更深层级或任何额外条目一律拒绝。
+    文件名只能是 ``<share_id>.json``（持锁自愈后，合法 prepared 暂存目录
+    内恰有两份新份额文件）。激活备份（``*.bak.json``、``wallet.bak.json``）
+    只可能存在于激活事务窗口，持锁自愈后必已回滚/清理，故任何
+    ``.bak.json`` 都意味着夹带了半状态，与符号链接、更深层级、临时文件或
+    任何额外条目一样一律拒绝（503，不能对账不出包）。
     """
     fs_root = os.path.join(data_dir, "rotation-staging", wallet_id)
     members: list[str] = []
@@ -157,14 +160,10 @@ def _scan_staging_dir(data_dir: str, wallet_id: str) -> list[str]:
             if not f_entry.is_file(follow_symlinks=False):
                 raise BackupError(503, "unexpected non-file in rotation-staging")
             name = f_entry.name
-            ok = name == "wallet.bak.json" or (
-                name.endswith(".json")
-                and _SAFE_SHARE_ID.match(name[: -len(".json")])
-            ) or (
-                name.endswith(".bak.json")
-                and _SAFE_SHARE_ID.match(
-                    name[: -len(".bak.json")]
-                )
+            # 唯一合法成员是 <share_id>.json（stem 为安全份额标识，点号
+            # 会使 *.bak.json / wallet.bak.json 的 stem 失配而被拒绝）。
+            ok = name.endswith(".json") and bool(
+                _SAFE_SHARE_ID.match(name[: -len(".json")])
             )
             if not ok:
                 raise BackupError(503, "unexpected file in rotation-staging")
@@ -196,13 +195,54 @@ def _scan_flat_dir(
     return members
 
 
+def _scan_root_strict(
+    data_dir: str, dirname: str, *, expect_dir: bool
+) -> None:
+    """严格校验一个白名单根目录下的全部直接条目。
+
+    ``expect_dir=False``（wallets/各业务目录）：只允许名为
+    ``<安全id>.json`` 的普通文件；``expect_dir=True``（shares/
+    rotation-staging）：只允许名为 ``<安全id>`` 的真实目录。符号链接、
+    文件/目录错位、原子写临时文件（``.tmp-*``）、非法命名等任何额外条目
+    一律 503——这些目录只存放钱包数据，混入杂物意味着现场不可信。
+    根目录本身缺失视为正常空状态，存在却是符号链接/文件则拒绝。
+    """
+    root = os.path.join(data_dir, dirname)
+    if not os.path.exists(root) and not os.path.islink(root):
+        return
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise BackupError(503, f"{dirname} is not a directory")
+    with os.scandir(root) as it:
+        entries = list(it)
+    for entry in entries:
+        if entry.is_symlink():
+            raise BackupError(503, f"refusing symbolic link under {dirname}")
+        name = entry.name
+        if expect_dir:
+            if not _SAFE_ID.match(name) or not entry.is_dir(
+                follow_symlinks=False
+            ):
+                raise BackupError(503, f"unexpected entry under {dirname}")
+        else:
+            stem = name[: -len(".json")] if name.endswith(".json") else ""
+            if not _SAFE_ID.match(stem) or not entry.is_file(
+                follow_symlinks=False
+            ):
+                raise BackupError(503, f"unexpected entry under {dirname}")
+
+
 def _iter_whitelist_files(data_dir: str, wallet_id: str) -> list[str]:
     """枚举该钱包白名单内的现存相对路径（POSIX 风格，已排序、去重）。
 
     覆盖：wallets/W.json、shares/W/*、业务目录 W（审计/审批/签名/策略/
     交易策略/资产/会话/轮换）、rotation-staging/W/*（递归）。锁文件
-    （locks/）、资产提交意图（asset-intents/，恢复后必为空）、灾备事务
-    目录与原子写临时文件均不在白名单。
+    （locks/）、资产提交意图（asset-intents/，恢复后必为空）与灾备事务
+    目录不在白名单。
+
+    本枚举被 backup 与 restore 事务（提交/回滚记账）共用，故对目录根保持
+    宽容（只取属于 W 的白名单成员）；backup 出包前另有
+    :func:`_scan_root_strict` 对每个白名单根做整根严格扫描。回滚路径必须
+    能在提交窗口自身残留临时文件时收敛，不能在此误判失败。
     """
     members: list[str] = []
     for rel in _wallet_members(wallet_id):
@@ -239,9 +279,17 @@ def _build_manifest(
     """锁内、恢复完成后读取白名单文件，构造 manifest v1 与 (relpath, data)。
 
     manifest 含 version/wallet_id/snapshot_id/files，每项 path/bytes/sha256；
-    manifest_sha256 绑定（含 S 在内的）主体哈希。任何符号链接/非常规文件/
-    路径异常都抛 BackupError。
+    manifest_sha256 绑定（含 S 在内的）主体哈希。出包前先严格扫描各白名单
+    根（临时文件/符号链接/类型错位/非法命名一律 503）；任何符号链接/非常规
+    文件/路径异常都抛 BackupError，不能对账不出包。
     """
+    # 严格扫描整根（wallets/各业务根、shares/、rotation-staging/）：白名单
+    # 外的杂物一律拒绝。其他钱包的合法条目（bob.json、bob/）仍放行。
+    for rel_dir in _BUSINESS_FILE_DIRS:
+        _scan_root_strict(data_dir, rel_dir, expect_dir=False)
+    _scan_root_strict(data_dir, "wallets", expect_dir=False)
+    for rel_dir in ("shares", "rotation-staging"):
+        _scan_root_strict(data_dir, rel_dir, expect_dir=True)
     relpaths = _iter_whitelist_files(data_dir, wallet_id)
     files: list[dict] = []
     payloads: list[tuple[str, bytes]] = []
@@ -384,13 +432,10 @@ def _is_whitelisted(wallet_id: str, rel: str) -> bool:
 
 
 def _staging_filename_ok(name: str) -> bool:
-    if name == "wallet.bak.json":
-        return True
-    if name.endswith(".json") and bool(_SAFE_SHARE_ID.match(name[: -len(".json")])):
-        return True
-    return bool(
-        name.endswith(".bak.json")
-        and bool(_SAFE_SHARE_ID.match(name[: -len(".bak.json")]))
+    # 合法快照的暂存成员只可能是 <share_id>.json；*.bak.json 是激活事务
+    # 窗口的瞬态备份，持锁自愈后必已清理，夹带即拒绝。
+    return name.endswith(".json") and bool(
+        _SAFE_SHARE_ID.match(name[: -len(".json")])
     )
 
 
@@ -483,6 +528,12 @@ def _validate_manifest_shape(
     """校验 manifest v1 形状、成员清单与每项字节/sha256，以及 S 绑定哈希。"""
     if not isinstance(manifest, dict):
         raise BackupError(503, "manifest is not a JSON object")
+    # 顶层只允许契约键：任何夹带的额外键（即便不参与绑定哈希）也拒绝，
+    # 绝不静默归一丢弃，避免快照借未声明通道夹带数据。
+    if set(manifest) != {
+        "version", "wallet_id", "snapshot_id", "files", "manifest_sha256",
+    }:
+        raise BackupError(503, "manifest has unexpected top-level keys")
     if manifest.get("version") != MANIFEST_VERSION:
         raise BackupError(503, "unsupported manifest version")
     wallet_id = manifest.get("wallet_id")
@@ -505,6 +556,9 @@ def _validate_manifest_shape(
     for entry in entries:
         if not isinstance(entry, dict):
             raise BackupError(503, "manifest entry is not an object")
+        # 每个 files 项只允许契约键 path/bytes/sha256。
+        if set(entry) != {"path", "bytes", "sha256"}:
+            raise BackupError(503, "manifest entry has unexpected keys")
         path = entry.get("path")
         nbytes = entry.get("bytes")
         digest = entry.get("sha256")

@@ -186,6 +186,121 @@ class BackupTest(unittest.TestCase):
         self.assertEqual(cm.exception.status, 503)
         self.assertFalse(os.path.exists(self.out))
 
+    def test_backup_refuses_transient_bak_in_staging(self):
+        # 持锁自愈后 prepared 暂存目录只能含两份新份额；任何 *.bak.json
+        # （激活事务窗口残留）都是半状态，必须 503 且不出包。
+        self.h.service.create_share_rotation("alice", "rot1")
+        for junk in ("wallet.bak.json", "rot1-share-1.bak.json"):
+            p = os.path.join(
+                self.data, "rotation-staging/alice/rot1", junk)
+            with open(p, "w") as f:
+                f.write("{}")
+            with self.assertRaises(drbackup.BackupError) as cm:
+                drbackup.backup(self.data, "alice", "S1", self.out)
+            self.assertEqual(cm.exception.status, 503)
+            self.assertFalse(os.path.exists(self.out))
+            os.unlink(p)
+
+    def test_backup_strict_root_scan_rejects_junk(self):
+        def expect_503(make_junk):
+            make_junk()
+            with self.assertRaises(drbackup.BackupError) as cm:
+                drbackup.backup(self.data, "alice", "S1", self.out)
+            self.assertEqual(cm.exception.status, 503)
+            self.assertFalse(os.path.exists(self.out))
+
+        # 业务根里的原子写临时文件 / 冒名目录
+        expect_503(lambda: open(
+            os.path.join(self.data, "policies", ".tmp-x.json"), "w").close())
+        os.unlink(os.path.join(self.data, "policies", ".tmp-x.json"))
+        expect_503(lambda: os.makedirs(
+            os.path.join(self.data, "wallets", "subdir")))
+        os.rmdir(os.path.join(self.data, "wallets", "subdir"))
+        # shares / rotation-staging 根下只允许安全命名的真实目录
+        expect_503(lambda: open(
+            os.path.join(self.data, "shares", "x.json"), "w").close())
+        os.unlink(os.path.join(self.data, "shares", "x.json"))
+        expect_503(lambda: os.symlink(
+            "/etc/hostname", os.path.join(self.data, "shares", "evil")))
+        os.unlink(os.path.join(self.data, "shares", "evil"))
+
+    def test_backup_tolerates_other_wallets_but_excludes_them(self):
+        # 严格根扫描不得误伤其他钱包的合法条目；且快照只含 alice。
+        self.h.service.create_wallet("bob", 2)
+        self.h.service.put_policy("bob", 1, 10)
+        body = drbackup.backup(self.data, "alice", "S1", self.out)
+        for entry in body["manifest"]["files"]:
+            self.assertNotIn("bob", entry["path"].split("/"))
+
+    def test_backup_failure_never_overwrites_existing_snapshot(self):
+        # 先成功出一个包，再令现场无法对账；失败后既有快照内容必须原样保留。
+        drbackup.backup(self.data, "alice", "S1", self.out)
+        with open(self.out, "rb") as f:
+            sentinel = f.read()
+        os.symlink("/etc/hostname",
+                   os.path.join(self.data, "shares/alice/evil.json"))
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S2", self.out)
+        self.assertEqual(cm.exception.status, 503)
+        with open(self.out, "rb") as f:
+            self.assertEqual(f.read(), sentinel)
+
+
+class RestoreManifestStrictnessTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "src")
+        self.dst = os.path.join(self.tmp, "dst")
+        h = make_harness(self.src)
+        h.service.create_wallet("alice", 2)
+        self.pack = os.path.join(self.tmp, "good.tar")
+        drbackup.backup(self.src, "alice", "S1", self.pack)
+        self.manifest, self.files = _read_pack(self.pack)
+
+    def _repack(self, manifest, path):
+        _pack(path, manifest, self.files)
+
+    def test_extra_top_level_key_503(self):
+        import hashlib
+        m = json.loads(json.dumps(self.manifest))
+        m["extra"] = 1
+        # 重绑使 4 个规范键的绑定哈希仍自洽，证明是契约键检查在拦截。
+        m["manifest_sha256"] = hashlib.sha256(
+            drbackup._canonical_manifest_body(m)).hexdigest()
+        p = os.path.join(self.tmp, "top.tar")
+        self._repack(m, p)
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.dst, "wallets/alice.json")))
+
+    def test_extra_file_entry_key_503(self):
+        import hashlib
+        m = json.loads(json.dumps(self.manifest))
+        m["files"][0]["mode"] = 0o777
+        m["manifest_sha256"] = hashlib.sha256(
+            drbackup._canonical_manifest_body(m)).hexdigest()
+        p = os.path.join(self.tmp, "entry.tar")
+        self._repack(m, p)
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_staging_bak_member_503(self):
+        # 夹带 *.bak.json 暂存成员：读包结构初筛即拒绝（非白名单）。
+        p = os.path.join(self.tmp, "bak.tar")
+        _repack_with_overrides(
+            self.pack, p, {},
+            add_members={
+                "rotation-staging/alice/rot1/rot1-share-1.bak.json": b"{}"},
+        )
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.dst, "wallets/alice.json")))
+
 
 class RestoreHappyPathTest(unittest.TestCase):
     def setUp(self):
