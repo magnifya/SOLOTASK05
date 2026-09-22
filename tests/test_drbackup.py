@@ -186,6 +186,182 @@ class BackupTest(unittest.TestCase):
         self.assertEqual(cm.exception.status, 503)
         self.assertFalse(os.path.exists(self.out))
 
+    def test_failed_backup_does_not_overwrite_existing_snapshot(self):
+        first = os.path.join(self.tmp, "first.tar")
+        drbackup.backup(self.data, "alice", "S0", first)
+        with open(first, "rb") as f:
+            original_bytes = f.read()
+        os.symlink("/etc/hostname",
+                   os.path.join(self.data, "shares/alice/evil.json"))
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", first)
+        self.assertEqual(cm.exception.status, 503)
+        with open(first, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+    def test_backup_rejects_bak_json_in_business_dir(self):
+        with open(os.path.join(self.data, "wallets/alice.bak.json"), "w") as f:
+            f.write("{}")
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", self.out)
+        self.assertEqual(cm.exception.status, 503)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_backup_rejects_atomic_temp_file(self):
+        audit_dir = os.path.join(self.data, "audit")
+        os.makedirs(audit_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=audit_dir, prefix=".tmp-", suffix=".json")
+        os.close(fd)
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", self.out)
+        self.assertEqual(cm.exception.status, 503)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_backup_rejects_directory_in_business_dir(self):
+        os.makedirs(os.path.join(self.data, "audit", "alice.json"))
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", self.out)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_backup_rejects_bak_json_in_rotation_staging(self):
+        svc = self.h.service
+        svc.create_share_rotation("alice", "rot1")
+        with open(
+            os.path.join(self.data, "rotation-staging/alice/rot1",
+                         "wallet.bak.json"), "w"
+        ) as f:
+            f.write("{}")
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", self.out)
+        self.assertEqual(cm.exception.status, 503)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_backup_allows_other_wallets_formal_files(self):
+        bob = self.h.service
+        bob.create_wallet("bob", 2)
+        body = drbackup.backup(self.data, "alice", "S1", self.out)
+        paths = {f["path"] for f in body["manifest"]["files"]}
+        self.assertTrue(all("bob" not in p for p in paths))
+
+
+class RestoreManifestContractTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "src")
+        self.dst = os.path.join(self.tmp, "dst")
+        self.h = make_harness(self.src)
+        self.h.service.create_wallet("alice", 2)
+        self.pack = os.path.join(self.tmp, "good.tar")
+        drbackup.backup(self.src, "alice", "S1", self.pack)
+
+    def test_extra_top_level_manifest_key_503(self):
+        manifest, files = _read_pack(self.pack)
+        manifest["extra"] = 1
+        p = os.path.join(self.tmp, "extra-top.tar")
+        _pack(p, manifest, files)
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_extra_manifest_entry_key_503(self):
+        manifest, files = _read_pack(self.pack)
+        manifest["files"][0]["evil"] = "x"
+        manifest["manifest_sha256"] = hashlib.sha256(
+            drbackup._canonical_manifest_body(manifest)
+        ).hexdigest()
+        p = os.path.join(self.tmp, "extra-entry.tar")
+        _pack(p, manifest, files)
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_private_key_field_in_wallet_meta_503(self):
+        manifest, files = _read_pack(self.pack)
+        wallet = json.loads(files["wallets/alice.json"])
+        wallet["private_key"] = "00" * 32
+        p = os.path.join(self.tmp, "pk.tar")
+        _repack_with_overrides(
+            self.pack, p,
+            {"wallets/alice.json": json.dumps(wallet).encode()},
+        )
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_extra_share_record_key_503(self):
+        manifest, files = _read_pack(self.pack)
+        rec = json.loads(files["shares/alice/share-1.json"])
+        rec["extra"] = 1
+        p = os.path.join(self.tmp, "sx.tar")
+        _repack_with_overrides(
+            self.pack, p,
+            {"shares/alice/share-1.json": json.dumps(rec).encode()},
+        )
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(self.dst, "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_private_key_nested_in_audit_file_503(self):
+        # 审计/业务文件即使嵌套夹带 private_key 字段也必须拒绝
+        tmp2 = tempfile.mkdtemp()
+        src2 = os.path.join(tmp2, "src")
+        h2 = make_harness(src2)
+        h2.service.create_wallet("alice", 2)
+        h2.service.put_policy("alice", 1, 3600)
+        good = os.path.join(tmp2, "good.tar")
+        drbackup.backup(src2, "alice", "S1", good)
+        manifest, files = _read_pack(good)
+        audit_log = json.loads(files["audit/alice.json"])
+        audit_log["events"][0]["details"]["private_key"] = "11" * 32
+        p = os.path.join(tmp2, "bad.tar")
+        _repack_with_overrides(
+            good, p,
+            {"audit/alice.json": json.dumps(audit_log).encode()},
+        )
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(os.path.join(tmp2, "dst"), "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_unknown_audit_event_type_503(self):
+        tmp2 = tempfile.mkdtemp()
+        src2 = os.path.join(tmp2, "src")
+        h2 = make_harness(src2)
+        h2.service.create_wallet("alice", 2)
+        h2.service.put_policy("alice", 1, 3600)
+        good = os.path.join(tmp2, "good.tar")
+        drbackup.backup(src2, "alice", "S1", good)
+        manifest, files = _read_pack(good)
+        audit_log = json.loads(files["audit/alice.json"])
+        audit_log["events"][0]["type"] = "totally_new_event"
+        p = os.path.join(tmp2, "bad.tar")
+        _repack_with_overrides(
+            good, p,
+            {"audit/alice.json": json.dumps(audit_log).encode()},
+        )
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(os.path.join(tmp2, "dst"), "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_rotation_record_extra_key_503(self):
+        tmp2 = tempfile.mkdtemp()
+        src2 = os.path.join(tmp2, "src")
+        h2 = make_harness(src2)
+        h2.service.create_wallet("alice", 2)
+        h2.service.create_share_rotation("alice", "rot1")
+        good = os.path.join(tmp2, "good.tar")
+        drbackup.backup(src2, "alice", "S1", good)
+        manifest, files = _read_pack(good)
+        rotations = json.loads(files["rotations/alice.json"])
+        rotations["rot1"]["bogus"] = 5
+        p = os.path.join(tmp2, "bad.tar")
+        _repack_with_overrides(
+            good, p,
+            {"rotations/alice.json": json.dumps(rotations).encode()},
+        )
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.restore(os.path.join(tmp2, "dst"), "alice", p)
+        self.assertEqual(cm.exception.status, 503)
+
 
 class RestoreHappyPathTest(unittest.TestCase):
     def setUp(self):
@@ -334,6 +510,27 @@ class RestoreRotationTest(unittest.TestCase):
         # 两个历史签名在恢复后都能按各自时刻公钥重放
         self.assertEqual(svc.sign("carol", "r1", "m", s1)[0], 200)
         self.assertEqual(svc.sign("carol", "r2", "m2", s2)[0], 200)
+
+    def test_sessions_and_tx_policy_survive_restore(self):
+        tmp = tempfile.mkdtemp()
+        src, dst = f"{tmp}/src", f"{tmp}/dst"
+        h = make_harness(src)
+        h.service.create_wallet("erin", 2)
+        h.service.put_transaction_policy("erin", "cold", 50, ["BTC", "ETH"])
+        h.service.create_sign_session("erin", "ses1", "hello", 600)
+        pack = f"{tmp}/b.tar"
+        drbackup.backup(src, "erin", "S1", pack)
+        status, _ = drbackup.restore(dst, "erin", pack)
+        self.assertEqual(status, 201)
+        store = WalletStore(dst)
+        self.assertEqual(
+            store.get_transaction_policy("erin"),
+            {"mode": "cold", "max_delta": 50, "allowed_assets": ["BTC", "ETH"]},
+        )
+        view = WalletService(store).get_sign_session("erin", "ses1")
+        self.assertEqual(view["id"], "ses1")
+        self.assertEqual(view["state"], "collecting")
+        self.assertEqual(view["missing_shares"], ["share-1", "share-2"])
 
     def test_direct_sign_without_policy_has_no_request_record(self):
         # 无审批策略时 /sign 直接产生 request_signed 事件、没有审批单文件：

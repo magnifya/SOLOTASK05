@@ -90,6 +90,14 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _is_sha256_hex(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
 def _read_regular_file(path: str) -> bytes:
     """读取普通文件字节；符号链接/非常规文件一律拒绝（绝不跟随链接）。"""
     if os.path.islink(path):
@@ -129,9 +137,10 @@ def _scan_share_dir(data_dir: str, wallet_id: str) -> list[str]:
 def _scan_staging_dir(data_dir: str, wallet_id: str) -> list[str]:
     """递归枚举 rotation-staging/<W>/ 下的全部成员并严格校验。
 
-    结构只能是 ``<rotation_id>/<file>`` 两层：rotation_id 为安全标识；
-    文件名只能是 ``<share_id>.json``、``<share_id>.bak.json`` 或
-    ``wallet.bak.json``。符号链接、更深层级或任何额外条目一律拒绝。
+    结构只能是 ``<rotation_id>/<share_id>.json`` 两层：rotation_id 为安全
+    标识；文件名只能是 ``<share_id>.json``。符号链接、更深层级、原子写
+    临时文件、``*.bak.json`` 激活备份（持锁自愈后必已清理）或任何额外
+    条目一律拒绝。
     """
     fs_root = os.path.join(data_dir, "rotation-staging", wallet_id)
     members: list[str] = []
@@ -157,21 +166,50 @@ def _scan_staging_dir(data_dir: str, wallet_id: str) -> list[str]:
             if not f_entry.is_file(follow_symlinks=False):
                 raise BackupError(503, "unexpected non-file in rotation-staging")
             name = f_entry.name
-            ok = name == "wallet.bak.json" or (
+            # 激活备份 *.bak.json（含 wallet.bak.json）只可能存在于激活
+            # 事务窗口；持锁自愈后仍在等于现场半完成，绝不出包。
+            if name.endswith(".bak.json") or not (
                 name.endswith(".json")
                 and _SAFE_SHARE_ID.match(name[: -len(".json")])
-            ) or (
-                name.endswith(".bak.json")
-                and _SAFE_SHARE_ID.match(
-                    name[: -len(".bak.json")]
-                )
-            )
-            if not ok:
+            ):
                 raise BackupError(503, "unexpected file in rotation-staging")
             members.append(
                 f"rotation-staging/{wallet_id}/{rid_entry.name}/{name}"
             )
     return members
+
+
+def _scan_shared_root(data_dir: str, dirname: str, wallet_id: str) -> None:
+    """严格扫描一个多钱包共享根目录（wallets/ 与各业务目录）。
+
+    这些目录里允许存在**其他钱包**的 ``<other_id>.json`` 正式文件；但凡
+    属于目标钱包 W 命名空间的额外条目、原子写临时文件（``.tmp-*.json``）、
+    ``*.bak.json`` 备份、符号链接或子目录都意味着未对账现场，一律 503。
+    """
+    fs_root = os.path.join(data_dir, dirname)
+    if not os.path.exists(fs_root) and not os.path.islink(fs_root):
+        return
+    if os.path.islink(fs_root) or not os.path.isdir(fs_root):
+        raise BackupError(503, f"{dirname} is not a directory")
+    with os.scandir(fs_root) as it:
+        entries = list(it)
+    for entry in entries:
+        name = entry.name
+        if entry.is_symlink():
+            raise BackupError(503, f"refusing symbolic link under {dirname}")
+        if not entry.is_file(follow_symlinks=False):
+            raise BackupError(503, f"unexpected non-file under {dirname}")
+        if name.startswith(".tmp-") and name.endswith(".json"):
+            raise BackupError(503, f"atomic-write temp file under {dirname}")
+        if name.endswith(".bak.json"):
+            raise BackupError(503, f"activation backup file under {dirname}")
+        # 共享根目录只允许正式的 <safe-id>.json 文件（其他钱包的正式文件
+        # 自然允许）；任何其他命名都是白名单外的非法条目。
+        if not (
+            name.endswith(".json")
+            and bool(_SAFE_ID.match(name[: -len(".json")]))
+        ):
+            raise BackupError(503, f"unexpected file name under {dirname}")
 
 
 def _scan_flat_dir(
@@ -205,6 +243,11 @@ def _iter_whitelist_files(data_dir: str, wallet_id: str) -> list[str]:
     目录与原子写临时文件均不在白名单。
     """
     members: list[str] = []
+    # wallets/ 与每个业务共享根目录都要严格扫描：任何原子写临时文件、
+    # *.bak.json、符号链接、子目录或非法命名都拒绝出包（fail-closed）。
+    _scan_shared_root(data_dir, "wallets", wallet_id)
+    for dirname in _BUSINESS_FILE_DIRS:
+        _scan_shared_root(data_dir, dirname, wallet_id)
     for rel in _wallet_members(wallet_id):
         path = os.path.join(data_dir, *rel.split("/"))
         if os.path.exists(path) or os.path.islink(path):
@@ -336,6 +379,10 @@ def backup(
             manifest, payloads = _build_manifest(
                 data_dir, wallet_id, snapshot_id
             )
+            # 出包前用与 restore 完全相同的全量对账（临时目录跑线上恢复器 +
+            # 在用份额公私钥 + 审计/账本/会话/轮换/历史签名对账）校验即将
+            # 打包的**确切字节**：不能对账绝不出包，也绝不生成无法恢复的快照。
+            _verify_snapshot(service, wallet_id, manifest, dict(payloads))
             _write_snapshot(output, manifest, payloads)
     except BackupError:
         raise
@@ -384,13 +431,15 @@ def _is_whitelisted(wallet_id: str, rel: str) -> bool:
 
 
 def _staging_filename_ok(name: str) -> bool:
-    if name == "wallet.bak.json":
-        return True
-    if name.endswith(".json") and bool(_SAFE_SHARE_ID.match(name[: -len(".json")])):
-        return True
-    return bool(
-        name.endswith(".bak.json")
-        and bool(_SAFE_SHARE_ID.match(name[: -len(".bak.json")]))
+    """合法快照的暂存目录只允许 <share_id>.json 正式新份额文件。
+
+    ``*.bak.json``（含 wallet.bak.json）是激活事务窗口内的瞬态备份，持锁
+    自愈后必已清理，任何快照都不得携带（manifest 校验另有显式拒绝）。
+    """
+    if name.endswith(".bak.json"):
+        return False
+    return name.endswith(".json") and bool(
+        _SAFE_SHARE_ID.match(name[: -len(".json")])
     )
 
 
@@ -477,12 +526,109 @@ def _is_whitelisted_path_any(rel: str) -> bool:
     return False
 
 
+#: manifest v1 顶层允许的契约键
+_MANIFEST_TOP_KEYS = frozenset(
+    ("version", "wallet_id", "snapshot_id", "files", "manifest_sha256")
+)
+
+#: manifest 每个 files 项允许的契约键
+_MANIFEST_ENTRY_KEYS = frozenset(("path", "bytes", "sha256"))
+
+#: 钱包元数据文件与其 shares 条目允许的契约键（绝不包含私钥材料）
+_WALLET_META_KEYS = frozenset(
+    ("wallet_id", "created_at", "public_key", "shares")
+)
+_WALLET_SHARE_ENTRY_KEYS = frozenset(("share_id", "public_key"))
+
+#: 单个份额文件允许的契约键（全系统唯一允许含 private_key 的文件形状）
+_SHARE_RECORD_KEYS = frozenset(("share_id", "public_key", "private_key"))
+
+#: 轮换记录允许的契约键（previous_public_key 仅 activating/active 携带）
+_ROTATION_RECORD_KEYS = frozenset(
+    ("rotation_id", "state", "share_ids", "public_key", "created_at",
+     "previous_public_key")
+)
+
+#: 审批单记录允许的契约键
+_REQUEST_RECORD_KEYS = frozenset(
+    ("id", "message", "state", "approvers", "req", "t0", "t1", "reason")
+)
+
+#: 已完成签名记录允许的契约键（绝不含份额私钥）
+_SIGNATURE_RECORD_KEYS = frozenset(("message", "signature"))
+
+#: 审批策略 / 交易策略文件允许的契约键
+_APPROVAL_POLICY_KEYS = frozenset(
+    ("wallet_id", "required_approvals", "timeout_seconds")
+)
+_TRANSACTION_POLICY_KEYS = frozenset(("mode", "max_delta", "allowed_assets"))
+
+#: 非份额文件中绝不得出现的私钥字段名
+_PRIVATE_KEY_FIELD = "private_key"
+
+#: 审计事件恰允许的七个字段
+_AUDIT_EVENT_KEYS = frozenset(
+    ("seq", "type", "at", "request_id", "actor_id", "reason", "details")
+)
+
+#: 审计日志顶层允许的契约键
+_AUDIT_LOG_KEYS = frozenset(("wallet_id", "next_seq", "events"))
+
+#: manifest v1 契约内全部已知审计事件类型（封闭集合，未知类型拒绝）
+_KNOWN_AUDIT_TYPES = frozenset(
+    (
+        "policy_updated",
+        "request_created",
+        "request_approved",
+        "request_rejected",
+        "request_expired",
+        "request_signed",
+        "share_rotation_prepared",
+        "share_rotation_activated",
+        "asset_operation_committed",
+        "transaction_policy_updated",
+        "session_event",
+    )
+)
+
+
+def _verify_audit_contract(wallet_id: str, files: dict[str, bytes]) -> None:
+    """审计日志契约校验：顶层契约键、事件恰七字段、类型为封闭已知集合。
+
+    seq 连续性与各类型的语义对账由线上恢复器（check_log/轮换链/账本/会话/
+    审批单对账）负责；这里拦住夹带额外字段或未知事件类型的日志——审计是
+    恢复提交点的唯一依据，未识别类型不得静默带入恢复后的系统。
+    """
+    rel = f"audit/{wallet_id}.json"
+    if rel not in files:
+        return
+    log = _load_json_object(files[rel], "audit file")
+    if not set(log) <= _AUDIT_LOG_KEYS:
+        raise BackupError(503, "audit file has an unexpected top-level key")
+    recorded_wallet = log.get("wallet_id")
+    if recorded_wallet is not None and recorded_wallet != wallet_id:
+        raise BackupError(503, "audit file wallet_id does not match")
+    events = log.get("events")
+    if not isinstance(events, list):
+        raise BackupError(503, "audit file events must be a list")
+    for event in events:
+        if not isinstance(event, dict) or set(event) != _AUDIT_EVENT_KEYS:
+            raise BackupError(503, "audit event has an unexpected shape")
+        if event.get("type") not in _KNOWN_AUDIT_TYPES:
+            raise BackupError(503, "audit file has an unknown event type")
+
+
 def _validate_manifest_shape(
     manifest: object, files: dict[str, bytes]
 ) -> dict:
-    """校验 manifest v1 形状、成员清单与每项字节/sha256，以及 S 绑定哈希。"""
+    """校验 manifest v1 形状、成员清单与每项字节/sha256，以及 S 绑定哈希。
+
+    manifest 顶层与每个 files 项都只允许契约键：任何额外键（夹带的标识、
+    私钥材料或未知扩展）一律 503，绝不静默忽略后继续。"""
     if not isinstance(manifest, dict):
         raise BackupError(503, "manifest is not a JSON object")
+    if not set(manifest) <= _MANIFEST_TOP_KEYS:
+        raise BackupError(503, "manifest has an unexpected top-level key")
     if manifest.get("version") != MANIFEST_VERSION:
         raise BackupError(503, "unsupported manifest version")
     wallet_id = manifest.get("wallet_id")
@@ -493,7 +639,7 @@ def _validate_manifest_shape(
     if not isinstance(entries, list):
         raise BackupError(503, "manifest files must be a list")
     bound = manifest.get("manifest_sha256")
-    if not isinstance(bound, str):
+    if not isinstance(bound, str) or not _is_sha256_hex(bound):
         raise BackupError(503, "manifest is missing its binding hash")
     if sha256_hex(_canonical_manifest_body(manifest)) != bound:
         raise BackupError(503, "manifest binding hash mismatch")
@@ -505,6 +651,8 @@ def _validate_manifest_shape(
     for entry in entries:
         if not isinstance(entry, dict):
             raise BackupError(503, "manifest entry is not an object")
+        if not set(entry) <= _MANIFEST_ENTRY_KEYS:
+            raise BackupError(503, "manifest entry has an unexpected key")
         path = entry.get("path")
         nbytes = entry.get("bytes")
         digest = entry.get("sha256")
@@ -515,7 +663,7 @@ def _validate_manifest_shape(
             raise BackupError(503, "manifest lists a non-whitelisted path")
         if not isinstance(nbytes, int) or isinstance(nbytes, bool) or nbytes < 0:
             raise BackupError(503, "manifest entry has a bad byte count")
-        if not isinstance(digest, str):
+        if not isinstance(digest, str) or not _is_sha256_hex(digest):
             raise BackupError(503, "manifest entry has a bad sha256")
         data = files.get(path)
         if data is None or len(data) != nbytes or sha256_hex(data) != digest:
@@ -554,6 +702,8 @@ def _request_shape_ok(key: str, record: object) -> bool:
 
     if not isinstance(record, dict):
         return False
+    if set(record) != _REQUEST_RECORD_KEYS:
+        return False
     if record.get("id") != key:
         return False
     if not isinstance(record.get("message"), str):
@@ -565,7 +715,7 @@ def _request_shape_ok(key: str, record: object) -> bool:
     approvers = record.get("approvers")
     if not isinstance(approvers, list) or not all(
         isinstance(a, str) for a in approvers
-    ):
+    ) or len(set(approvers)) != len(approvers):
         return False
     if record.get("req") not in (1, 2):
         return False
@@ -576,6 +726,12 @@ def _request_shape_ok(key: str, record: object) -> bool:
         return False
     reason = record.get("reason")
     if reason is not None and not isinstance(reason, str):
+        return False
+    # pending 不得已有批准；达到门槛必须是 approved
+    approvers_n = len(approvers)
+    if approvers_n > record.get("req"):
+        return False
+    if record.get("state") == "approved" and approvers_n < record.get("req"):
         return False
     return True
 
@@ -593,6 +749,18 @@ def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) 
         or not isinstance(public_hex, str)
     ):
         raise BackupError(503, "wallet metadata shares are malformed")
+    # 钱包元数据文件只允许公开契约键（wallet_id/created_at/public_key/
+    # shares），份额条目只允许 share_id/public_key：任何私钥材料或夹带的
+    # 额外字段都不得出现在非份额文件中。
+    if not set(wallet) <= _WALLET_META_KEYS:
+        raise BackupError(503, "wallet metadata has an unexpected key")
+    from .store import parse_utc_iso
+
+    if parse_utc_iso(wallet.get("created_at")) is None:
+        raise BackupError(503, "wallet metadata has a bad created_at")
+    for entry in shares:
+        if not isinstance(entry, dict) or set(entry) != _WALLET_SHARE_ENTRY_KEYS:
+            raise BackupError(503, "wallet metadata shares are malformed")
     try:
         wallet_pub = bytes.fromhex(public_hex)
     except ValueError:
@@ -604,18 +772,18 @@ def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) 
     share_files = {p for p in files if p.startswith(share_dir_prefix)}
     expected_share_files = set()
     for index, entry in enumerate(shares):
-        if not isinstance(entry, dict):
-            raise BackupError(503, "wallet metadata shares are malformed")
         share_id = entry.get("share_id")
         meta_pub_hex = entry.get("public_key")
         if not isinstance(share_id, str) or not isinstance(meta_pub_hex, str):
             raise BackupError(503, "wallet metadata shares are malformed")
         rel = f"{share_dir_prefix}{share_id}.json"
         expected_share_files.add(rel)
+        if rel not in files:
+            raise BackupError(503, "snapshot is missing an in-use share file")
         record = _load_json_object(files[rel], "share file")
         priv_hex = record.get("private_key")
         rec_pub_hex = record.get("public_key")
-        if (
+        if set(record) != _SHARE_RECORD_KEYS or (
             record.get("share_id") != share_id
             or not isinstance(priv_hex, str)
             or rec_pub_hex != meta_pub_hex
@@ -823,18 +991,27 @@ def _verify_requests_against_audit(
 
 
 def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
-    """对不被恢复器覆盖的业务文件（策略/审批单）做形状校验。"""
+    """对业务文件做严格形状与契约键校验（任何夹带/畸形一律 503）。
+
+    覆盖：审批策略、交易策略、审批单、已完成签名、轮换记录。审计/账本/
+    会话/暂存份额由线上恢复器做严格对账；此处补齐恢复器不逐键覆盖的
+    文件，保证非份额文件不含任何 private_key 字段、每类文件只含契约键。
+    """
     from .store import approval_policy_shape_ok, transaction_policy_shape_ok
 
     rel = f"policies/{wallet_id}.json"
     if rel in files:
         policy = _load_json_object(files[rel], "approval policy file")
-        if not approval_policy_shape_ok(policy):
+        if set(policy) != _APPROVAL_POLICY_KEYS or not approval_policy_shape_ok(
+            policy
+        ):
             raise BackupError(503, "approval policy file is malformed")
     rel = f"transaction-policies/{wallet_id}.json"
     if rel in files:
         policy = _load_json_object(files[rel], "transaction policy file")
-        if not transaction_policy_shape_ok(policy):
+        if set(policy) != _TRANSACTION_POLICY_KEYS or not (
+            transaction_policy_shape_ok(policy)
+        ):
             raise BackupError(503, "transaction policy file is malformed")
     rel = f"requests/{wallet_id}.json"
     if rel in files:
@@ -844,6 +1021,146 @@ def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
                 _request_shape_ok(key, record)
             ):
                 raise BackupError(503, "requests file is malformed")
+    _verify_signatures_shapes(wallet_id, files)
+    _verify_rotations_shapes(wallet_id, files)
+
+
+def _verify_signatures_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
+    """signatures/<W>.json：顶层对象，每键安全标识，记录恰为
+    {message, signature}，signature 为 128 字节 hex。绝不含私钥字段。"""
+    rel = f"signatures/{wallet_id}.json"
+    if rel not in files:
+        return
+    signatures = _load_json_object(files[rel], "signatures file")
+    for key, record in signatures.items():
+        if not isinstance(key, str) or not _SAFE_ID.match(key):
+            raise BackupError(503, "signatures file has a bad request id")
+        if not isinstance(record, dict) or set(record) != _SIGNATURE_RECORD_KEYS:
+            raise BackupError(503, "signature record is malformed")
+        message = record.get("message")
+        signature_hex = record.get("signature")
+        if not isinstance(message, str) or not message or not isinstance(
+            signature_hex, str
+        ):
+            raise BackupError(503, "signature record is malformed")
+        try:
+            signature = bytes.fromhex(signature_hex)
+        except ValueError:
+            raise BackupError(503, "signature is not hex")
+        if len(signature) != 128:
+            raise BackupError(503, "aggregate signature has a bad length")
+
+
+def _verify_rotations_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
+    """rotations/<W>.json：顶层对象，每键安全标识且等于记录 rotation_id，
+    记录只允许轮换契约键，state/share_ids/public_key 形状严格。"""
+    rel = f"rotations/{wallet_id}.json"
+    if rel not in files:
+        return
+    rotations = _load_json_object(files[rel], "rotations file")
+    for key, record in rotations.items():
+        if not isinstance(key, str) or not _SAFE_ID.match(key):
+            raise BackupError(503, "rotations file has a bad rotation id")
+        if not isinstance(record, dict) or not set(record) <= _ROTATION_RECORD_KEYS:
+            raise BackupError(503, "rotation record is malformed")
+        if record.get("rotation_id") != key:
+            raise BackupError(503, "rotation record id does not match its key")
+        state = record.get("state")
+        if state not in ("prepared", "activating", "active"):
+            raise BackupError(503, "rotation record has a bad state")
+        share_ids = record.get("share_ids")
+        if (
+            not isinstance(share_ids, list)
+            or len(share_ids) != 2
+            or len(set(share_ids)) != 2
+            or not all(
+                isinstance(sid, str) and bool(_SAFE_SHARE_ID.match(sid))
+                for sid in share_ids
+            )
+        ):
+            raise BackupError(503, "rotation record has bad share_ids")
+        try:
+            if len(bytes.fromhex(record.get("public_key", ""))) != 64:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise BackupError(503, "rotation record has a bad public_key")
+        created_at = record.get("created_at")
+        if created_at is not None and not isinstance(created_at, str):
+            raise BackupError(503, "rotation record has a bad created_at")
+        previous = record.get("previous_public_key")
+        if state == "prepared":
+            if previous is not None:
+                raise BackupError(503, "prepared rotation carries a previous key")
+        elif previous is None:
+            # 已激活轮必须携带 previous_public_key，连续轮换时间线据此重建
+            raise BackupError(503, "active rotation lacks its previous key")
+        if previous is not None:
+            try:
+                if len(bytes.fromhex(previous)) != 64:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise BackupError(503, "rotation record has a bad previous key")
+
+
+def _json_contains_key(value: object, forbidden: str) -> bool:
+    """递归检查已解析 JSON 中是否出现名为 forbidden 的键。"""
+    if isinstance(value, dict):
+        if forbidden in value:
+            return True
+        return any(_json_contains_key(v, forbidden) for v in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_key(v, forbidden) for v in value)
+    return False
+
+
+def _verify_no_private_key_in_business_files(
+    wallet_id: str, files: dict[str, bytes]
+) -> None:
+    """非份额文件（wallets/业务目录）绝不得含任何 private_key 字段。
+
+    shares/<W>/* 与 rotation-staging/<W>/<rid>/<share>.json 是全系统唯一
+    允许存放份额私钥的位置；其余文件即使哈希自洽，夹带私钥字段也属隔离
+    破坏，一律 503。
+    """
+    for rel, data in files.items():
+        parts = rel.split("/")
+        if parts[0] in ("shares", "rotation-staging"):
+            continue
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            # 非 JSON 的白名单文件不存在；形状校验在他处统一处理
+            continue
+        if _json_contains_key(value, _PRIVATE_KEY_FIELD):
+            raise BackupError(503, "private key material outside share files")
+
+
+def _verify_staging_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
+    """rotation-staging 中合法快照只能含 prepared 新份额（恰三契约键）。
+
+    *.bak.json 激活备份已在 manifest 校验阶段拒绝；此处逐份校验暂存份额
+    记录形状（share_id/public_key/private_key，hex 长度），密码学对应关系
+    由 scratch 恢复器的 prepared 暂存校验负责。
+    """
+    prefix = f"rotation-staging/{wallet_id}/"
+    for rel, data in files.items():
+        if not rel.startswith(prefix):
+            continue
+        if rel.endswith(".bak.json") or rel.rsplit("/", 1)[-1] == "wallet.bak.json":
+            raise BackupError(503, "snapshot must not carry transient backups")
+        record = _load_json_object(data, "staged share file")
+        if set(record) != _SHARE_RECORD_KEYS:
+            raise BackupError(503, "staged share record is malformed")
+        expected_share_id = rel.rsplit("/", 1)[-1][: -len(".json")]
+        if record.get("share_id") != expected_share_id:
+            raise BackupError(503, "staged share id does not match its file")
+        try:
+            if len(bytes.fromhex(record.get("public_key", ""))) != 32 or len(
+                bytes.fromhex(record.get("private_key", ""))
+            ) != 32:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise BackupError(503, "staged share key has a bad length")
 
 
 def _verify_snapshot(
@@ -870,7 +1187,10 @@ def _verify_snapshot(
     )
     if wallet.get("wallet_id") != wallet_id:
         raise BackupError(503, "wallet file id does not match its file name")
+    _verify_no_private_key_in_business_files(wallet_id, files)
+    _verify_audit_contract(wallet_id, files)
     _verify_inuse_shares(wallet, files, wallet_id)
+    _verify_staging_shapes(wallet_id, files)
     _verify_business_shapes(wallet_id, files)
 
     scratch_dir = tempfile.mkdtemp(prefix="dr-verify-")
@@ -979,13 +1299,20 @@ def _read_restore_records(data_dir: str, wallet_id: str) -> dict:
         raise BackupError(503, "restore records are corrupt") from exc
     if (
         not isinstance(records, dict)
+        or set(records) != {"wallet_id", "snapshots"}
         or records.get("wallet_id") != wallet_id
         or not isinstance(records.get("snapshots"), dict)
     ):
         raise BackupError(503, "restore records are malformed")
     for sid, entry in records["snapshots"].items():
-        if not is_safe_id(sid) or not isinstance(entry, dict) or not isinstance(
-            entry.get("manifest_sha256"), str
+        digest = entry.get("manifest_sha256") if isinstance(entry, dict) else None
+        if (
+            not is_safe_id(sid)
+            or not isinstance(entry, dict)
+            or set(entry) != {"manifest_sha256"}
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)
         ):
             raise BackupError(503, "restore records are malformed")
     return records
@@ -1223,12 +1550,19 @@ def _resume_pending_restore(
     result: Optional[tuple[str, str]] = None
     for snapshot_id in sorted(os.listdir(wallet_txn_root)):
         txn = os.path.join(wallet_txn_root, snapshot_id)
-        if not is_safe_id(snapshot_id) or not os.path.isdir(txn):
+        if os.path.islink(txn) or not is_safe_id(snapshot_id) or not os.path.isdir(
+            txn
+        ):
             raise RecoveryError(
                 f"unexpected restore-txn entry under wallet {wallet_id!r}"
             )
         prepared_path = os.path.join(txn, MARKER_PREPARED)
         committed_path = os.path.join(txn, MARKER_COMMITTED)
+        for marker in (prepared_path, committed_path):
+            if os.path.islink(marker):
+                raise RecoveryError(
+                    f"refusing symbolic link restore marker {marker!r}"
+                )
         if os.path.exists(committed_path):
             _rollforward_restore(data_dir, wallet_id, snapshot_id)
             prepared = _read_marker(prepared_path)
