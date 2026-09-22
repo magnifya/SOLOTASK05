@@ -117,7 +117,8 @@
   仅在 `signed` 时存在（128 字节 hex，即两份份额签名的有序拼接）。
   视图不回传单个份额签名。
 - `GET .../sign-sessions/{id}` 返回视图；未知会话 `404`。查询与份额
-  投递都会**懒过期**：到点的 `collecting` 会话持久化为 `expired`。
+  投递都会**懒过期**：到点的 `collecting`/`ready` 会话原子持久化为
+  `expired` 并仅记一次 `action=expired` 事件（创建重放不触发懒过期）。
 - `POST .../sign-sessions/{id}/shares` 投递 `{"share_id", "signature"}`：
   仅接受**在用份额**对会话 `id` 与 `message` **直接拼接载荷**的有效
   Ed25519 份额签名（64 字节 hex）。首收 `201`；同份额同值重放 `200`、
@@ -127,18 +128,23 @@
   （与 `POST /sign` 同一套规则；只读校验，不改审批单状态）：门控通过
   转 `signed`（`201`）；门控失败返回 `409` 并保留 `ready`，审批补齐后
   重放任一份已收份额即重试，成功 `200`。`signed` 后任意重放均 `200`
-  同体。`ready`/`signed` 不再受会话超时约束。
+  同体。`signed`/`expired` 终态不再受会话超时约束（`ready` 与
+  `collecting` 一样到点过期，已收份额保留但终态不再聚合）。
 - 会话记录（`sign-sessions/<wallet_id>.json`，含份额签名但**不含任何
   私钥**）与审计事件都在每钱包跨进程事务锁内原子持久化：服务重启后
   collecting/ready/signed/expired 全部续作，并发（含多进程共用同一
   data-dir）只有一个首次聚合。创建以 `action=created` 事件为提交点
   （事件未落盘的残留记录重启即清），聚合以 `action=signed` 事件为唯一
   提交点（事件在则前滚补齐为唯一 signed，事件不在则回滚 ready 可重试）。
-  会话文件 JSON 损坏或形状异常时 fail-closed：常驻请求统一 `503`，
-  `serve` 拒绝就绪，保留现场不归一、不覆盖。
-- 份额轮换后：已 `signed` 会话的旧份额同值重放仍 `200`；未齐份会话只
-  能使用创建时快照的在用份额，旧份额补投 `400`；轮换后新建的会话使用
-  新份额。既有 `sign`、`share-sign` 与轮换行为不受影响。
+  会话文件 JSON 损坏、形状异常，或 JSON 可解析但时间（`expires_at`
+  非可解析 UTC 时间）、状态、事件顺序、份额（与相应公钥重验不符）或
+  聚合结果（与重算的有序聚合签名不符）矛盾时 fail-closed：常驻请求
+  统一 `503`，`serve` 拒绝就绪，保留现场不归一、不覆盖。
+- 份额轮换后：`collecting`/`ready` 会话改用钱包当前两份在用份额——
+  已收旧份额剔除、视图同步更新 `received_shares`/`missing_shares`，
+  新份额可继续投递并完成；失效旧份额投递 `400`。已 `signed` 会话保留
+  原聚合结果，旧份额同值重放仍 `200` 同体、异值 `409`；轮换后新建的
+  会话使用新份额。既有 `sign`、`share-sign` 与轮换行为不受影响。
 
 会话审计事件统一为 `session_event`（七字段
 `seq, type, at, request_id, actor_id, reason, details`，`request_id` 为
@@ -148,7 +154,7 @@
 | ---- | ---- | ---- |
 | `created` | 会话首次创建 | `{message, timeout_seconds}` |
 | `share_received` | 份额首次收妥（每份一次） | `{share_id, state: collecting\|ready}` |
-| `expired` | collecting 会话到点被懒过期（仅一次） | `{state: expired}` |
+| `expired` | collecting/ready 会话到点被懒过期（仅一次） | `{state: expired}` |
 | `signed` | 首次聚合成功（仅一次） | `{state: signed}` |
 
 重放（创建重放、同值份额重放、signed 重放、门控重试）不产生新事件；

@@ -1939,12 +1939,13 @@ class WalletService:
     def _session_expire_if_needed(
         self, wallet_id: str, record: dict
     ) -> dict:
-        """懒过期：collecting 会话到点则持久化为 expired 并原子记一次
-        action=expired 的 session_event。ready/signed 不再受到期时间约束
-        （两份已齐备，等待/重试门控）。调用方须持钱包事务锁。"""
-        if record["state"] == "collecting" and datetime.now(timezone.utc) >= (
-            _parse_iso(record["expires_at"])
-        ):
+        """懒过期：collecting/ready 会话到点则持久化为 expired 并原子记一次
+        action=expired 的 session_event（ready 的两份已收份额原样保留，但
+        终态不再聚合）。signed/expired 终态不再受到期时间约束。
+        调用方须持钱包事务锁。"""
+        if record["state"] in ("collecting", "ready") and datetime.now(
+            timezone.utc
+        ) >= (_parse_iso(record["expires_at"])):
             expired = dict(record)
             expired["state"] = "expired"
             self._store.update_sign_session(wallet_id, record["id"], expired)
@@ -1958,11 +1959,42 @@ class WalletService:
                     ),
                 )
             except BaseException:
-                # 状态/事件原子：事件未落盘恢复为 collecting
+                # 状态/事件原子：事件未落盘则恢复为原 collecting/ready
                 self._store.update_sign_session(wallet_id, record["id"], record)
                 raise
             record = expired
         return record
+
+    def _session_sync_rotation(
+        self, wallet_id: str, wallet: dict, record: dict
+    ) -> dict:
+        """轮换激活后，collecting/ready 会话改用钱包当前两份在用份额。
+
+        已收的旧份额一律剔除（其签名对新份额毫无意义），share_ids 换成
+        当前在用份额并按剩余份额数重算状态（ready 掉回 collecting），
+        视图随之同步 received_shares/missing_shares，新份额可继续投递
+        完成；失效旧份额的投递由后续"在用份额"判定返回 400。signed/
+        expired 终态会话保留原份额快照与聚合结果，绝不同步。同步本身
+        不记事件：恢复以 share_received 事件 ∩ 当前 share_ids 重建，
+        与同步后的记录天然一致。调用方须持钱包事务锁。"""
+        if record["state"] not in ("collecting", "ready"):
+            return record
+        current_ids = [s["share_id"] for s in wallet["shares"]]
+        if list(record["share_ids"]) == current_ids:
+            return record
+        kept = [
+            entry
+            for entry in record["shares"]
+            if entry["share_id"] in current_ids
+        ]
+        synced = dict(record)
+        synced["share_ids"] = current_ids
+        synced["shares"] = kept
+        synced["state"] = "ready" if len(kept) == REQUIRED_SHARES else (
+            "collecting"
+        )
+        self._store.update_sign_session(wallet_id, record["id"], synced)
+        return synced
 
     def create_sign_session(
         self,
@@ -2053,13 +2085,15 @@ class WalletService:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400
-                self._get_wallet_or_404(wallet_id)
+                wallet = self._get_wallet_or_404(wallet_id)
                 self._validate_session_id(session_id)
                 record = self._store.get_sign_session(wallet_id, session_id)
                 if record is None:
                     raise ServiceError(
                         404, f"sign session {session_id!r} not found"
                     )
+                # 轮换后 collecting/ready 会话先切换到当前在用份额
+                record = self._session_sync_rotation(wallet_id, wallet, record)
                 record = self._session_expire_if_needed(wallet_id, record)
                 return self._session_view(record)
         except CorruptDataError:
@@ -2171,7 +2205,10 @@ class WalletService:
                 raise ServiceError(
                     404, f"sign session {session_id!r} not found"
                 )
-            # 投递时懒过期：到点 collecting 持久化为 expired（记一次事件）
+            # 轮换后 collecting/ready 会话先切换到当前在用份额（剔除已收
+            # 旧份额），再判定懒过期与投递
+            record = self._session_sync_rotation(wallet_id, wallet, record)
+            # 投递时懒过期：到点 collecting/ready 持久化为 expired（记一次事件）
             record = self._session_expire_if_needed(wallet_id, record)
             if record["state"] == "expired":
                 # 状态判定优先于载荷校验：已过期一律 409（含畸形载荷）
@@ -2213,8 +2250,9 @@ class WalletService:
                 # collecting 重复投递 / signed 重放：200 同体，不记事件
                 return 200, self._session_view(record)
 
-            # 未收过的新份额：仅接受会话在用（创建时快照）且当前仍在钱包
-            # 在用的份额；轮换后的旧份额与不属于本会话的份额一律 400。
+            # 未收过的新份额：仅接受会话当前份额集（轮换后已同步为钱包
+            # 当前在用份额）且仍在钱包在用的份额；轮换后失效的旧份额与
+            # 不属于本会话的份额一律 400。
             if share_id not in session_ids or share_id not in share_pub:
                 raise ServiceError(
                     400, f"unknown or inactive share_id {share_id!r}"
@@ -2290,21 +2328,128 @@ class WalletService:
         signed_record = self._commit_session_signed(wallet_id, record)
         return 200, self._session_view(signed_record)
 
+    @staticmethod
+    def _map_wallet_public_key(
+        mapping: dict, share_ids: object, public_key_hex: object
+    ) -> None:
+        """把"钱包公钥（两份份额公钥有序拼接）"按下标映射到各 share_id。"""
+        if not isinstance(public_key_hex, str):
+            return
+        try:
+            raw = bytes.fromhex(public_key_hex)
+        except ValueError:
+            return
+        if len(raw) != 64 or not isinstance(share_ids, (list, tuple)):
+            return
+        if len(share_ids) != 2:
+            return
+        parts = crypto.split_public_key(raw)
+        for index, sid in enumerate(share_ids):
+            if isinstance(sid, str):
+                mapping.setdefault(sid, parts[index].hex())
+
+    def _session_share_public_keys(self, wallet_id: str) -> dict[str, str]:
+        """share_id -> 公钥 hex：覆盖当前在用份额与历代已激活轮换的份额。
+
+        当前在用份额取自钱包元数据；历代份额取自 share_rotation_activated
+        事件（details 含新 share_ids 与轮换后钱包公钥；最早一条的
+        previous_public_key 即初代钱包公钥，对应创建时的 SHARE_IDS）。
+        恢复据此重新校验会话中每份已存份额签名。
+        """
+        mapping: dict[str, str] = {}
+        wallet = self._store.get_wallet(wallet_id)
+        if wallet is not None:
+            for share in wallet.get("shares", []):
+                sid = share.get("share_id")
+                pub = share.get("public_key")
+                if isinstance(sid, str) and isinstance(pub, str):
+                    mapping[sid] = pub
+        activated = sorted(
+            self._activated_rotations(wallet_id).values(),
+            key=lambda event: event.get("seq", 0),
+        )
+        for index, event in enumerate(activated):
+            details = event.get("details")
+            if not isinstance(details, dict):
+                continue
+            if index == 0:
+                # 最早一次激活的 previous_public_key = 初代钱包公钥
+                self._map_wallet_public_key(
+                    mapping, SHARE_IDS, details.get("previous_public_key")
+                )
+            self._map_wallet_public_key(
+                mapping, details.get("share_ids"), details.get("public_key")
+            )
+        return mapping
+
+    @staticmethod
+    def _validate_session_event_order(
+        wallet_id: str, session_id: str, session_events: list[dict]
+    ) -> None:
+        """严格校验会话事件动作顺序（矛盾即 RecoveryError，现场原样保留）。
+
+        合法序列：created 恰好一次且为首；随后零或多条 share_received
+        （share_id 非空且互不重复）；末尾至多一条终态事件（signed 或
+        expired），终态之后绝不再有任何事件。轮换前的历史 share_received
+        （旧 share_id）是合法现场，不做份额集归属校验。"""
+        seen_share_ids: set[str] = set()
+        terminal_seen = False
+        for index, event in enumerate(session_events):
+            action = event["details"].get("action")
+            if index == 0:
+                if action != "created":
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        f"event log starts with {action!r}, not 'created'"
+                    )
+                continue
+            if terminal_seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} "
+                    "has events after a terminal (signed/expired) event"
+                )
+            if action == "share_received":
+                sid = event["details"].get("share_id")
+                if not isinstance(sid, str) or not sid:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has a share_received event without a share_id"
+                    )
+                if sid in seen_share_ids:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        f"has duplicate share_received events for {sid!r}"
+                    )
+                seen_share_ids.add(sid)
+            elif action in ("signed", "expired"):
+                terminal_seen = True
+            else:
+                # 重复的 created 或未知动作
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} "
+                    f"has an unexpected event action {action!r}"
+                )
+
     def _recover_sign_sessions(self, wallet_id: str) -> None:
         """启动/持锁恢复签名会话崩溃现场（调用方须持钱包事务锁）。
 
-        严格校验由存储层完成（损坏即 CorruptDataError -> 503/阻止就绪，
-        保留现场）。对账以 session_event 为唯一提交点，按事件重建现场，
-        恢复本身不记事件：
+        严格校验由存储层（形状/expires_at）与本方法（事件动作顺序、份额
+        签名重验、聚合签名重算比对）共同完成：任何 JSON 可解析但时间、
+        状态、事件、份额或聚合结果矛盾的现场都原样保留并抛
+        RecoveryError -> 常驻请求 503/阻止就绪。对账以 session_event 为
+        唯一提交点，按事件重建现场，恢复本身不记事件：
 
-        - 无 created 事件：创建未提交，删除残留会话记录；
+        - 无任何事件：创建未提交（created 未落盘），删除残留会话记录；
         - 已落盘份额若无对应 share_received 事件：份额提交未完成，丢弃
           （份额写入先于事件追加，正常原子流程不会出现，仅崩溃/篡改）；
         - 有 share_received 事件却找不到对应已存份额：无法安全对账，
           fail-closed；
-        - signed 事件：以两份已提交份额重算聚合签名，前滚为唯一 signed；
-        - expired 事件：终态 expired（此时已提交份额必不足两份，否则与
-          ready 不可过期矛盾，矛盾现场 fail-closed）；
+        - 每份已提交份额签名都用相应公钥（含历代轮换份额）重新校验，
+          验不过即矛盾现场，fail-closed；
+        - signed 事件：以两份已提交份额重算有序聚合签名，与记录不一致
+          即矛盾现场；一致则前滚为唯一 signed；
+        - expired 事件：终态 expired（collecting 与 ready 都可到点过期，
+          已提交份额原样保留，终态不再聚合）；
         - 否则按已提交份额数恢复为 collecting（<2）或 ready（2）：磁盘
           误写的 signed/ready/expired 随事件回滚，ready 可重试，collecting
           到点后由下一次访问重新懒过期（事件未落盘，过期从未生效）。
@@ -2313,6 +2458,7 @@ class WalletService:
         if not records:
             return
         events = self._audit.session_events(wallet_id)
+        public_keys: dict[str, str] | None = None
         for record in records:
             session_id = record["id"]
             session_events = sorted(
@@ -2323,24 +2469,25 @@ class WalletService:
                 ),
                 key=lambda event: event.get("seq", 0),
             )
-            actions = [event["details"]["action"] for event in session_events]
-            if "created" not in actions:
+            if not session_events:
+                # created 事件未落盘：创建未提交，删除残留会话记录
                 self._store.delete_sign_session(wallet_id, session_id)
                 continue
-            # 已提交（事件落盘）的份额，按 share_received 事件的 share_id 去重
-            committed_share_ids: list[str] = []
-            for event in session_events:
-                details = event["details"]
-                if details.get("action") != "share_received":
-                    continue
-                sid = details.get("share_id")
-                if isinstance(sid, str) and sid not in committed_share_ids:
-                    committed_share_ids.append(sid)
+            self._validate_session_event_order(
+                wallet_id, session_id, session_events
+            )
+            actions = [event["details"]["action"] for event in session_events]
+            # 已提交（事件落盘）的份额（顺序校验已保证 share_id 不重复）
+            committed_share_ids = [
+                event["details"]["share_id"]
+                for event in session_events
+                if event["details"]["action"] == "share_received"
+            ]
             stored = {
                 entry["share_id"]: entry for entry in record["shares"]
             }
             committed_entries = []
-            for sid in record["share_ids"]:  # 顺序固定为 share-1, share-2
+            for sid in record["share_ids"]:
                 if sid in committed_share_ids:
                     if sid not in stored:
                         raise RecoveryError(
@@ -2349,6 +2496,30 @@ class WalletService:
                             "signature"
                         )
                     committed_entries.append(stored[sid])
+            if committed_entries:
+                # 用相应公钥重新校验每份已提交的份额签名
+                if public_keys is None:
+                    public_keys = self._session_share_public_keys(wallet_id)
+                payload = crypto.build_payload(session_id, record["message"])
+                for entry in committed_entries:
+                    sid = entry["share_id"]
+                    public_hex = public_keys.get(sid)
+                    if public_hex is None:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} sign session {session_id!r} "
+                            f"has a committed share {sid!r} with no known "
+                            "public key"
+                        )
+                    if not crypto.verify_share(
+                        bytes.fromhex(public_hex),
+                        payload,
+                        bytes.fromhex(entry["signature"]),
+                    ):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} sign session {session_id!r} "
+                            f"has a stored signature for {sid!r} that does "
+                            "not verify"
+                        )
             signed_landed = "signed" in actions
             expired_landed = "expired" in actions
             rebuilt = dict(record)
@@ -2364,12 +2535,19 @@ class WalletService:
                 rebuilt["aggregate_signature"] = (
                     self._aggregate_session_shares(rebuilt).hex()
                 )
-            elif expired_landed:
-                if len(committed_entries) >= 2:
+                recorded = record.get("aggregate_signature")
+                if (
+                    recorded is not None
+                    and recorded != rebuilt["aggregate_signature"]
+                ):
                     raise RecoveryError(
                         f"wallet {wallet_id!r} sign session {session_id!r} "
-                        "is expired but both shares committed"
+                        "has a recorded aggregate signature that does not "
+                        "match the recomputed one"
                     )
+            elif expired_landed:
+                # collecting 与 ready 都可到点过期：已提交份额（含 ready
+                # 的两份）原样保留，终态不再聚合
                 rebuilt["state"] = "expired"
             else:
                 rebuilt["state"] = (

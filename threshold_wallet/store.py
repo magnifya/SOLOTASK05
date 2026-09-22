@@ -49,6 +49,7 @@ import re
 import shutil
 import tempfile
 import threading
+from datetime import datetime, timedelta
 from typing import Optional
 
 from .crypto import ShareKey, combine_public_keys, public_key_from_private
@@ -77,6 +78,22 @@ def _is_plain_int(value: object) -> bool:
 
 def _valid_safe_id(value: object) -> bool:
     return isinstance(value, str) and bool(_SAFE_ID.match(value))
+
+
+def _valid_utc_iso(value: object) -> bool:
+    """可解析的 UTC 时间字符串（如 2026-09-22T01:02:03.456789+00:00 或 Z 结尾）。
+
+    必须带时区且偏移恰为 0：朴素时间或其他时区偏移都不算 UTC 现场。
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+    )
 
 
 def approval_policy_shape_ok(policy: object) -> bool:
@@ -506,10 +523,10 @@ class WalletStore:
         """签名会话记录形状的严格校验（损坏文件 fail-closed 用）。
 
         要求：id 为安全标识且与键一致；message 为非空字符串；
-        timeout_seconds 为非布尔正整数；expires_at 为字符串；state 仅
-        collecting/ready/signed/expired；shares 为条目数组，share_id
-        不重复且为当前记录的份额；signed 时必须带 128 字节聚合签名；
-        collecting/ready/expired 不得带签名。"""
+        timeout_seconds 为非布尔正整数；expires_at 为可解析的 UTC 时间
+        字符串；state 仅 collecting/ready/signed/expired；shares 为条目
+        数组，share_id 不重复且为当前记录的份额；signed 时必须带 128 字节
+        聚合签名；collecting/ready/expired 不得带签名。"""
         if not isinstance(record, dict):
             return False
         if record.get("id") != key or not _valid_safe_id(key):
@@ -520,7 +537,7 @@ class WalletStore:
         timeout = record.get("timeout_seconds")
         if not _is_plain_int(timeout) or timeout <= 0:
             return False
-        if not isinstance(record.get("expires_at"), str):
+        if not _valid_utc_iso(record.get("expires_at")):
             return False
         if not isinstance(record.get("created_at"), str):
             return False
@@ -571,8 +588,9 @@ class WalletStore:
             if aggregate_hex is not None:
                 return False
         else:
-            # expired：超时只发生在收齐之前（collecting），故不足两份且无签名
-            if len(seen) >= 2 or aggregate_hex is not None:
+            # expired：collecting 或 ready 到点过期；已收份额（含 ready
+            # 的两份）原样保留供查询，但绝不再有聚合签名
+            if aggregate_hex is not None:
                 return False
         return True
 
