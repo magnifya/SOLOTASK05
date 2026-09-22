@@ -5,11 +5,13 @@
 - sign    对应 POST /v1/wallets/<wallet_id>/sign
 - show    对应 GET  /v1/wallets/<wallet_id>
 
-另有两个本地命令：
+另有本地命令：
 - serve       启动 HTTP 服务
 - share-sign  份额持有方辅助命令：用本机房份额私钥生成份额签名
               （签名内容为 signing_request_id 与 message 的拼接），
               输出可直接交给 sign 子命令的 {"share_id", "signature"}
+- backup      创建单钱包灾备快照（持锁恢复对账后只打包白名单文件）
+- restore     从灾备快照锁内校验并事务化恢复单钱包（幂等/冲突语义）
 
 客户端命令只通过 HTTP 与服务端交互；create/show 的响应中本就不含私钥。
 """
@@ -125,6 +127,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ss.add_argument("--share-id", required=True)
     p_ss.add_argument("--signing-request-id", required=True)
     p_ss.add_argument("--message", required=True)
+
+    # backup / restore（本地兼容灾备命令）
+    p_backup = sub.add_parser("backup", help="创建单钱包灾备快照")
+    p_backup.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p_backup.add_argument("--wallet-id", required=True)
+    p_backup.add_argument("--snapshot-id", required=True)
+    p_backup.add_argument("--output", required=True)
+
+    p_restore = sub.add_parser("restore", help="从灾备快照恢复单钱包")
+    p_restore.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p_restore.add_argument("--wallet-id", required=True)
+    p_restore.add_argument("--input", required=True)
 
     return parser
 
@@ -312,6 +326,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except Exception:
                 # 兜底：任何未预期异常也只落一行泛化 JSON，杜绝 traceback
                 return _fail("share-sign failed, refusing to sign")
+
+        elif args.command in ("backup", "restore"):
+            from .backup import (
+                BackupError,
+                create_backup,
+                restore_backup,
+            )
+
+            # 灾备命令的统一错误边界与 share-sign 相同：成功单行 JSON 到
+            # stdout；任何失败（参数非法、钱包缺失、恢复不可对账、备份
+            # 损坏、文件系统异常）都只落一行 {"error": ...} 到 stderr 并以
+            # 退出码 1 结束，绝不打印 traceback、私钥或签名载荷。
+            try:
+                if args.command == "backup":
+                    status, result = 201, create_backup(
+                        args.data_dir,
+                        args.wallet_id,
+                        args.snapshot_id,
+                        args.output,
+                    )
+                else:
+                    status, result = restore_backup(
+                        args.data_dir, args.wallet_id, args.input
+                    )
+            except BackupError as exc:
+                print(
+                    json.dumps(
+                        {"error": exc.message},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            except (OSError, ValueError):
+                return _fail("disaster recovery operation failed")
+            except Exception:
+                return _fail("disaster recovery operation failed")
+            _print_json(
+                {"status": status, **result},
+            )
+            return 0
 
         else:  # pragma: no cover - argparse 已保证不会到达
             return _fail(f"unknown command {args.command!r}")

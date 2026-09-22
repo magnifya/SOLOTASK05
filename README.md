@@ -381,6 +381,77 @@ python -m threshold_wallet.cli request-show --wallet-id alice \
 钱包事务锁内做懒恢复（自愈轮换/资产提交崩溃现场），再按当前在用份额
 签名；恢复失败或份额不存在时输出单行 JSON 到 stderr 并非零退出。
 
+## 兼容灾备（backup / restore）
+
+`backup` / `restore` 是不经 HTTP 的本地 CLI 子命令，按**单个钱包**做
+快照灾备，成功打印单行 JSON 到 stdout，失败打印单行 `{"error": ...}`
+到 stderr 并以退出码 1 结束。
+
+```bash
+# 备份钱包 alice 为快照 snap-1（snapshot_id 匹配 [A-Za-z0-9_-]{1,128}）
+python -m threshold_wallet.cli backup --data-dir ./data \
+    --wallet-id alice --snapshot-id snap-1 --output /backups/alice-snap-1.tar
+
+# 在另一个 data-dir 恢复
+python -m threshold_wallet.cli restore --data-dir ./data2 \
+    --wallet-id alice --input /backups/alice-snap-1.tar
+```
+
+### backup
+
+- 持有该钱包跨进程事务锁，**先恢复对账**：轮换现场、资产提交意图、
+  签名会话全部自愈到一致静止状态；不能对账即失败（503），绝不打包
+  半状态。钱包不存在返回 404；`snapshot_id` 非法返回 400；备份输出
+  路径不得位于 data-dir 内（400）。
+- **只打包该钱包白名单内的文件**（相对 tar 路径）：
+  `wallets/W.json`、`shares/W/*`、`signatures/W.json`、
+  `policies/W.json`、`requests/W.json`、`rotations/W.json`、
+  `rotation-staging/W/*`、`audit/W.json`、`assets/W.json`、
+  `asset-intents/W/*`（静止备份必为空）、
+  `transaction-policies/W.json`、`sign-sessions/W.json`。
+  `locks/`、`restore-txn/`、`restore-records/` 与其他钱包的数据一律
+  不打包。
+- 拒绝绝对路径 / `..` / 重复成员 / **符号链接**（含指向目录的链接）/
+  白名单外的额外文件 / 锁与原子写临时文件；静止后 `shares/W/` 必须恰
+  有钱包在用两份份额，prepared 轮换暂存目录必须与记录一一对应且恰含
+  两份新份额。
+- 备份为非压缩 tar，首个成员是 `manifest.json`。manifest 为 v1：
+  `{version: 1, wallet_id: W, snapshot_id: S, files: [{path, bytes,
+  sha256}, ...]}`；S 直接进入 manifest 并参与其规范化 SHA-256，故 S
+  与清单内容绑定。清单只记录路径/字节数/哈希，**绝不含私钥或签名
+  载荷**。
+- 成功 stdout 单行 JSON 含 `status=201`、`wallet_id`、`snapshot_id`、
+  `manifest` 与 `manifest_sha256`；失败 stderr 单行 error JSON、退出 1。
+
+### restore
+
+- `restore --data-dir D --wallet-id W --input B`：锁外先严格读取校验
+  tar（非压缩、首成员 manifest、成员全部是 W 的白名单常规文件、无
+  绝对/`..`/重复/额外/链接成员、字节数与 SHA-256 与 manifest 完全
+  一致），再持有该钱包事务锁完成恢复。
+- 锁内校验：备份**身份**（manifest.wallet_id 恰为 W、含钱包元数据）、
+  白名单哈希、各文件**形状**（审批策略、交易策略、审批单、签名记录）、
+  **公私钥**对应（每份在用份额与暂存新份额的 32 字节私钥必须推导出其
+  公钥，两份公钥按序拼接恰为钱包公钥）、**审计 seq**（严格 1..N 连续）、
+  **账本/会话/轮换一致性**（在私有暂存区上跑与常驻完全相同的恢复对账，
+  且恢复不得改动快照一字节）、**历史签名连续**（每条已保存签名沿轮换
+  公钥时间线取其提交时刻的在用公钥，拆开两半独立验签）。任一不通过
+  即 503 且**不写任何业务文件**。
+- 恢复是可恢复事务，工作区在 `restore-txn/W/S/`（白名单之外，常驻
+  请求不可见）：`staging/` 为快照暂存，`backup/` 为换入前 live 镜像与
+  捕获清单，`commit.json` 是唯一提交标记。流程为物化暂存→全部校验→
+  捕获 live→换入→写 commit 标记→记录并清理。崩溃后下次持锁访问（含
+  常驻请求自愈与启动恢复）按标记**前滚补齐**（标记在）或**按捕获镜像
+  精确回滚**（标记不在），期间任何请求都读不到半状态；无法安全对账时
+  fail-closed（阻止就绪/503）。
+- `restore-records/W.json` 只记录每个已提交快照的 S 与 manifest 哈希
+  （及时间戳），不含清单全文。首次恢复某快照 `status=201`；同一 S 且
+  manifest 哈希相同重放返回 `200` 且响应体相同；同一 S 但内容（哈希）
+  不同返回 `409`；备份损坏或不可对账返回 `503`。
+- 恢复**不新增审计事件**：恢复后余额、资产 `version`、签名幂等性、
+  审批/会话/轮换状态、历史签名验证全部连续；恢复到一个已有其他钱包的
+  data-dir 只替换 W 的白名单文件，不触碰其他钱包。
+
 ## 测试
 
 ```bash
@@ -404,5 +475,10 @@ python -m unittest discover -s tests -v
   mode 标识、整数上限与资产标识，不含私钥。
   可恢复签名会话（`sign-sessions/<wallet_id>.json`）只含原文、标识、
   到期时间、份额签名与 signed 时的聚合签名，**不含任何份额私钥**。
+  灾备快照的 manifest 只含每项的路径、字节数与 SHA-256，不含私钥或
+  签名载荷；恢复工作区（`restore-txn/<wallet_id>/<snapshot_id>/`，
+  含快照暂存与换入前镜像，成功或结清即删）与其他业务目录遵循同一
+  "每文件至多一个份额私钥、绝无完整私钥拼接"的边界；恢复记录
+  （`restore-records/<wallet_id>.json`）只存快照标识与 manifest 哈希。
   写入采用临时文件 + 原子替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。

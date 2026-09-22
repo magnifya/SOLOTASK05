@@ -12,11 +12,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
 
 from . import audit, crypto
+from . import backup as disaster_recovery
 from .audit import AuditStore
 from .flock import FileLock, wallet_lock_path
 from .store import (
@@ -140,6 +142,11 @@ class WalletService:
             | set(self._store.list_asset_ledger_wallet_ids())
             | set(self._store.list_sign_session_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
+            | set(
+                disaster_recovery.list_restore_txn_wallet_ids(
+                    self._store.data_dir
+                )
+            )
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
@@ -164,6 +171,12 @@ class WalletService:
         fail-closed，统一转成 RecoveryError，绝不把 ValueError 漏给调用方
         当成普通参数错误。"""
         try:
+            # 灾备恢复事务的崩溃现场最先按 commit 标记结清（前滚/回滚）：
+            # 换入后的 live 才是轮换/资产/会话恢复应当看到的现场；标记在
+            # 则换入不可撤回，标记不在则精确回到事务前。
+            disaster_recovery.recover_interrupted_restores(
+                self._store.data_dir, wallet_id
+            )
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
@@ -207,6 +220,19 @@ class WalletService:
         交由 _recover_wallet fail-closed。
         """
         try:
+            # 灾备恢复事务的崩溃现场（他进程 restore 在换入后、结清前异常
+            # 退出）：先按 commit 标记前滚/回滚，否则后续请求会读到换入了
+            # 一半的 live。正在运行的 restore 持同一把钱包锁，故此处只会
+            # 看到崩溃遗留、不会与在途事务交错。
+            txn_dir = os.path.join(
+                self._store.data_dir,
+                disaster_recovery.RESTORE_TXN_DIRNAME,
+                wallet_id,
+            )
+            if os.path.isdir(txn_dir):
+                disaster_recovery.recover_interrupted_restores(
+                    self._store.data_dir, wallet_id
+                )
             # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义
             # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
             # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
