@@ -30,7 +30,7 @@ import os
 import threading
 from typing import Optional
 
-from .store import CorruptDataError, WalletStore, _check_id
+from .store import CorruptDataError, WalletStore, _check_id, _is_plain_int
 
 #: 审计事件类型
 TYPE_POLICY_UPDATED = "policy_updated"
@@ -71,41 +71,76 @@ class AuditStore:
     def _read(self, wallet_id: str) -> Optional[dict]:
         return WalletStore._read_json(self._path(wallet_id))
 
+    def _load_strict(self, wallet_id: str) -> Optional[dict]:
+        """读取审计日志并做**语义一致性**严格校验。
+
+        JSON 可解析但存在以下任一语义矛盾时抛 CorruptDataError
+        （fail-closed，绝不返回重号/缺口序列，绝不把历史归一或覆盖）：
+        - 顶层不是对象、events 不是数组；
+        - 任一事件 seq 不是非布尔正整数；
+        - seq 不自 1 起严格连续（重号或缺口）；
+        - next_seq 存在且不是非布尔整数、或不等于 max(seq)+1。
+
+        文件不存在返回 None（尚无事件的正常空状态）。仅用于对外查询与
+        追加写入路径；恢复对账路径使用更宽松的 ``_read``，使审计损坏不
+        阻断与审计无关的路由与启动就绪（与 JSON 不可解析时的隔离一致）。
+        """
+        data = self._read(wallet_id)
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise CorruptDataError(
+                f"audit log for wallet {wallet_id!r} top-level value is not an object"
+            )
+        events = data.get("events")
+        if not isinstance(events, list):
+            raise CorruptDataError(
+                f"audit log for wallet {wallet_id!r} has no list-valued 'events'"
+            )
+        seqs: list[int] = []
+        for event in events:
+            if not isinstance(event, dict) or not _is_plain_int(
+                event.get("seq")
+            ) or event["seq"] < 1:
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has an event with an "
+                    "invalid seq"
+                )
+            seqs.append(event["seq"])
+        ordered = sorted(seqs)
+        if ordered != list(range(1, len(ordered) + 1)):
+            raise CorruptDataError(
+                f"audit log for wallet {wallet_id!r} has a non-consecutive or "
+                "duplicated seq"
+            )
+        if "next_seq" in data:
+            stored_next = data["next_seq"]
+            if (
+                not _is_plain_int(stored_next)
+                or stored_next != len(ordered) + 1
+            ):
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has an inconsistent next_seq"
+                )
+        return data
+
     def append_event(self, wallet_id: str, event: dict) -> dict:
         """原子追加一条事件，分配下一个 seq 并持久化，返回含 seq/at 的记录。
 
-        seq 从 1 起；同一 wallet 的写入在此串行化。调用方负责在更大的
-        每钱包事务锁内把状态变更与本调用绑定（失败时回滚状态）。
+        seq 从 1 起；同一 wallet 的写入在此串行化。追加前先做严格一致性
+        校验：在语义矛盾（重号/缺口/next_seq 不符）的日志上拒绝继续写，
+        抛 CorruptDataError 由调用方回滚状态并转 503，绝不把矛盾"补齐"
+        或覆盖历史。调用方负责在更大的每钱包事务锁内把状态变更与本调用
+        绑定（失败时回滚状态）。
         """
         path = self._path(wallet_id)
         with self._lock:
-            data = self._read(wallet_id)
+            data = self._load_strict(wallet_id)
             if data is None:
                 data = {"wallet_id": wallet_id, "next_seq": 1, "events": []}
-            events = data.get("events")
-            if not isinstance(events, list):
-                events = []
-                data["events"] = events
-            # 重启恢复：以文件中实际最大事件 seq 为准，与记录的 next_seq
-            # 互相校准取较大者，保证 seq 单调连续、不重号、不回退
-            # （同时兼容缺 next_seq 字段的旧文件）。
-            max_seq = 0
-            for existing in events:
-                seq = existing.get("seq") if isinstance(existing, dict) else None
-                if (
-                    isinstance(seq, int)
-                    and not isinstance(seq, bool)
-                    and seq > max_seq
-                ):
-                    max_seq = seq
-            stored_next = data.get("next_seq")
-            if (
-                not isinstance(stored_next, int)
-                or isinstance(stored_next, bool)
-                or stored_next < 1
-            ):
-                stored_next = 1
-            next_seq = max(stored_next, max_seq + 1)
+            events = data["events"]
+            # 严格加载已保证 seq 自 1 连续；下一个 seq 即长度 + 1。
+            next_seq = len(events) + 1
             stamped = dict(event)
             stamped["seq"] = next_seq
             events.append(stamped)
@@ -249,16 +284,17 @@ class AuditStore:
         无日志文件或范围内无事件时返回 []。返回的是记录副本，
         调用方修改不会影响存储内容。
         """
-        data = self._read(wallet_id)
+        data = self._load_strict(wallet_id)
         if not data:
             return []
-        # 按 seq 升序返回；即使历史文件事件顺序异常也保证可读、不乱序。
-        events = [
-            dict(event)
-            for event in data.get("events", [])
-            if isinstance(event, dict)
-            and isinstance(event.get("seq"), int)
-            and event["seq"] >= from_seq
-        ]
-        events.sort(key=lambda e: e["seq"])
+        # 严格加载已保证 seq 自 1 连续；仍按 seq 排序返回，使物理存储顺序
+        # 被外部打乱（内容仍是 1..n 排列）时公开响应依旧升序。
+        events = sorted(
+            (
+                dict(event)
+                for event in data["events"]
+                if event["seq"] >= from_seq
+            ),
+            key=lambda e: e["seq"],
+        )
         return events[:limit]

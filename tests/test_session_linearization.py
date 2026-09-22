@@ -50,6 +50,21 @@ def _child_deliver(data_dir, wallet_id, session_id, share_id, queue,
         queue.put((share_id, "ERR", repr(exc)))
 
 
+def _child_create_session(data_dir, wallet_id, session_id, queue,
+                          message="m", timeout=600):
+    try:
+        store = WalletStore(data_dir)
+        svc = WalletService(store)
+        status, body = svc.create_sign_session(
+            wallet_id, session_id, message, timeout
+        )
+        queue.put((status, body.get("state"), body.get("expires_at")))
+    except ServiceError as exc:
+        queue.put((exc.status, None, None))
+    except BaseException as exc:  # 不应有任何未预期异常
+        queue.put(("ERR", repr(exc), None))
+
+
 class CrossProcessSessionLinearizationTest(unittest.TestCase):
     N = 8
 
@@ -154,6 +169,40 @@ class CrossProcessSessionLinearizationTest(unittest.TestCase):
         self.assertEqual(actions.count("expired"), 1, actions)
         self.assertNotIn("signed", actions)
         self.assertEqual(len(actions), 4)  # created + 2 shares + expired
+
+    def test_concurrent_create_single_result(self):
+        # 多个独立进程并发创建同一 session_id：恰一个首建 201，其余同参
+        # 重放 200 同体，只有一条 created 事件，seq 连续。
+        self._fresh().create_wallet("w1", 2)
+        queue = self.ctx.Queue()
+        procs = [
+            self.ctx.Process(
+                target=_child_create_session,
+                args=(self.tmp, "w1", "cc0", queue),
+            )
+            for _ in range(self.N)
+        ]
+        for p in procs:
+            p.start()
+        results = self._drain(queue, self.N)
+        for p in procs:
+            p.join(timeout=30)
+            self.assertEqual(p.exitcode, 0)
+
+        statuses = [r[0] for r in results]
+        self.assertEqual(statuses.count(201), 1, results)
+        self.assertEqual(statuses.count(200), self.N - 1, results)
+        # 重放同体：state 与 expires_at 全部一致
+        self.assertEqual({r[1] for r in results}, {"collecting"})
+        self.assertEqual(len({r[2] for r in results}), 1, results)
+
+        svc2 = self._fresh()
+        actions = [
+            e["details"]["action"]
+            for e in svc2.get_audit_events("w1")["events"]
+            if e["type"] == "session_event"
+        ]
+        self.assertEqual(actions, ["created"], actions)
 
     def test_activation_interleaved_with_inflight_session(self):
         svc = self._fresh()

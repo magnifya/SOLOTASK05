@@ -556,7 +556,9 @@ class WalletStore:
             return False
         if parse_utc_iso(record.get("expires_at")) is None:
             return False
-        if not isinstance(record.get("created_at"), str):
+        # created_at 与 expires_at 同等严格：必须是可解析的 UTC 时间，
+        # 拒绝朴素时间（无 tz）与非零偏移，绝不按本地时间猜测。
+        if parse_utc_iso(record.get("created_at")) is None:
             return False
         state = record.get("state")
         if state not in ("collecting", "ready", "signed", "expired"):
