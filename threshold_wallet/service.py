@@ -94,19 +94,24 @@ class _WalletTransactionLock:
 class WalletService:
     """建钱包、查询钱包、校验并聚合两份额签名。"""
 
-    def __init__(self, store: WalletStore) -> None:
+    def __init__(self, store: WalletStore, recover: bool = True) -> None:
         self._store = store
         self._audit = AuditStore(store.data_dir)
         # 每钱包一把事务锁：串行化同一钱包的"状态变更 + 审计事件"，
         # ThreadingHTTPServer 并发下保证状态与事件原子、懒过期只记一次。
         self._wallet_locks: dict[str, threading.Lock] = {}
         self._wallet_locks_guard = threading.Lock()
-        # 启动恢复：崩溃时停留在 activating 的轮换先回滚为 prepared，
-        # 轮换残留按有效性判定保留或安全删除，然后才对外服务。
-        # 同一 data-dir 可能有另一存活进程正在服务，因此每个钱包的恢复
-        # 都在其跨进程事务锁内进行：对方在途的激活/签名提交完成后才
-        # 判定现场，对方已崩溃时 flock 自动释放、不会阻塞恢复。
-        self._recover_on_startup()
+        # 离线灾备命令（backup/restore）只操作单个钱包：它们传
+        # recover=False 跳过全局启动恢复，自行在该钱包锁内调用
+        # _heal_wallet 做同等的崩溃现场自愈，避免因不相关钱包的现场
+        # 让单个钱包的离线快照失败。
+        if recover:
+            # 启动恢复：崩溃时停留在 activating 的轮换先回滚为 prepared，
+            # 轮换残留按有效性判定保留或安全删除，然后才对外服务。
+            # 同一 data-dir 可能有另一存活进程正在服务，因此每个钱包的恢复
+            # 都在其跨进程事务锁内进行：对方在途的激活/签名提交完成后才
+            # 判定现场，对方已崩溃时 flock 自动释放、不会阻塞恢复。
+            self._recover_on_startup()
 
     def _thread_lock_for(self, wallet_id: str) -> threading.Lock:
         with self._wallet_locks_guard:
@@ -140,10 +145,17 @@ class WalletService:
             | set(self._store.list_asset_ledger_wallet_ids())
             | set(self._store.list_sign_session_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
+            | set(self._list_restore_txn_wallet_ids())
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
                 self._recover_wallet(wallet_id)
+
+    def _list_restore_txn_wallet_ids(self) -> list[str]:
+        """存在未完成灾备恢复事务（restore-txn）的钱包（延迟导入避免环）。"""
+        from . import drbackup
+
+        return drbackup.list_txn_wallet_ids(self._store.data_dir)
 
     def _activated_rotations(self, wallet_id: str) -> dict[str, dict]:
         """该钱包已落盘的 share_rotation_activated 事件映射。"""
@@ -164,6 +176,22 @@ class WalletService:
         fail-closed，统一转成 RecoveryError，绝不把 ValueError 漏给调用方
         当成普通参数错误。"""
         try:
+            # 灾备恢复事务的崩溃残留最先对账：committed 在则前滚到快照现场、
+            # 否则按 old/ 备份整体回滚到恢复前现场。必须先于审计/账本/轮换
+            # 校验——替换窗口内 data-dir 可能混有新旧两套文件，只有先把它
+            # 收敛成一个完整一致的现场，后续对账才有意义。
+            from . import drbackup
+
+            try:
+                drbackup._resume_pending_restore(self, wallet_id)
+            except drbackup.BackupError as exc:
+                # 灾备残留现场枚举/回滚时的严格校验失败（符号链接、白名单
+                # 外文件等）在启动/持锁恢复语义下同样是不可对账：统一转成
+                # RecoveryError，由上层 fail-closed（阻止就绪/503）。
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} restore transaction cannot be "
+                    f"reconciled: {exc.message}"
+                ) from exc
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
@@ -207,6 +235,21 @@ class WalletService:
         交由 _recover_wallet fail-closed。
         """
         try:
+            # 灾备恢复事务的崩溃残留优先收敛（committed 前滚/否则整体回滚），
+            # 再进入账本/会话/轮换的静止快路径：替换窗口内现场可能新旧混杂。
+            import os as _os
+
+            from . import drbackup
+
+            if _os.path.isdir(
+                _os.path.join(
+                    self._store.data_dir,
+                    drbackup.RESTORE_TXN_DIRNAME,
+                    wallet_id,
+                )
+            ):
+                self._recover_wallet(wallet_id)
+                return
             # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义
             # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
             # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。

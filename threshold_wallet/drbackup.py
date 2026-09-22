@@ -1,0 +1,1392 @@
+"""兼容灾备 CLI：``backup`` / ``restore``（离线快照与对账恢复）。
+
+本模块只处理**单个钱包**（--wallet-id W）的灾备，绝不触碰 data-dir 内
+其他钱包的任何文件：
+
+``backup --data-dir D --wallet-id W --snapshot-id S --output B``
+    在该钱包的跨进程事务锁内先自愈轮换/资产提交/签名会话的崩溃现场，
+    再按**白名单**逐文件读取、逐字节计算 sha256，打包成确定性 tar
+    （内含 manifest v1：W、S 与每项 path/bytes/sha256，manifest 主体
+    sha256 绑定含 S 在内的内容）。白名单之外（绝对路径/``..``/重复/符号
+    链接/额外文件/锁文件/临时文件）一律拒绝。无法对账（恢复失败/数据
+    损坏）即失败，绝不出包。
+
+``restore --data-dir D --wallet-id W --input B``
+    在钱包事务锁内先校验快照身份、白名单哈希、文件形状、公私钥对应、
+    审计 seq 连续、账本/会话/轮换一致性（失败不写盘），再以
+    ``restore-txn/<W>/<S>/`` 下的 prepared/committed 标记完成崩溃安全的
+    前滚/回滚替换；``restore-records/<W>.json`` 记录 S 与 manifest 哈希，
+    首次 201、同 S 同 manifest 200 同体、不同内容 409、损坏/不可对账 503。
+
+安全边界：恢复不新增审计事件，余额/version 不跳变，幂等保持，历史签名
+连续可验；响应与 manifest 只含公钥/标识/哈希/整数/业务原文，绝不含任何
+份额私钥。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+from typing import Optional
+
+from .service import WalletService
+from .store import CorruptDataError, RecoveryError, WalletStore
+
+#: snapshot_id / wallet_id 允许的字符（与存储层安全 id 一致）
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+#: share_id 允许的字符（<rotation_id>-share-N 最长 136）
+_SAFE_SHARE_ID = re.compile(r"^[A-Za-z0-9_-]{1,136}$")
+
+#: manifest 版本
+MANIFEST_VERSION = 1
+
+#: 快照内 manifest 成员的固定路径（必须且唯一）
+MANIFEST_MEMBER = "manifest.json"
+
+#: data-dir 下的灾备事务与记录目录
+RESTORE_TXN_DIRNAME = "restore-txn"
+RESTORE_RECORDS_DIRNAME = "restore-records"
+
+#: restore-txn 标记文件名
+MARKER_PREPARED = "prepared.json"
+MARKER_COMMITTED = "committed.json"
+
+#: 业务目录下的单文件成员（<dir>/<wallet_id>.json）
+_BUSINESS_FILE_DIRS = (
+    "audit",
+    "signatures",
+    "policies",
+    "requests",
+    "rotations",
+    "assets",
+    "transaction-policies",
+    "sign-sessions",
+)
+
+
+class BackupError(Exception):
+    """备份/恢复失败。``status`` 为对外语义状态码（400/404/409/503）。"""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def is_safe_id(value: object) -> bool:
+    """wallet_id / snapshot_id 是否匹配 [A-Za-z0-9_-]{1,128}。"""
+    return isinstance(value, str) and bool(_SAFE_ID.match(value))
+
+
+def sha256_hex(data: bytes) -> str:
+    """返回字节串的 sha256 hex。"""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_regular_file(path: str) -> bytes:
+    """读取普通文件字节；符号链接/非常规文件一律拒绝（绝不跟随链接）。"""
+    if os.path.islink(path):
+        raise BackupError(503, f"refusing to read symbolic link: {path}")
+    if not os.path.isfile(path):
+        raise BackupError(503, f"not a regular file: {path}")
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# ---- 白名单 ---------------------------------------------------------------
+
+def _wallet_members(wallet_id: str) -> list[str]:
+    """该钱包在快照中允许出现的非目录成员路径（文件须现存才打包）。"""
+    members = [f"wallets/{wallet_id}.json"]
+    members.extend(f"{d}/{wallet_id}.json" for d in _BUSINESS_FILE_DIRS)
+    return members
+
+
+def _scan_share_dir(data_dir: str, wallet_id: str) -> list[str]:
+    """枚举 shares/<W>/ 下的全部成员并严格校验，返回成员相对路径。
+
+    只允许名为 ``<合法 share_id>.json`` 的普通文件；符号链接、子目录、
+    非 .json、临时文件（.tmp-*）等任何额外条目一律拒绝。
+    """
+    base = os.path.join(data_dir, "shares", wallet_id)
+    return _scan_flat_dir(
+        base,
+        f"shares/{wallet_id}",
+        lambda name: (
+            name.endswith(".json")
+            and bool(_SAFE_SHARE_ID.match(name[: -len(".json")]))
+        ),
+    )
+
+
+def _scan_staging_dir(data_dir: str, wallet_id: str) -> list[str]:
+    """递归枚举 rotation-staging/<W>/ 下的全部成员并严格校验。
+
+    结构只能是 ``<rotation_id>/<file>`` 两层：rotation_id 为安全标识；
+    文件名只能是 ``<share_id>.json``、``<share_id>.bak.json`` 或
+    ``wallet.bak.json``。符号链接、更深层级或任何额外条目一律拒绝。
+    """
+    fs_root = os.path.join(data_dir, "rotation-staging", wallet_id)
+    members: list[str] = []
+    if not os.path.exists(fs_root) and not os.path.islink(fs_root):
+        return members
+    if os.path.islink(fs_root) or not os.path.isdir(fs_root):
+        raise BackupError(503, "rotation-staging wallet entry is not a directory")
+    with os.scandir(fs_root) as it:
+        rotations = list(it)
+    for rid_entry in sorted(rotations, key=lambda e: e.name):
+        if rid_entry.is_symlink():
+            raise BackupError(503, "refusing symbolic link in rotation-staging")
+        if not rid_entry.name or not _SAFE_ID.match(rid_entry.name):
+            raise BackupError(503, "unexpected entry in rotation-staging")
+        if not rid_entry.is_dir(follow_symlinks=False):
+            raise BackupError(503, "unexpected file in rotation-staging")
+        rid_fs = os.path.join(fs_root, rid_entry.name)
+        with os.scandir(rid_fs) as it2:
+            files = list(it2)
+        for f_entry in sorted(files, key=lambda e: e.name):
+            if f_entry.is_symlink():
+                raise BackupError(503, "refusing symbolic link in rotation-staging")
+            if not f_entry.is_file(follow_symlinks=False):
+                raise BackupError(503, "unexpected non-file in rotation-staging")
+            name = f_entry.name
+            ok = name == "wallet.bak.json" or (
+                name.endswith(".json")
+                and _SAFE_SHARE_ID.match(name[: -len(".json")])
+            ) or (
+                name.endswith(".bak.json")
+                and _SAFE_SHARE_ID.match(
+                    name[: -len(".bak.json")]
+                )
+            )
+            if not ok:
+                raise BackupError(503, "unexpected file in rotation-staging")
+            members.append(
+                f"rotation-staging/{wallet_id}/{rid_entry.name}/{name}"
+            )
+    return members
+
+
+def _scan_flat_dir(
+    fs_root: str, rel_root: str, name_ok
+) -> list[str]:
+    """枚举一个扁平目录：只接受通过 name_ok 的普通文件，其余一律拒绝。"""
+    if not os.path.exists(fs_root) and not os.path.islink(fs_root):
+        return []
+    if os.path.islink(fs_root) or not os.path.isdir(fs_root):
+        raise BackupError(503, f"{rel_root} is not a directory")
+    members: list[str] = []
+    with os.scandir(fs_root) as it:
+        entries = list(it)
+    for entry in sorted(entries, key=lambda e: e.name):
+        if entry.is_symlink():
+            raise BackupError(503, f"refusing symbolic link under {rel_root}")
+        if not entry.is_file(follow_symlinks=False):
+            raise BackupError(503, f"unexpected non-file under {rel_root}")
+        if not name_ok(entry.name):
+            raise BackupError(503, f"unexpected file under {rel_root}")
+        members.append(f"{rel_root}/{entry.name}")
+    return members
+
+
+def _iter_whitelist_files(data_dir: str, wallet_id: str) -> list[str]:
+    """枚举该钱包白名单内的现存相对路径（POSIX 风格，已排序、去重）。
+
+    覆盖：wallets/W.json、shares/W/*、业务目录 W（审计/审批/签名/策略/
+    交易策略/资产/会话/轮换）、rotation-staging/W/*（递归）。锁文件
+    （locks/）、资产提交意图（asset-intents/，恢复后必为空）、灾备事务
+    目录与原子写临时文件均不在白名单。
+    """
+    members: list[str] = []
+    for rel in _wallet_members(wallet_id):
+        path = os.path.join(data_dir, *rel.split("/"))
+        if os.path.exists(path) or os.path.islink(path):
+            if os.path.islink(path):
+                raise BackupError(503, "refusing symbolic link to a wallet file")
+            if not os.path.isfile(path):
+                raise BackupError(503, "wallet file is not a regular file")
+            members.append(rel)
+    members.extend(_scan_share_dir(data_dir, wallet_id))
+    members.extend(_scan_staging_dir(data_dir, wallet_id))
+    if len(members) != len(set(members)):
+        raise BackupError(503, "duplicate snapshot member detected")
+    return sorted(members)
+
+
+# ---- manifest -------------------------------------------------------------
+
+def _canonical_manifest_body(manifest: dict) -> bytes:
+    """manifest 参与哈希绑定的主体（不含自引用 manifest_sha256）。"""
+    body = {
+        "version": manifest["version"],
+        "wallet_id": manifest["wallet_id"],
+        "snapshot_id": manifest["snapshot_id"],
+        "files": manifest["files"],
+    }
+    return json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+
+def _build_manifest(
+    data_dir: str, wallet_id: str, snapshot_id: str
+) -> tuple[dict, list[tuple[str, bytes]]]:
+    """锁内、恢复完成后读取白名单文件，构造 manifest v1 与 (relpath, data)。
+
+    manifest 含 version/wallet_id/snapshot_id/files，每项 path/bytes/sha256；
+    manifest_sha256 绑定（含 S 在内的）主体哈希。任何符号链接/非常规文件/
+    路径异常都抛 BackupError。
+    """
+    relpaths = _iter_whitelist_files(data_dir, wallet_id)
+    files: list[dict] = []
+    payloads: list[tuple[str, bytes]] = []
+    for rel in relpaths:
+        path = os.path.join(data_dir, *rel.split("/"))
+        data = _read_regular_file(path)
+        files.append(
+            {
+                "path": rel,
+                "bytes": len(data),
+                "sha256": sha256_hex(data),
+            }
+        )
+        payloads.append((rel, data))
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "wallet_id": wallet_id,
+        "snapshot_id": snapshot_id,
+        "files": files,
+    }
+    manifest["manifest_sha256"] = sha256_hex(_canonical_manifest_body(manifest))
+    return manifest, payloads
+
+
+def _write_snapshot(
+    out_path: str, manifest: dict, payloads: list[tuple[str, bytes]]
+) -> None:
+    """把 manifest 与白名单文件按确定性顺序写入 tar（pax），原子替换。
+
+    全部成员为固定 mtime/属主/权限的普通文件：无绝对路径、无 ``..``、
+    无符号/硬链接/设备、无目录项之外的元数据。先写同目录临时文件再
+    os.replace，绝不留下半截快照。
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=out_dir, prefix=".snapshot-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as raw:
+            with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                manifest_bytes = json.dumps(
+                    manifest, ensure_ascii=False, sort_keys=True, indent=2
+                ).encode("utf-8") + b"\n"
+                _add_bytes(tar, MANIFEST_MEMBER, manifest_bytes)
+                for rel, data in payloads:
+                    _add_bytes(tar, rel, data)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(data)
+    info.mtime = 0
+    info.mode = 0o600
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.type = tarfile.REGTYPE
+    tar.addfile(info, io.BytesIO(data))
+
+
+def backup(
+    data_dir: str, wallet_id: str, snapshot_id: str, output: str
+) -> dict:
+    """执行一次备份，返回成功响应体（含 status/snapshot_id/manifest）。
+
+    在该钱包的跨进程事务锁内先自愈崩溃现场（轮换/资产提交/签名会话），
+    再读盘打包；恢复无法对账或数据损坏一律失败（503），绝不出包。
+    """
+    if not isinstance(output, str) or not output:
+        raise BackupError(400, "--output must be a non-empty path")
+    if not is_safe_id(wallet_id):
+        raise BackupError(400, "invalid wallet_id")
+    if not is_safe_id(snapshot_id):
+        raise BackupError(400, "invalid snapshot_id")
+    try:
+        service = WalletService(WalletStore(data_dir), recover=False)
+        with service._wallet_lock(wallet_id):
+            # 持锁自愈：先把他进程崩溃遗留的半完成轮换/提交/会话对账干净，
+            # 绝不打包半状态；恢复失败直接向上抛（fail-closed）。
+            service._heal_wallet(wallet_id)
+            if service._store.get_wallet(wallet_id) is None:
+                raise BackupError(404, f"wallet {wallet_id!r} not found")
+            manifest, payloads = _build_manifest(
+                data_dir, wallet_id, snapshot_id
+            )
+            _write_snapshot(output, manifest, payloads)
+    except BackupError:
+        raise
+    except (RecoveryError, CorruptDataError) as exc:
+        # 不回显内部对账细节，避免泄露任何密钥/载荷线索
+        raise BackupError(503, "wallet cannot be reconciled, backup refused") from exc
+    except OSError as exc:
+        raise BackupError(503, f"backup failed: {exc.__class__.__name__}") from exc
+    return {
+        "status": 201,
+        "snapshot_id": snapshot_id,
+        "manifest": manifest,
+    }
+
+
+# ---- 还原（读取快照）------------------------------------------------------
+
+def _is_whitelisted(wallet_id: str, rel: str) -> bool:
+    """成员相对路径是否属于该钱包白名单（不判断现存，只判形状/归属）。"""
+    parts = rel.split("/")
+    if rel == f"wallets/{wallet_id}.json":
+        return True
+    if (
+        len(parts) == 2
+        and parts[0] in _BUSINESS_FILE_DIRS
+        and parts[1] == f"{wallet_id}.json"
+    ):
+        return True
+    if (
+        len(parts) == 3
+        and parts[0] == "shares"
+        and parts[1] == wallet_id
+        and parts[2].endswith(".json")
+        and bool(_SAFE_SHARE_ID.match(parts[2][: -len(".json")]))
+    ):
+        return True
+    if (
+        len(parts) == 4
+        and parts[0] == "rotation-staging"
+        and parts[1] == wallet_id
+        and bool(_SAFE_ID.match(parts[2]))
+        and _staging_filename_ok(parts[3])
+    ):
+        return True
+    return False
+
+
+def _staging_filename_ok(name: str) -> bool:
+    if name == "wallet.bak.json":
+        return True
+    if name.endswith(".json") and bool(_SAFE_SHARE_ID.match(name[: -len(".json")])):
+        return True
+    return bool(
+        name.endswith(".bak.json")
+        and bool(_SAFE_SHARE_ID.match(name[: -len(".bak.json")]))
+    )
+
+
+def _validate_member_name(name: str) -> None:
+    """拒绝绝对路径、Windows 盘符/反斜杠、``..``/`.`/空段。"""
+    if not name or name.startswith("/") or "\\" in name or ":" in name:
+        raise BackupError(503, "illegal member path in snapshot")
+    parts = name.split("/")
+    for part in parts:
+        if part in ("", ".", ".."):
+            raise BackupError(503, "illegal member path in snapshot")
+
+
+def _read_snapshot(input_path: str) -> tuple[dict, dict[str, bytes]]:
+    """严格读取 tar：返回 (manifest, {relpath: bytes})。
+
+    拒绝：无法打开/非 tar、绝对/``..``/重复成员、符号链接/设备/硬链接等
+    非常规文件、白名单外成员、缺/多 manifest、manifest JSON/形状/哈希
+    绑定错误。调用方再做钱包身份与业务对账。
+    """
+    try:
+        tar = tarfile.open(input_path, mode="r:*")
+    except (tarfile.TarError, OSError) as exc:
+        raise BackupError(503, "snapshot is unreadable or not a tar archive") from exc
+    files: dict[str, bytes] = {}
+    manifest: Optional[dict] = None
+    try:
+        for member in tar.getmembers():
+            # PAX/GNU 的扩展头记录不会出现在 getmembers；任何残留的非常规
+            # 类型（目录/符号/硬链接/设备/PAX 头）一律拒绝。
+            if not member.isfile() or member.issym() or member.islnk():
+                raise BackupError(503, "snapshot contains a non-regular member")
+            name = member.name
+            _validate_member_name(name)
+            if name == MANIFEST_MEMBER:
+                if manifest is not None:
+                    raise BackupError(503, "duplicate manifest in snapshot")
+            elif not _is_whitelisted_path_any(name):
+                # 读取期还没有 wallet_id 上下文，用结构谓词初筛
+                raise BackupError(503, "snapshot contains a non-whitelisted member")
+            if name in files:
+                raise BackupError(503, "duplicate member in snapshot")
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                raise BackupError(503, "snapshot member is not readable")
+            with extracted:
+                data = extracted.read()
+            if len(data) != member.size:
+                raise BackupError(503, "snapshot member size mismatch")
+            if name == MANIFEST_MEMBER:
+                try:
+                    manifest = json.loads(data.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise BackupError(503, "manifest is not valid JSON") from exc
+            else:
+                files[name] = data
+    except tarfile.TarError as exc:
+        raise BackupError(503, "snapshot archive is corrupt") from exc
+    finally:
+        tar.close()
+    if manifest is None:
+        raise BackupError(503, "snapshot has no manifest")
+    manifest = _validate_manifest_shape(manifest, files)
+    return manifest, files
+
+
+def _is_whitelisted_path_any(rel: str) -> bool:
+    """读取期（尚无 wallet_id）的结构初筛：路径段必须是安全标识/文件名。"""
+    parts = rel.split("/")
+    if len(parts) == 2 and parts[0] == "wallets":
+        stem = parts[1][: -len(".json")] if parts[1].endswith(".json") else ""
+        return bool(_SAFE_ID.match(stem))
+    if len(parts) == 2 and parts[0] in _BUSINESS_FILE_DIRS:
+        stem = parts[1][: -len(".json")] if parts[1].endswith(".json") else ""
+        return bool(_SAFE_ID.match(stem))
+    if len(parts) == 3 and parts[0] == "shares":
+        return bool(_SAFE_ID.match(parts[1])) and parts[2].endswith(".json") and (
+            bool(_SAFE_SHARE_ID.match(parts[2][: -len(".json")]))
+        )
+    if len(parts) == 4 and parts[0] == "rotation-staging":
+        return bool(_SAFE_ID.match(parts[1])) and bool(
+            _SAFE_ID.match(parts[2])
+        ) and _staging_filename_ok(parts[3])
+    return False
+
+
+def _validate_manifest_shape(
+    manifest: object, files: dict[str, bytes]
+) -> dict:
+    """校验 manifest v1 形状、成员清单与每项字节/sha256，以及 S 绑定哈希。"""
+    if not isinstance(manifest, dict):
+        raise BackupError(503, "manifest is not a JSON object")
+    if manifest.get("version") != MANIFEST_VERSION:
+        raise BackupError(503, "unsupported manifest version")
+    wallet_id = manifest.get("wallet_id")
+    snapshot_id = manifest.get("snapshot_id")
+    if not is_safe_id(wallet_id) or not is_safe_id(snapshot_id):
+        raise BackupError(503, "manifest has invalid wallet or snapshot id")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise BackupError(503, "manifest files must be a list")
+    bound = manifest.get("manifest_sha256")
+    if not isinstance(bound, str):
+        raise BackupError(503, "manifest is missing its binding hash")
+    if sha256_hex(_canonical_manifest_body(manifest)) != bound:
+        raise BackupError(503, "manifest binding hash mismatch")
+    # 归一为"规范主体 + 绑定哈希"：保证同 S 同哈希的重放返回与首次逐字节
+    # 一致的 manifest（同体），忽略包内任何额外键/排版差异。
+    normalized = json.loads(_canonical_manifest_body(manifest))
+    normalized["manifest_sha256"] = bound
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BackupError(503, "manifest entry is not an object")
+        path = entry.get("path")
+        nbytes = entry.get("bytes")
+        digest = entry.get("sha256")
+        if not isinstance(path, str) or path in seen:
+            raise BackupError(503, "manifest has a missing or duplicate path")
+        seen.add(path)
+        if not _is_whitelisted(wallet_id, path):
+            raise BackupError(503, "manifest lists a non-whitelisted path")
+        if not isinstance(nbytes, int) or isinstance(nbytes, bool) or nbytes < 0:
+            raise BackupError(503, "manifest entry has a bad byte count")
+        if not isinstance(digest, str):
+            raise BackupError(503, "manifest entry has a bad sha256")
+        data = files.get(path)
+        if data is None or len(data) != nbytes or sha256_hex(data) != digest:
+            raise BackupError(503, "snapshot file fails its manifest hash")
+    extra = set(files) - seen
+    if extra:
+        raise BackupError(503, "snapshot contains files absent from the manifest")
+    if not any(p == f"wallets/{wallet_id}.json" for p in seen):
+        raise BackupError(503, "snapshot is missing the wallet metadata file")
+    # 激活备份（*.bak.json）只是激活事务窗口内的瞬态文件，持锁备份前的
+    # 自愈必然已回滚/清理：合法快照里出现它们等于打包了半状态，拒绝。
+    if any(
+        p.startswith(f"rotation-staging/{wallet_id}/")
+        and p.endswith(".bak.json")
+        for p in seen
+    ):
+        raise BackupError(503, "snapshot must not carry transient rotation backups")
+    return normalized
+
+
+def _load_json_object(data: bytes, what: str) -> dict:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BackupError(503, f"{what} is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise BackupError(503, f"{what} must be a JSON object")
+    return value
+
+
+# ---- 业务对账（形状/公私钥/审计/账本/会话/轮换/签名）--------------------
+
+def _request_shape_ok(key: str, record: object) -> bool:
+    """审批单记录的最小形状（state 机/审批人/时间窗）。"""
+    from .store import parse_utc_iso
+
+    if not isinstance(record, dict):
+        return False
+    if record.get("id") != key:
+        return False
+    if not isinstance(record.get("message"), str):
+        return False
+    if record.get("state") not in (
+        "pending", "approved", "rejected", "expired", "signed",
+    ):
+        return False
+    approvers = record.get("approvers")
+    if not isinstance(approvers, list) or not all(
+        isinstance(a, str) for a in approvers
+    ):
+        return False
+    if record.get("req") not in (1, 2):
+        return False
+    if parse_utc_iso(record.get("t0")) is None:
+        return False
+    t1 = parse_utc_iso(record.get("t1"))
+    if t1 is None or t1 <= parse_utc_iso(record.get("t0")):
+        return False
+    reason = record.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return False
+    return True
+
+
+def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) -> None:
+    """逐份校验当前在用份额：私钥 32 字节、推导公钥匹配、两份拼成钱包公钥。"""
+    from . import crypto
+
+    shares = wallet.get("shares")
+    public_hex = wallet.get("public_key")
+    if (
+        not isinstance(shares, list)
+        or len(shares) != 2
+        or len({s.get("share_id") for s in shares if isinstance(s, dict)}) != 2
+        or not isinstance(public_hex, str)
+    ):
+        raise BackupError(503, "wallet metadata shares are malformed")
+    try:
+        wallet_pub = bytes.fromhex(public_hex)
+    except ValueError:
+        raise BackupError(503, "wallet public_key is not hex")
+    if len(wallet_pub) != 64:
+        raise BackupError(503, "wallet public_key has a bad length")
+    pubs: list[bytes] = []
+    share_dir_prefix = f"shares/{wallet_id}/"
+    share_files = {p for p in files if p.startswith(share_dir_prefix)}
+    expected_share_files = set()
+    for index, entry in enumerate(shares):
+        if not isinstance(entry, dict):
+            raise BackupError(503, "wallet metadata shares are malformed")
+        share_id = entry.get("share_id")
+        meta_pub_hex = entry.get("public_key")
+        if not isinstance(share_id, str) or not isinstance(meta_pub_hex, str):
+            raise BackupError(503, "wallet metadata shares are malformed")
+        rel = f"{share_dir_prefix}{share_id}.json"
+        expected_share_files.add(rel)
+        record = _load_json_object(files[rel], "share file")
+        priv_hex = record.get("private_key")
+        rec_pub_hex = record.get("public_key")
+        if (
+            record.get("share_id") != share_id
+            or not isinstance(priv_hex, str)
+            or rec_pub_hex != meta_pub_hex
+        ):
+            raise BackupError(503, "share record does not match wallet metadata")
+        try:
+            priv = bytes.fromhex(priv_hex)
+            pub = bytes.fromhex(rec_pub_hex)
+        except ValueError:
+            raise BackupError(503, "share key is not hex")
+        if len(priv) != 32 or len(pub) != 32:
+            raise BackupError(503, "share key has a bad length")
+        try:
+            if crypto.public_key_from_private(priv) != pub:
+                raise BackupError(503, "share private/public key mismatch")
+        except (ValueError, TypeError):
+            raise BackupError(503, "share private key is invalid")
+        if pub != wallet_pub[32 * index: 32 * (index + 1)]:
+            raise BackupError(503, "share public keys do not form wallet public_key")
+        pubs.append(pub)
+    if share_files != expected_share_files:
+        raise BackupError(503, "share directory does not match the in-use share set")
+    if b"".join(pubs) != wallet_pub:
+        raise BackupError(503, "wallet public_key does not match its shares")
+
+
+def _verify_historical_signatures(
+    wallet_id: str, files: dict[str, bytes], scratch: WalletStore
+) -> None:
+    """每条已完成签名都能用其**签名时刻**的钱包公钥独立验通（连续可验）。
+
+    签名时刻公钥由审计轮换链确定：首个激活事件的 previous_public_key 为
+    创世公钥；每次激活的 public_key 自其 seq 起生效。签名以对应
+    request_signed 事件 seq 定位公钥。签名记录与 signed 事件必须一一对应、
+    message 一致；任一不符 fail-closed（503）。
+    """
+    from . import audit as audit_mod
+    from . import crypto
+
+    sig_rel = f"signatures/{wallet_id}.json"
+    if sig_rel not in files:
+        # 没有签名文件：有 signed 事件也算不一致（下方事件侧对账）
+        signatures = {}
+    else:
+        signatures = _load_json_object(files[sig_rel], "signatures file")
+    sig_by_id: dict[str, dict] = {}
+    for key, record in signatures.items():
+        if not isinstance(key, str) or not _SAFE_ID.match(key) or not isinstance(
+            record, dict
+        ):
+            raise BackupError(503, "signatures file is malformed")
+        message = record.get("message")
+        signature_hex = record.get("signature")
+        if not isinstance(message, str) or not isinstance(signature_hex, str):
+            raise BackupError(503, "signature record is malformed")
+        try:
+            signature = bytes.fromhex(signature_hex)
+        except ValueError:
+            raise BackupError(503, "signature is not hex")
+        if len(signature) != 128:
+            raise BackupError(503, "aggregate signature has a bad length")
+        sig_by_id[key] = {"message": message, "signature": signature}
+
+    audit_store = audit_mod.AuditStore(scratch.data_dir)
+    signed_events = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_SIGNED
+    )
+    activated = sorted(
+        audit_store.activated_rotation_events(wallet_id).values(),
+        key=lambda e: e.get("seq", 0),
+    )
+
+    wallet = _load_json_object(
+        files[f"wallets/{wallet_id}.json"], "wallet file"
+    )
+    try:
+        current_pub = bytes.fromhex(wallet["public_key"])
+    except (KeyError, ValueError, TypeError):
+        raise BackupError(503, "wallet public_key is invalid")
+    genesis_pub = (
+        bytes.fromhex(activated[0]["details"]["previous_public_key"])
+        if activated
+        else current_pub
+    )
+    if len(genesis_pub) != 64:
+        raise BackupError(503, "genesis public key has a bad length")
+
+    def public_key_at(seq: int) -> bytes:
+        effective = genesis_pub
+        for event in activated:
+            if event["seq"] < seq:
+                effective = bytes.fromhex(event["details"]["public_key"])
+            else:
+                break
+        return effective
+
+    signed_ids = set()
+    for event in signed_events:
+        rid = event.get("request_id")
+        details = event.get("details")
+        if not isinstance(rid, str) or not isinstance(details, dict):
+            raise BackupError(503, "request_signed event is malformed")
+        signed_ids.add(rid)
+        record = sig_by_id.get(rid)
+        if record is None:
+            raise BackupError(503, "signed audit event has no matching signature")
+        if details.get("message") != record["message"]:
+            raise BackupError(503, "signed event disagrees with its signature record")
+        public = public_key_at(event["seq"])
+        payload = rid.encode("utf-8") + record["message"].encode("utf-8")
+        halves_sig = (record["signature"][:64], record["signature"][64:])
+        halves_pub = (public[:32], public[32:])
+        for sig_half, pub_half in zip(halves_sig, halves_pub):
+            if not crypto.verify_share(pub_half, payload, sig_half):
+                raise BackupError(503, "historical signature does not verify")
+    if set(sig_by_id) != signed_ids:
+        raise BackupError(503, "signature records and signed events are inconsistent")
+
+
+def _verify_requests_against_audit(
+    wallet_id: str, files: dict[str, bytes], scratch: WalletStore
+) -> None:
+    """审批单文件与审计事件双向对账（启动恢复器不覆盖审批单，这里补全）。
+
+    - 每条审批单必有 request_created 事件且 message 一致；反之每个
+      request_created 事件必须有对应审批单；
+    - signed/expired/rejected 状态必有同名终态事件；pending 不得有终态；
+    - approved 的审批人集合/计数与 request_approved 事件一致；
+    - 有 request_signed 事件的单状态必须是 signed。
+    """
+    from . import audit as audit_mod
+
+    audit_store = audit_mod.AuditStore(scratch.data_dir)
+    rel = f"requests/{wallet_id}.json"
+    requests = (
+        _load_json_object(files[rel], "requests file") if rel in files else {}
+    )
+    created = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_CREATED
+    )
+    approved = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_APPROVED
+    )
+    rejected = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_REJECTED
+    )
+    expired = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_EXPIRED
+    )
+    signed = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_SIGNED
+    )
+    by_rid: dict[str, dict[str, list[dict]]] = {}
+    for kind, evs in (
+        ("created", created), ("approved", approved), ("rejected", rejected),
+        ("expired", expired), ("signed", signed),
+    ):
+        for ev in evs:
+            rid = ev.get("request_id")
+            if not isinstance(rid, str):
+                raise BackupError(503, "request audit event lacks request_id")
+            by_rid.setdefault(rid, {}).setdefault(kind, []).append(ev)
+
+    for rid, record in requests.items():
+        groups = by_rid.get(rid)
+        c_evs = (groups or {}).get("created", [])
+        if len(c_evs) != 1:
+            raise BackupError(503, "request record and created events disagree")
+        if c_evs[0].get("details", {}).get("message") != record["message"]:
+            raise BackupError(503, "request created event disagrees with record")
+        state = record["state"]
+        terminal_events = {
+            kind: len(groups.get(kind, [])) if groups else 0
+            for kind in ("signed", "expired", "rejected")
+        }
+        # 记录终态与审计终态必须严格一致，不允许多余/缺失
+        expected_terminal = {
+            "pending": None, "approved": None,
+            "signed": "signed", "expired": "expired", "rejected": "rejected",
+        }[state]
+        for kind, count in terminal_events.items():
+            want = 1 if kind == expected_terminal else 0
+            if count != want:
+                raise BackupError(
+                    503, "request terminal state disagrees with its events"
+                )
+        # 审批人集合（去重）与计数必须和 request_approved 事件一致；
+        # pending 允许已有部分批准但未达门槛，approved 必须恰达门槛。
+        approver_ids = [
+            e.get("actor_id") for e in (groups or {}).get("approved", [])
+        ]
+        if any(not isinstance(a, str) for a in approver_ids):
+            raise BackupError(503, "approve event lacks a valid actor_id")
+        if set(approver_ids) != set(record["approvers"]):
+            raise BackupError(503, "request approvers do not match its events")
+        if state == "approved" and len(record["approvers"]) != record["req"]:
+            raise BackupError(503, "approved request never reached its quorum")
+    # 反向：每个 request_created 事件都必须有审批单。注意无审批策略时
+    # /sign 可直接产生 request_signed 事件而没有审批单/created 事件，
+    # 那种单不在此对账范围内（其连续性由历史签名校验负责）。
+    for ev in created:
+        rid = ev.get("request_id")
+        if rid not in requests:
+            raise BackupError(503, "created event has no request record")
+
+
+def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
+    """对不被恢复器覆盖的业务文件（策略/审批单）做形状校验。"""
+    from .store import approval_policy_shape_ok, transaction_policy_shape_ok
+
+    rel = f"policies/{wallet_id}.json"
+    if rel in files:
+        policy = _load_json_object(files[rel], "approval policy file")
+        if not approval_policy_shape_ok(policy):
+            raise BackupError(503, "approval policy file is malformed")
+    rel = f"transaction-policies/{wallet_id}.json"
+    if rel in files:
+        policy = _load_json_object(files[rel], "transaction policy file")
+        if not transaction_policy_shape_ok(policy):
+            raise BackupError(503, "transaction policy file is malformed")
+    rel = f"requests/{wallet_id}.json"
+    if rel in files:
+        requests = _load_json_object(files[rel], "requests file")
+        for key, record in requests.items():
+            if not isinstance(key, str) or not _SAFE_ID.match(key) or not (
+                _request_shape_ok(key, record)
+            ):
+                raise BackupError(503, "requests file is malformed")
+
+
+def _verify_snapshot(
+    service: WalletService,
+    wallet_id: str,
+    manifest: dict,
+    files: dict[str, bytes],
+) -> None:
+    """锁内完整对账校验（失败抛 BackupError(503)，绝不写盘）。
+
+    做法：把候选文件写入**临时目录**，在其上运行与线上完全相同的启动恢复
+    （审计 seq 连续、轮换激活链、账本语义与 committed 事件、会话严格
+    加载），再显式校验在用份额公私钥、策略/审批单形状与全部历史签名。
+    合法快照是已对账现场，恢复器不得改动任何业务文件——若改动说明快照
+    夹带了半状态，同样拒绝。
+    """
+    import tempfile
+
+    from .store import CorruptDataError as _CD
+    from .store import RecoveryError as _RE
+
+    wallet = _load_json_object(
+        files[f"wallets/{wallet_id}.json"], "wallet file"
+    )
+    if wallet.get("wallet_id") != wallet_id:
+        raise BackupError(503, "wallet file id does not match its file name")
+    _verify_inuse_shares(wallet, files, wallet_id)
+    _verify_business_shapes(wallet_id, files)
+
+    scratch_dir = tempfile.mkdtemp(prefix="dr-verify-")
+    try:
+        for rel, data in files.items():
+            target = os.path.join(scratch_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                dir=os.path.dirname(target), prefix=".v-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, target)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+                raise
+        scratch_store = WalletStore(scratch_dir)
+        scratch_service = WalletService(scratch_store, recover=False)
+        try:
+            # 与线上同一套恢复/对账（孤立临时目录，无需真加锁）
+            scratch_service._recover_wallet(wallet_id)
+        except (_RE, _CD, ValueError, OSError) as exc:
+            raise BackupError(503, "snapshot cannot be reconciled") from exc
+
+        # 恢复后业务文件必须与快照逐字节一致：合法快照是静止已对账现场，
+        # 恢复器不应做任何归一化/前滚/回滚/清理。
+        for rel, original in files.items():
+            if rel == MANIFEST_MEMBER:
+                continue
+            path = os.path.join(scratch_dir, *rel.split("/"))
+            try:
+                with open(path, "rb") as f:
+                    recovered = f.read()
+            except OSError as exc:
+                raise BackupError(503, "snapshot is not a settled scene") from exc
+            if json.loads(recovered.decode("utf-8")) != json.loads(
+                original.decode("utf-8")
+            ):
+                raise BackupError(503, "snapshot captures an unsettled scene")
+
+        _verify_historical_signatures(wallet_id, files, scratch_store)
+        _verify_requests_against_audit(wallet_id, files, scratch_store)
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+# ---- restore-txn 标记与落盘 ----------------------------------------------
+
+def _txn_dir(data_dir: str, wallet_id: str, snapshot_id: str) -> str:
+    return os.path.join(
+        data_dir, RESTORE_TXN_DIRNAME, wallet_id, snapshot_id
+    )
+
+
+def _txn_old_dir(data_dir: str, wallet_id: str, snapshot_id: str) -> str:
+    return os.path.join(_txn_dir(data_dir, wallet_id, snapshot_id), "old")
+
+
+def _records_path(data_dir: str, wallet_id: str) -> str:
+    return os.path.join(
+        data_dir, RESTORE_RECORDS_DIRNAME, wallet_id + ".json"
+    )
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_write_json(path: str, value: dict) -> None:
+    _atomic_write_bytes(
+        path,
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+        + b"\n",
+    )
+
+
+def _read_restore_records(data_dir: str, wallet_id: str) -> dict:
+    """读取 restore-records/<W>.json；不存在返回空结构，损坏抛 BackupError。"""
+    path = _records_path(data_dir, wallet_id)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {"wallet_id": wallet_id, "snapshots": {}}
+    except OSError as exc:
+        raise BackupError(503, "restore records are unreadable") from exc
+    try:
+        records = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BackupError(503, "restore records are corrupt") from exc
+    if (
+        not isinstance(records, dict)
+        or records.get("wallet_id") != wallet_id
+        or not isinstance(records.get("snapshots"), dict)
+    ):
+        raise BackupError(503, "restore records are malformed")
+    for sid, entry in records["snapshots"].items():
+        if not is_safe_id(sid) or not isinstance(entry, dict) or not isinstance(
+            entry.get("manifest_sha256"), str
+        ):
+            raise BackupError(503, "restore records are malformed")
+    return records
+
+
+def _write_restore_records(
+    data_dir: str, wallet_id: str, records: dict
+) -> None:
+    _atomic_write_json(_records_path(data_dir, wallet_id), records)
+
+
+def _safe_join(base: str, rel: str) -> str:
+    """把白名单相对路径接到 base 下，二次杜绝穿越。"""
+    parts = rel.split("/")
+    target = os.path.join(base, *parts)
+    abs_base = os.path.abspath(base)
+    abs_target = os.path.abspath(target)
+    if abs_target != abs_base and not abs_target.startswith(abs_base + os.sep):
+        raise BackupError(503, "illegal restore path")
+    return target
+
+
+def _list_current_relpaths(data_dir: str, wallet_id: str) -> list[str]:
+    """当前 data-dir 中该钱包白名单内现存文件（复用备份期的严格枚举）。"""
+    return _iter_whitelist_files(data_dir, wallet_id)
+
+
+def _commit_restore(
+    data_dir: str,
+    wallet_id: str,
+    snapshot_id: str,
+    manifest: dict,
+    files: dict[str, bytes],
+) -> None:
+    """prepared 标记之后执行替换：备份现状 → 写入目标 → 删除多余文件。"""
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
+    current = _list_current_relpaths(data_dir, wallet_id)
+    backup_paths: list[str] = []
+    for rel in current:
+        src = _safe_join(data_dir, rel)
+        dst = _safe_join(old_root, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        backup_paths.append(rel)
+    # 备份清单写入 prepared（回滚依据），随后落目标文件。
+    prepared = {
+        "wallet_id": wallet_id,
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "old_files": backup_paths,
+    }
+    _atomic_write_json(os.path.join(txn, MARKER_PREPARED), prepared)
+
+    for rel, data in files.items():
+        target = _safe_join(data_dir, rel)
+        _atomic_write_bytes_target(target, data)
+
+    target_set = set(files)
+    for rel in current:
+        if rel not in target_set:
+            try:
+                os.unlink(_safe_join(data_dir, rel))
+            except FileNotFoundError:
+                pass
+    _prune_empty_leaf_dirs(data_dir, wallet_id)
+
+
+def _atomic_write_bytes_target(target: str, data: bytes) -> None:
+    directory = os.path.dirname(target)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _prune_empty_leaf_dirs(data_dir: str, wallet_id: str) -> None:
+    """删除替换后变空的钱包份额/暂存叶子目录（绝不删共享业务根目录）。"""
+    staging_wallet = os.path.join(
+        data_dir, "rotation-staging", wallet_id
+    )
+    if os.path.isdir(staging_wallet):
+        for rid in list(os.listdir(staging_wallet)):
+            rid_dir = os.path.join(staging_wallet, rid)
+            try:
+                if os.path.isdir(rid_dir) and not os.listdir(rid_dir):
+                    os.rmdir(rid_dir)
+            except OSError:
+                pass
+        try:
+            if not os.listdir(staging_wallet):
+                os.rmdir(staging_wallet)
+        except OSError:
+            pass
+    shares_wallet = os.path.join(data_dir, "shares", wallet_id)
+    try:
+        if os.path.isdir(shares_wallet) and not os.listdir(shares_wallet):
+            os.rmdir(shares_wallet)
+    except OSError:
+        pass
+
+
+def _rollback_restore(
+    data_dir: str, wallet_id: str, snapshot_id: str, prepared: dict
+) -> None:
+    """committed 标记缺失：用 old/ 备份还原现场并清理事务目录。"""
+    old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
+    old_files = prepared.get("old_files")
+    if not isinstance(old_files, list) or not all(isinstance(p, str) for p in old_files):
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} marker is malformed"
+        )
+    target_paths = _list_current_relpaths(data_dir, wallet_id)
+    old_set = set(old_files)
+    # 删除回滚后不应存在的文件（含本次新写入的目标）。
+    for rel in target_paths:
+        if rel not in old_set:
+            try:
+                os.unlink(_safe_join(data_dir, rel))
+            except FileNotFoundError:
+                pass
+    for rel in old_files:
+        src = _safe_join(old_root, rel)
+        dst = _safe_join(data_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+    _prune_empty_leaf_dirs(data_dir, wallet_id)
+    shutil.rmtree(_txn_dir(data_dir, wallet_id, snapshot_id), ignore_errors=True)
+    _prune_empty_txn_parents(data_dir, wallet_id)
+
+
+def _rollforward_restore(
+    data_dir: str, wallet_id: str, snapshot_id: str
+) -> None:
+    """committed 标记在：确保目标文件齐备（按标记前滚）。
+
+    committed 标记只在全部目标文件原子落盘、多余文件删除**之后**才写入，
+    故标记在即表示替换窗口已完成：这里校验每个目标成员都以普通文件存在，
+    并删除标记之外多出的白名单文件。成员内容的正确性已在落盘前由全量
+    对账保证；缺文件（标记在却无文件）属无法安全补齐的现场，抛
+    RecoveryError（fail-closed），绝不猜写。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    committed_path = os.path.join(txn, MARKER_COMMITTED)
+    try:
+        with open(committed_path, "rb") as f:
+            committed = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise RecoveryError(
+            f"committed restore marker for {wallet_id!r}/{snapshot_id!r} "
+            "is unreadable"
+        ) from exc
+    files = committed.get("files")
+    if not isinstance(files, list) or not all(isinstance(p, str) for p in files):
+        raise RecoveryError(
+            f"committed restore marker for {wallet_id!r}/{snapshot_id!r} "
+            "is malformed"
+        )
+    for rel in files:
+        path = _safe_join(data_dir, rel)
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise RecoveryError("committed restore target is missing")
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            raise RecoveryError("committed restore target is missing") from exc
+    # 现场即目标（commit 在删除多余文件之后才打标记）；清理多余白名单文件。
+    present = set(_list_current_relpaths(data_dir, wallet_id))
+    wanted = set(files)
+    for rel in present - wanted:
+        try:
+            os.unlink(_safe_join(data_dir, rel))
+        except FileNotFoundError:
+            pass
+    _prune_empty_leaf_dirs(data_dir, wallet_id)
+
+
+def _finalize_committed_restore(
+    data_dir: str, wallet_id: str, snapshot_id: str, manifest_sha256: str
+) -> None:
+    """committed 前滚成功后：补登 restore-records（幂等）并清理事务目录。"""
+    records = _read_restore_records(data_dir, wallet_id)
+    existing = records["snapshots"].get(snapshot_id)
+    if existing is None:
+        records["snapshots"][snapshot_id] = {
+            "manifest_sha256": manifest_sha256
+        }
+        _write_restore_records(data_dir, wallet_id, records)
+    elif existing.get("manifest_sha256") != manifest_sha256:
+        raise RecoveryError(
+            f"restore record for {snapshot_id!r} disagrees with committed marker"
+        )
+    shutil.rmtree(
+        _txn_dir(data_dir, wallet_id, snapshot_id), ignore_errors=True
+    )
+    _prune_empty_txn_parents(data_dir, wallet_id)
+
+
+def _prune_empty_txn_parents(data_dir: str, wallet_id: str) -> None:
+    """清理变空的 restore-txn/<W>/ 与 restore-txn/ 目录（best-effort）。"""
+    wallet_root = os.path.join(data_dir, RESTORE_TXN_DIRNAME, wallet_id)
+    top_root = os.path.join(data_dir, RESTORE_TXN_DIRNAME)
+    for path in (wallet_root, top_root):
+        try:
+            if os.path.isdir(path) and not os.listdir(path):
+                os.rmdir(path)
+        except OSError:
+            pass
+
+
+def _resume_pending_restore(
+    service: WalletService, wallet_id: str
+) -> Optional[tuple[str, str]]:
+    """在钱包锁内自愈未完成的 restore-txn（崩溃窗口残留）。
+
+    - 只有 prepared、无 committed：回滚为备份现场，删除事务目录；
+    - committed 在：前滚确认目标齐备，补登 restore-records，清理目录。
+
+    返回本次完成提交的 (snapshot_id, manifest_sha256)（用于幂等返回），
+    无残留返回 None。无法安全对账抛 RecoveryError（fail-closed）。
+    """
+    data_dir = service._store.data_dir
+    wallet_txn_root = os.path.join(data_dir, RESTORE_TXN_DIRNAME, wallet_id)
+    if not os.path.isdir(wallet_txn_root):
+        return None
+    result: Optional[tuple[str, str]] = None
+    for snapshot_id in sorted(os.listdir(wallet_txn_root)):
+        txn = os.path.join(wallet_txn_root, snapshot_id)
+        if not is_safe_id(snapshot_id) or not os.path.isdir(txn):
+            raise RecoveryError(
+                f"unexpected restore-txn entry under wallet {wallet_id!r}"
+            )
+        prepared_path = os.path.join(txn, MARKER_PREPARED)
+        committed_path = os.path.join(txn, MARKER_COMMITTED)
+        if os.path.exists(committed_path):
+            _rollforward_restore(data_dir, wallet_id, snapshot_id)
+            prepared = _read_marker(prepared_path)
+            manifest_sha256 = prepared.get("manifest_sha256")
+            if not isinstance(manifest_sha256, str):
+                # committed 已落盘但 prepared 异常：以 committed 标记哈希为准
+                try:
+                    with open(committed_path, "rb") as f:
+                        committed = json.loads(f.read().decode("utf-8"))
+                    manifest_sha256 = committed.get("manifest_sha256")
+                except (OSError, ValueError, UnicodeDecodeError):
+                    manifest_sha256 = None
+            if not isinstance(manifest_sha256, str):
+                raise RecoveryError(
+                    f"committed restore for {snapshot_id!r} has no manifest hash"
+                )
+            _finalize_committed_restore(
+                data_dir, wallet_id, snapshot_id, manifest_sha256
+            )
+            result = (snapshot_id, manifest_sha256)
+            continue
+        if os.path.exists(prepared_path):
+            prepared = _read_marker(prepared_path)
+            _rollback_restore(data_dir, wallet_id, snapshot_id, prepared)
+            continue
+        # 空事务目录（极端残留）：直接清掉
+        shutil.rmtree(txn, ignore_errors=True)
+    try:
+        if os.path.isdir(wallet_txn_root) and not os.listdir(wallet_txn_root):
+            os.rmdir(wallet_txn_root)
+    except OSError:
+        pass
+    return result
+
+
+def _read_marker(path: str) -> dict:
+    try:
+        with open(path, "rb") as f:
+            value = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise RecoveryError(f"restore marker {path!r} is unreadable") from exc
+    if not isinstance(value, dict):
+        raise RecoveryError(f"restore marker {path!r} is malformed")
+    return value
+
+
+def list_txn_wallet_ids(data_dir: str) -> list[str]:
+    """启动恢复扫描：存在 restore-txn 钱包目录的全部 wallet_id。"""
+    root = os.path.join(data_dir, RESTORE_TXN_DIRNAME)
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []
+    return sorted(
+        name
+        for name in names
+        if _SAFE_ID.match(name) and os.path.isdir(os.path.join(root, name))
+    )
+
+
+def _restore_body(
+    status: int,
+    wallet_id: str,
+    snapshot_id: str,
+    manifest_sha256: str,
+    manifest: dict,
+) -> dict:
+    return {
+        "status": status,
+        "wallet_id": wallet_id,
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest_sha256,
+        "manifest": manifest,
+    }
+
+
+def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
+    """执行一次对账恢复，返回 (201|200, 响应体)；失败抛 BackupError。"""
+    if not isinstance(input_path, str) or not input_path:
+        raise BackupError(400, "--input must be a non-empty path")
+    if not is_safe_id(wallet_id):
+        raise BackupError(400, "invalid wallet_id")
+
+    # 读包与 manifest 形状/哈希绑定校验不依赖锁，先做快速失败。
+    manifest, files = _read_snapshot(input_path)
+    if manifest["wallet_id"] != wallet_id:
+        raise BackupError(409, "snapshot belongs to a different wallet")
+    snapshot_id = manifest["snapshot_id"]
+    manifest_sha256 = manifest["manifest_sha256"]
+
+    try:
+        service = WalletService(WalletStore(data_dir), recover=False)
+        with service._wallet_lock(wallet_id):
+            # 先完成上一次崩溃残留的 restore 前滚/回滚，再做线上现场自愈，
+            # 确保任何判定都不基于半状态。
+            _resume_pending_restore(service, wallet_id)
+            service._heal_wallet(wallet_id)
+
+            records = _read_restore_records(data_dir, wallet_id)
+            existing = records["snapshots"].get(snapshot_id)
+            if existing is not None:
+                if existing.get("manifest_sha256") == manifest_sha256:
+                    # 同 S 同 manifest：200 同体（重放包的 S 绑定哈希已在
+                    # 读包阶段验通且与记录一致，故其 manifest 即原 manifest）。
+                    return 200, _restore_body(
+                        200, wallet_id, snapshot_id, manifest_sha256, manifest
+                    )
+                # 同 S 不同内容：409，绝不覆盖既有恢复点
+                raise BackupError(
+                    409,
+                    f"snapshot {snapshot_id!r} was already restored from "
+                    "different content",
+                )
+
+            # 全量对账校验（临时目录内运行线上恢复器）；失败绝不写盘。
+            _verify_snapshot(service, wallet_id, manifest, files)
+
+            txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+            os.makedirs(txn, exist_ok=True)
+            try:
+                _commit_restore(
+                    data_dir, wallet_id, snapshot_id, manifest, files
+                )
+                committed = {
+                    "wallet_id": wallet_id,
+                    "snapshot_id": snapshot_id,
+                    "manifest_sha256": manifest_sha256,
+                    "files": sorted(files),
+                }
+                _atomic_write_json(
+                    os.path.join(txn, MARKER_COMMITTED), committed
+                )
+            except BaseException:
+                # 同步故障窗口：committed 未确认落盘即按回滚处理，绝不留下
+                # 新现场半状态。
+                prepared_path = os.path.join(txn, MARKER_PREPARED)
+                if os.path.exists(prepared_path):
+                    try:
+                        _rollback_restore(
+                            data_dir, wallet_id, snapshot_id,
+                            _read_marker(prepared_path),
+                        )
+                    except RecoveryError:
+                        pass
+                else:
+                    shutil.rmtree(txn, ignore_errors=True)
+                raise
+
+            # committed 已落盘：提交不可撤回。此后崩溃也只前滚。
+            _finalize_committed_restore(
+                data_dir, wallet_id, snapshot_id, manifest_sha256
+            )
+    except BackupError:
+        raise
+    except RecoveryError as exc:
+        raise BackupError(503, "restore cannot be reconciled") from exc
+    except (CorruptDataError, ValueError, OSError) as exc:
+        raise BackupError(503, "restore failed, data left untouched") from exc
+    return 201, _restore_body(
+        201, wallet_id, snapshot_id, manifest_sha256, manifest
+    )

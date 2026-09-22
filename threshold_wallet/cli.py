@@ -126,6 +126,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_ss.add_argument("--signing-request-id", required=True)
     p_ss.add_argument("--message", required=True)
 
+    # backup（兼容灾备：离线快照）
+    p_backup = sub.add_parser(
+        "backup", help="打包单个钱包的灾备快照（本地，离线）"
+    )
+    p_backup.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p_backup.add_argument("--wallet-id", required=True)
+    p_backup.add_argument("--snapshot-id", required=True)
+    p_backup.add_argument("--output", required=True)
+
+    # restore（兼容灾备：对账恢复）
+    p_restore = sub.add_parser(
+        "restore", help="从灾备快照对账恢复单个钱包（本地，离线）"
+    )
+    p_restore.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p_restore.add_argument("--wallet-id", required=True)
+    p_restore.add_argument("--input", required=True)
+
     return parser
 
 
@@ -312,6 +329,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except Exception:
                 # 兜底：任何未预期异常也只落一行泛化 JSON，杜绝 traceback
                 return _fail("share-sign failed, refusing to sign")
+
+        elif args.command in ("backup", "restore"):
+            from . import drbackup
+
+            # 灾备命令的统一错误边界（与 share-sign 一致）：stdout 为空、
+            # stderr 仅一行 {"error": ...}、退出码 1；绝不打印 traceback、
+            # 私钥或签名载荷。
+            try:
+                if args.command == "backup":
+                    result = drbackup.backup(
+                        args.data_dir,
+                        args.wallet_id,
+                        args.snapshot_id,
+                        args.output,
+                    )
+                    _print_json(result)
+                    return 0
+                status, body = drbackup.restore(
+                    args.data_dir, args.wallet_id, args.input
+                )
+                _print_json(body)
+                return 0
+            except drbackup.BackupError as exc:
+                return _fail(exc.message)
+            except Exception:
+                return _fail("disaster-recovery operation failed")
 
         else:  # pragma: no cover - argparse 已保证不会到达
             return _fail(f"unknown command {args.command!r}")

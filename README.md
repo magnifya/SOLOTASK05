@@ -381,6 +381,72 @@ python -m threshold_wallet.cli request-show --wallet-id alice \
 钱包事务锁内做懒恢复（自愈轮换/资产提交崩溃现场），再按当前在用份额
 签名；恢复失败或份额不存在时输出单行 JSON 到 stderr 并非零退出。
 
+## 兼容灾备（backup / restore）
+
+两个**离线**子命令直接在 `--data-dir` 上工作（不经 HTTP），只操作单个
+钱包 `--wallet-id W`，绝不触碰 data-dir 内其他钱包的任何文件。
+
+```bash
+# 打包快照
+python -m threshold_wallet.cli backup --data-dir ./data \
+     --wallet-id alice --snapshot-id snap-2026-09-23 --output ./alice.tar
+
+# 在（通常是空的）新 data-dir 上对账恢复
+python -m threshold_wallet.cli restore --data-dir ./data2 \
+     --wallet-id alice --input ./alice.tar
+```
+
+### backup
+
+- `snapshot_id` 必须匹配 `[A-Za-z0-9_-]{1,128}`，否则失败退出。
+- 在该钱包的跨进程事务锁内**先恢复轮换、资产意图、签名会话现场**
+  （与线上同一套启动/懒恢复），无法对账即失败（**不能对账不出包**）。
+- 仅打包该钱包白名单内文件：`wallets/W.json`、`shares/W/*`、业务目录
+  中 W 的单文件（`audit`/`signatures`/`policies`/`requests`/
+  `rotations`/`assets`/`transaction-policies`/`sign-sessions`）、以及
+  `rotation-staging/W/*`。
+- 拒绝：绝对路径、`..` 穿越、重复成员、符号链接、白名单外的额外文件、
+  锁文件（`locks/`）、原子写临时文件与激活备份（`*.bak.json`，只可能
+  存在于激活事务窗口，持锁自愈后必已清理）。
+- 产物为确定性 tar：首项 `manifest.json`（manifest v1），其余为白名单
+  普通文件成员。manifest 含 `version`、`wallet_id`、`snapshot_id` 与
+  每项 `{path, bytes, sha256}`；`manifest_sha256` 绑定**含 S 在内**的
+  manifest 主体 sha256，故 S 与内容不可被分别篡改。manifest 只含
+  标识/公钥/哈希/整数/业务原文，**绝不含份额私钥**。
+- 成功 stdout 为单行 JSON：`{"status": 201, "snapshot_id", "manifest"}`；
+  失败 stderr 为单行 `{"error": ...}` 且退出码 1（钱包不存在 404、
+  非法标识 400、无法对账/读盘失败 503）。
+
+### restore
+
+- `--input` 指向 backup 产物。在该钱包事务锁内：先按 `restore-txn`
+  标记收敛上一次崩溃的恢复，再自愈线上现场，然后做**全量校验，失败绝不
+  写盘**：
+  - 身份：manifest 的 `wallet_id` 必须等于命令行 W，否则 409；
+  - 白名单与哈希：成员路径合法、无重复/链接/额外文件，每项字节数与
+    sha256 必须与 manifest 一致，manifest 绑定哈希必须验通；
+  - 形状/公私钥：各 JSON 形状严格校验；当前在用两份份额私钥各为 32 字节、
+    可推导出份额公钥、两份拼成钱包公钥；
+  - 审计 `seq` 必须自 1 起连续；账本 version/余额重算自洽且与
+    `asset_operation_committed` 事件一一对应；签名会话按其
+    `session_event` 严格对账（含历史公钥逐份重验、聚合签名重算）；
+    轮换激活链连续；审批单与请求类事件双向一致；
+  - 每条已完成签名都能用其**签名时刻**（由轮换链确定）的钱包公钥拆半
+    独立验通，保证历史签名连续。
+- 提交是崩溃安全事务：先在 `restore-txn/W/S/` 写 `prepared.json` 并把
+  替换前的文件完整备份到其 `old/`，再原子替换目标文件、删除多余文件，
+  最后写 `committed.json` 作为唯一提交点。崩溃后（启动恢复或下次持锁
+  访问）按标记处理：`committed` 在则**前滚**补齐，否则用 `old/`
+  **整体回滚**并清理。恢复窗口期内任何请求都看不到半状态。
+- 提交完成后在 `restore-records/W.json` 记录 `S` 与 `manifest_sha256`。
+  恢复本身**不新增审计事件**、不改余额/version、不破坏幂等与历史签名。
+- 结果语义：首次恢复 `status=201`；同 S 且同 manifest 重放 `status=200`
+  且返回体逐字节相同（同体）；同 S 但内容不同返回 `409`（不覆盖既有
+  恢复点）；快照损坏或不可对账返回 `503` 且现场不变。
+- 成功 stdout 为单行 JSON：`{"status", "wallet_id", "snapshot_id",
+  "manifest_sha256", "manifest"}`；失败 stderr 单行 `{"error": ...}`、
+  退出码 1。响应、日志与快照都不泄露份额私钥。
+
 ## 测试
 
 ```bash
