@@ -767,6 +767,126 @@ class WalletStore:
         _check_id("wallet_id", wallet_id)
         self._read_asset_ledger(wallet_id)
 
+    def asset_ledger_file_exists(self, wallet_id: str) -> bool:
+        """该钱包的账本文件是否存在（存在即需语义/事件对账，哪怕为空）。"""
+        return os.path.exists(self._assets_path(wallet_id))
+
+    def check_asset_ledger_semantics(self, wallet_id: str) -> dict:
+        """在形状合法的前提下，对账本做**语义**对账（纯账本，不读审计）。
+
+        形状合法只能保证字段类型正确，无法发现 JSON 可解析但自相矛盾的
+        现场；本方法按正常服务只会写出的不变量重算：
+
+        - 每条操作（pending/committed）都必须携带非布尔整数
+          balance/version 快照（服务落盘的 R 恒含这两项）；
+        - 对每个资产，按 version 升序的 committed 操作必须恰为
+          version 1..K（不缺号、不重号、起点为 1），且余额从 0 起按
+          delta 逐条累加，每个前缀余额都必须非负、与记录快照一致；
+        - K>=1 时资产条目必须恰为 {balance: 末态, version: K}；
+          K=0（只有/没有 pending）时不得存在资产条目；
+        - pending 操作的 (balance, version) 快照必须等于该资产某条已提交
+          前缀（version 在 0..K 内且余额与重算前缀一致）——快照是创建
+          时刻的账本状态，提交交错时它可能落后于当前末态。
+
+        任一矛盾抛 CorruptDataError（fail-closed，保留现场），绝不带
+        矛盾账本继续创建/提交/查询。返回校验后的账本供上层与审计对账。
+        """
+        _check_id("wallet_id", wallet_id)
+        ledger = self._read_asset_ledger(wallet_id)
+        operations = ledger["operations"]
+        assets = ledger["assets"]
+
+        asset_ids: set[str] = set()
+        pending_by_asset: dict[str, list[dict]] = {}
+        committed_by_asset: dict[str, list[dict]] = {}
+        for record in operations.values():
+            asset_id = record["asset_id"]
+            asset_ids.add(asset_id)
+            if (
+                not _is_plain_int(record.get("balance"))
+                or not _is_plain_int(record.get("version"))
+            ):
+                raise CorruptDataError(
+                    f"asset ledger for wallet {wallet_id!r} operation "
+                    f"{record.get('operation_id')!r} lacks a snapshot"
+                )
+            if record["state"] == "committed":
+                committed_by_asset.setdefault(asset_id, []).append(record)
+            else:
+                pending_by_asset.setdefault(asset_id, []).append(record)
+
+        for asset_id, entry in assets.items():
+            asset_ids.add(asset_id)
+
+        prefix_balances: dict[str, list[int]] = {}
+        for asset_id in asset_ids:
+            commits = committed_by_asset.get(asset_id, [])
+            ordered = sorted(commits, key=lambda r: r["version"])
+            versions = [r["version"] for r in ordered]
+            k_total = len(ordered)
+            if versions != list(range(1, k_total + 1)):
+                raise CorruptDataError(
+                    f"asset ledger for wallet {wallet_id!r} asset "
+                    f"{asset_id!r} has non-contiguous committed versions"
+                )
+            balances = [0]
+            balance = 0
+            for ordinal, record in enumerate(ordered, start=1):
+                if record["version"] != ordinal:
+                    raise CorruptDataError(
+                        f"asset ledger for wallet {wallet_id!r} asset "
+                        f"{asset_id!r} version ordering is inconsistent"
+                    )
+                balance += record["delta"]
+                if balance < 0:
+                    # 余额不足的提交在正常流程会被 409 拒绝：负余额前缀
+                    # 只可能是外部篡改/丢失操作
+                    raise CorruptDataError(
+                        f"asset ledger for wallet {wallet_id!r} asset "
+                        f"{asset_id!r} goes negative"
+                    )
+                if record["balance"] != balance:
+                    raise CorruptDataError(
+                        f"asset ledger for wallet {wallet_id!r} asset "
+                        f"{asset_id!r} balance does not recompute"
+                    )
+                balances.append(balance)
+            prefix_balances[asset_id] = balances
+
+            entry = assets.get(asset_id)
+            if k_total == 0:
+                if entry is not None:
+                    # 无任何已提交操作却存在资产条目：半完成/矛盾现场
+                    raise CorruptDataError(
+                        f"asset ledger for wallet {wallet_id!r} asset "
+                        f"{asset_id!r} exists without committed operations"
+                    )
+            elif entry != {"balance": balance, "version": k_total}:
+                raise CorruptDataError(
+                    f"asset ledger for wallet {wallet_id!r} asset "
+                    f"{asset_id!r} entry does not match its committed tail"
+                )
+
+        for asset_id, pendings in pending_by_asset.items():
+            balances = prefix_balances[asset_id]
+            k_total = len(balances) - 1
+            for record in pendings:
+                version = record["version"]
+                if not 0 <= version <= k_total:
+                    raise CorruptDataError(
+                        f"asset ledger for wallet {wallet_id!r} operation "
+                        f"{record['operation_id']!r} snapshot version is out "
+                        "of the committed prefix range"
+                    )
+                if record["balance"] != balances[version]:
+                    # pending 快照必须等于创建时刻（某条已提交前缀）的余额
+                    raise CorruptDataError(
+                        f"asset ledger for wallet {wallet_id!r} operation "
+                        f"{record['operation_id']!r} snapshot balance does not "
+                        "match the committed prefix"
+                    )
+        return ledger
+
     def list_asset_ledger_wallet_ids(self) -> list[str]:
         """返回存在资产账本文件的全部 wallet_id（启动恢复扫描用）。
 

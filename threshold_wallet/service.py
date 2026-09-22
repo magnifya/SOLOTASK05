@@ -139,6 +139,7 @@ class WalletService:
             | set(self._store.list_asset_intent_wallet_ids())
             | set(self._store.list_asset_ledger_wallet_ids())
             | set(self._store.list_sign_session_wallet_ids())
+            | set(self._audit.list_audit_wallet_ids())
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
@@ -163,14 +164,21 @@ class WalletService:
         fail-closed，统一转成 RecoveryError，绝不把 ValueError 漏给调用方
         当成普通参数错误。"""
         try:
-            # 先校验资产账本：账本损坏时任何对账都不可信，直接 fail-closed。
-            self._store.check_asset_ledger(wallet_id)
+            # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
+            # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
+            self._audit.check_log(wallet_id)
+            # 先校验资产账本（形状 + 语义）：账本损坏时任何对账都不可信，
+            # 直接 fail-closed。
+            self._store.check_asset_ledger_semantics(wallet_id)
             self._store.recover_wallet_rotation(
                 wallet_id,
                 self._activated_rotations(wallet_id),
                 self._prepared_rotations(wallet_id),
             )
             self._recover_wallet_asset_commits(wallet_id)
+            # 意图清零后再做账本 ↔ asset_operation_committed 事件的双向
+            # 对账：提交事件与 committed 操作必须一一对应、details 即 R。
+            self._reconcile_asset_committed_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except RecoveryError:
             raise
@@ -199,10 +207,10 @@ class WalletService:
         交由 _recover_wallet fail-closed。
         """
         try:
-            # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状损坏时
-            # 无法与意图/事件对账，绝不能静默当成空账本。任何持锁访问都
-            # 先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
-            self._store.check_asset_ledger(wallet_id)
+            # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义
+            # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
+            # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
+            self._store.check_asset_ledger_semantics(wallet_id)
             # 签名会话文件形状损坏同样 fail-closed，绝不把坏会话当空会话。
             # 这里只做形状校验；会话对账必须排在轮换/资产恢复之后——会话
             # 迁移依据"当前在用份额"，而他进程崩溃遗留的半完成激活可能仍
@@ -262,6 +270,11 @@ class WalletService:
                 return
             # 轮换现场静止后，再对他进程崩溃遗留的半完成会话对账（无会话
             # 文件时立即返回，零开销；此时读取审计不影响审计无关路由）。
+            # 账本文件存在时同理做账本 ↔ committed 事件对账：只有存在
+            # 账本现场时才需要读取审计，保持"无业务文件的纯钱包不依赖
+            # 审计日志"的既有可用性边界。
+            if self._store.asset_ledger_file_exists(wallet_id):
+                self._reconcile_asset_committed_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except RecoveryError:
             raise
@@ -1305,6 +1318,92 @@ class WalletService:
         """
         for operation_id, intent in self._store.list_asset_intents(wallet_id):
             self._resolve_asset_commit_intent(wallet_id, operation_id, intent)
+
+    def _reconcile_asset_committed_events(self, wallet_id: str) -> None:
+        """账本 committed 操作与 asset_operation_committed 事件双向对账
+        （调用方须持钱包事务锁；意图残留须已先恢复清零）。
+
+        唯一提交点是审计事件：
+
+        - 每条 committed 操作必须恰有一条同 request_id 的事件，
+          ``details`` 与账本中的 committed 视图 R 逐字段一致；
+        - 每条 committed 事件必须对应一条账本 committed 操作
+          （有事件无操作＝事件被半应用或历史被删，fail-closed）；
+        - pending 操作不得有 committed 事件；
+        - 同一 operation_id 出现多条 committed 事件＝重复提交点，
+          fail-closed。
+
+        审计日志损坏（CorruptDataError）同样向上抛出，由调用方 fail-closed。
+        """
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        committed_ops: dict[str, dict] = {
+            op_id: record
+            for op_id, record in ledger["operations"].items()
+            if record["state"] == "committed"
+        }
+        pending_ops = {
+            op_id
+            for op_id, record in ledger["operations"].items()
+            if record["state"] == "pending"
+        }
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_ASSET_OPERATION_COMMITTED
+        )
+        events_by_op: dict[str, dict] = {}
+        for event in events:
+            op_id = event.get("request_id")
+            details = event.get("details")
+            if not isinstance(op_id, str):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an asset_operation_committed "
+                    "event without an operation id"
+                )
+            if op_id in events_by_op:
+                # 重复提交点：绝不任取一条
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple committed events for "
+                    f"asset operation {op_id!r}"
+                )
+            if (
+                not isinstance(details, dict)
+                or details.get("operation_id") != op_id
+                or not isinstance(details.get("asset_id"), str)
+                or not isinstance(details.get("delta"), int)
+                or isinstance(details.get("delta"), bool)
+                or details.get("delta") == 0
+                or details.get("state") != "committed"
+                or not isinstance(details.get("balance"), int)
+                or isinstance(details.get("balance"), bool)
+                or not isinstance(details.get("version"), int)
+                or isinstance(details.get("version"), bool)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} committed event for {op_id!r} is "
+                    "malformed"
+                )
+            events_by_op[op_id] = event
+            if op_id in pending_ops:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset operation {op_id!r} is "
+                    "pending but has a committed event"
+                )
+            record = committed_ops.get(op_id)
+            if record is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a committed event for "
+                    f"{op_id!r} but no committed ledger operation"
+                )
+            if details != record:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} committed event for {op_id!r} "
+                    "does not match the ledger record"
+                )
+        if set(committed_ops) != set(events_by_op):
+            missing = sorted(set(committed_ops) - set(events_by_op))
+            raise RecoveryError(
+                f"wallet {wallet_id!r} committed operations {missing!r} have "
+                "no committed event"
+            )
 
     def _resolve_asset_commit_intent(
         self, wallet_id: str, operation_id: str, intent: object

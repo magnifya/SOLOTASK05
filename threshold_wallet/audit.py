@@ -30,7 +30,17 @@ import os
 import threading
 from typing import Optional
 
-from .store import CorruptDataError, WalletStore, _check_id
+from .store import (
+    CorruptDataError,
+    WalletStore,
+    _check_id,
+    _SAFE_ID,
+    parse_utc_iso,
+)
+
+
+def _safe_id_match(value: str) -> bool:
+    return bool(_SAFE_ID.match(value))
 
 #: 审计事件类型
 TYPE_POLICY_UPDATED = "policy_updated"
@@ -68,44 +78,123 @@ class AuditStore:
         _check_id("wallet_id", wallet_id)
         return os.path.join(self._audit_dir, wallet_id + ".json")
 
+    @staticmethod
+    def _event_shape_ok(event: object) -> bool:
+        """单条审计事件的严格形状：
+
+        seq 为非布尔正整数；type 为非空字符串；at 为可解析的 UTC 时间；
+        request_id/actor_id/reason 为 null 或字符串；details 为对象。
+        details 内部各事件类型的语义由相应恢复路径（轮换链/会话动作序列/
+        账本对账）负责，全局加载不重复解释。"""
+        if not isinstance(event, dict):
+            return False
+        seq = event.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            return False
+        if not isinstance(event.get("type"), str) or not event["type"]:
+            return False
+        if parse_utc_iso(event.get("at")) is None:
+            return False
+        for key in ("request_id", "actor_id", "reason"):
+            value = event.get(key)
+            if value is not None and not isinstance(value, str):
+                return False
+        if not isinstance(event.get("details"), dict):
+            return False
+        return True
+
+    def _read_strict(self, wallet_id: str) -> Optional[dict]:
+        """读取并严格校验审计文件；文件不存在返回 None。
+
+        以下现场一律视为不可对账的数据损坏（CorruptDataError），绝不静默
+        归一为空日志后覆盖历史：JSON 不可解析、顶层不是对象、events 缺失
+        或不是列表、wallet_id 字段不匹配、任一事件形状非法、seq 不从 1
+        起 / 不连续 / 有重号、记录的 next_seq 与实际最大 seq 矛盾。
+        """
+        path = self._path(wallet_id)
+        data = WalletStore._read_json(path)
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise CorruptDataError(
+                f"audit log {path!r} top-level value is not an object"
+            )
+        recorded_wallet = data.get("wallet_id")
+        if recorded_wallet is not None and recorded_wallet != wallet_id:
+            raise CorruptDataError(
+                f"audit log {path!r} wallet_id {recorded_wallet!r} does not "
+                f"match its file name {wallet_id!r}"
+            )
+        events = data.get("events")
+        if "events" not in data or not isinstance(events, list):
+            raise CorruptDataError(
+                f"audit log {path!r} has no list-valued 'events'"
+            )
+        seqs: list[int] = []
+        for event in events:
+            if not self._event_shape_ok(event):
+                raise CorruptDataError(
+                    f"audit log {path!r} has a malformed event"
+                )
+            seqs.append(event["seq"])
+        # seq 必须恰为 1..N：不重号、不缺口、单调（物理顺序允许被外部重排，
+        # 查询始终按 seq 升序；但 seq 集合本身必须连续）。
+        if sorted(seqs) != list(range(1, len(seqs) + 1)):
+            raise CorruptDataError(
+                f"audit log {path!r} has a non-contiguous or duplicated seq"
+            )
+        stored_next = data.get("next_seq")
+        if stored_next is not None:
+            if (
+                not isinstance(stored_next, int)
+                or isinstance(stored_next, bool)
+                or stored_next != len(events) + 1
+            ):
+                raise CorruptDataError(
+                    f"audit log {path!r} next_seq disagrees with its events"
+                )
+        return data
+
+    def check_log(self, wallet_id: str) -> None:
+        """只读严格校验审计文件；损坏抛 CorruptDataError/OSError。
+        文件不存在（尚无事件）视为正常空状态。"""
+        _check_id("wallet_id", wallet_id)
+        self._read_strict(wallet_id)
+
+    def list_audit_wallet_ids(self) -> list[str]:
+        """返回存在审计文件的全部 wallet_id（启动恢复扫描用）。"""
+        try:
+            names = os.listdir(self._audit_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _safe_id_match(name[: -len(".json")])
+        )
+
     def _read(self, wallet_id: str) -> Optional[dict]:
-        return WalletStore._read_json(self._path(wallet_id))
+        return self._read_strict(wallet_id)
 
     def append_event(self, wallet_id: str, event: dict) -> dict:
         """原子追加一条事件，分配下一个 seq 并持久化，返回含 seq/at 的记录。
 
         seq 从 1 起；同一 wallet 的写入在此串行化。调用方负责在更大的
         每钱包事务锁内把状态变更与本调用绑定（失败时回滚状态）。
+
+        既有日志损坏 / seq 矛盾时抛 CorruptDataError，绝不把历史清空后
+        继续写（那会用一条新事件覆盖全部审计历史）。
         """
         path = self._path(wallet_id)
         with self._lock:
-            data = self._read(wallet_id)
+            data = self._read_strict(wallet_id)
             if data is None:
                 data = {"wallet_id": wallet_id, "next_seq": 1, "events": []}
-            events = data.get("events")
-            if not isinstance(events, list):
-                events = []
-                data["events"] = events
-            # 重启恢复：以文件中实际最大事件 seq 为准，与记录的 next_seq
-            # 互相校准取较大者，保证 seq 单调连续、不重号、不回退
-            # （同时兼容缺 next_seq 字段的旧文件）。
-            max_seq = 0
-            for existing in events:
-                seq = existing.get("seq") if isinstance(existing, dict) else None
-                if (
-                    isinstance(seq, int)
-                    and not isinstance(seq, bool)
-                    and seq > max_seq
-                ):
-                    max_seq = seq
-            stored_next = data.get("next_seq")
-            if (
-                not isinstance(stored_next, int)
-                or isinstance(stored_next, bool)
-                or stored_next < 1
-            ):
-                stored_next = 1
-            next_seq = max(stored_next, max_seq + 1)
+            events = data["events"]
+            # 严格加载已保证 1..N 连续：下一个 seq 直接取 N+1，
+            # 与 next_seq（兼容缺字段的旧文件）一致。
+            next_seq = len(events) + 1
             stamped = dict(event)
             stamped["seq"] = next_seq
             events.append(stamped)
@@ -247,18 +336,32 @@ class AuditStore:
         """按 seq 升序返回 seq >= from_seq 的至多 limit 条事件。
 
         无日志文件或范围内无事件时返回 []。返回的是记录副本，
-        调用方修改不会影响存储内容。
+        调用方修改不会影响存储内容。日志损坏抛 CorruptDataError
+        （由调用方 fail-closed），绝不静默返回残缺历史。
         """
         data = self._read(wallet_id)
         if not data:
             return []
-        # 按 seq 升序返回；即使历史文件事件顺序异常也保证可读、不乱序。
+        # 严格加载已保证 seq 集合为 1..N；仍按 seq 升序输出，避免外部改动
+        # 事件物理顺序影响公开响应。
         events = [
             dict(event)
-            for event in data.get("events", [])
-            if isinstance(event, dict)
-            and isinstance(event.get("seq"), int)
-            and event["seq"] >= from_seq
+            for event in data["events"]
+            if event["seq"] >= from_seq
         ]
         events.sort(key=lambda e: e["seq"])
         return events[:limit]
+
+    def events_by_type(self, wallet_id: str, event_type: str) -> list[dict]:
+        """返回某类型的全部事件（按 seq 升序，返回副本）。纯只读。
+
+        账本语义恢复据此与已提交操作做双向对账：committed 事件必须与
+        账本一一对应。日志损坏抛 CorruptDataError（fail-closed）。"""
+        data = self._read(wallet_id)
+        if not data:
+            return []
+        return [
+            dict(event)
+            for event in sorted(data["events"], key=lambda e: e["seq"])
+            if event.get("type") == event_type
+        ]
