@@ -1005,6 +1005,23 @@ class WalletStore:
             except FileNotFoundError:
                 pass
 
+    def list_share_files(self, wallet_id: str) -> list[str]:
+        """列出 shares/<wallet_id>/ 目录内全部份额文件对应的 share_id
+        （仅纳入形如 <合法 share_id>.json 的正式文件，忽略临时残留）。"""
+        base = os.path.join(self._shares_dir, wallet_id)
+        try:
+            names = os.listdir(base)
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+        result = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            share_id = name[: -len(".json")]
+            if _SAFE_SHARE_ID.match(share_id):
+                result.append(share_id)
+        return sorted(result)
+
     def save_wallet_meta(self, wallet_id: str, meta: dict) -> None:
         """原子地覆盖钱包元数据文件（无私钥；轮换激活/回滚用）。"""
         path = self._wallet_path(wallet_id)
@@ -1280,6 +1297,7 @@ class WalletStore:
         if (
             not isinstance(share_ids, list)
             or len(share_ids) != 2
+            or len(set(share_ids)) != 2
             or any(
                 not isinstance(sid, str) or not _SAFE_SHARE_ID.match(sid)
                 for sid in share_ids
@@ -1293,6 +1311,20 @@ class WalletStore:
             if len(bytes.fromhex(public_key)) != 64:
                 return False
         except ValueError:
+            return False
+        # previous_public_key 仅 activating/active 携带；一旦存在必须是
+        # 64 字节公钥 hex（链对账用），形状非法即不可对账。
+        previous = record.get("previous_public_key")
+        if previous is not None:
+            if not isinstance(previous, str):
+                return False
+            try:
+                if len(bytes.fromhex(previous)) != 64:
+                    return False
+            except ValueError:
+                return False
+        created_at = record.get("created_at")
+        if created_at is not None and not isinstance(created_at, str):
             return False
         return True
 
@@ -1357,7 +1389,10 @@ class WalletStore:
         )
 
     def _assert_rollback_possible(
-        self, wallet_id: str, record: dict
+        self,
+        wallet_id: str,
+        record: dict,
+        expected_previous: Optional[str] = None,
     ) -> None:
         """事件未落盘的激活回滚前，确认能安全恢复旧钱包与旧份额。
 
@@ -1366,7 +1401,10 @@ class WalletStore:
         - 元数据已指向新公钥（换入已发生）：必须有激活前的钱包/份额
           备份作为权威回滚依据；
         - 元数据旧但旧份额缺失：同样必须有备份。
-        无法安全恢复时抛 RecoveryError（fail-closed），绝不猜写旧密钥。
+        expected_preversed 为审计激活链中该轮换的前一轮在用公钥（无激活
+        历史时为 None）：记录自报的 previous_public_key 必须与之相容，
+        否则属于跨轮次不相容现场，fail-closed。无法安全恢复时抛
+        RecoveryError，绝不猜写旧密钥。
         """
         rotation_id = record["rotation_id"]
         current = self.get_wallet(wallet_id)
@@ -1374,9 +1412,44 @@ class WalletStore:
             raise RecoveryError(
                 f"wallet {wallet_id!r} metadata missing during rollback"
             )
+        backup_meta = self._load_backup_wallet_meta(wallet_id, rotation_id)
+        recorded_previous = record.get("previous_public_key")
+        # 记录/备份/链上的 previous 必须互相一致
+        authoritative_previous = expected_previous
+        if isinstance(backup_meta, dict) and isinstance(
+            backup_meta.get("public_key"), str
+        ):
+            backup_previous = backup_meta["public_key"]
+            if authoritative_previous is None:
+                authoritative_previous = backup_previous
+            elif backup_previous != authoritative_previous:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rotation_id!r} backup "
+                    "public_key is incompatible with the rotation chain"
+                )
+        if isinstance(recorded_previous, str):
+            if authoritative_previous is None:
+                authoritative_previous = recorded_previous
+            elif recorded_previous != authoritative_previous:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rotation_id!r} "
+                    "previous_public_key is incompatible with the rotation chain"
+                )
+        if authoritative_previous is not None:
+            if current.get("public_key") not in (
+                record["public_key"],
+                authoritative_previous,
+            ):
+                # 当前钱包公钥既不是本轮目标、也不是上一轮在用公钥：
+                # 属于跨轮次不相容现场，无法判断该回到哪里，fail-closed。
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rotation_id!r} current "
+                    "public_key matches neither this nor the previous rotation"
+                )
+
         swapped = current.get("public_key") == record["public_key"]
         if swapped:
-            if self._load_backup_wallet_meta(wallet_id, rotation_id) is None:
+            if backup_meta is None:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} rotation {rotation_id!r} "
                     "has no activation backup to roll back"
@@ -1395,9 +1468,7 @@ class WalletStore:
             for sid in old_ids
             if isinstance(sid, str) and self.get_share(wallet_id, sid) is None
         ]
-        if missing and self._load_backup_wallet_meta(
-            wallet_id, rotation_id
-        ) is None:
+        if missing and backup_meta is None:
             raise RecoveryError(
                 f"wallet {wallet_id!r} rotation {rotation_id!r} lost "
                 f"in-use shares {missing!r} without backup"
@@ -1421,206 +1492,526 @@ class WalletStore:
         self.delete_activation_backups(wallet_id, rotation_id)
         return restored
 
-    def forward_complete_activation(
-        self, wallet_id: str, record: dict, event: dict
-    ) -> None:
-        """share_rotation_activated 事件已落盘：提交不可撤回，把现场前滚
-        成唯一 active 结果并清理全部暂存/备份残留。缺新份额或现场自相
-        矛盾时抛 RecoveryError（fail-closed），绝不猜写密钥。"""
-        rotation_id = record["rotation_id"]
-        details = event.get("details")
-        if not isinstance(details, dict) or details.get("public_key") != record[
-            "public_key"
-        ]:
+    @staticmethod
+    def _validated_share_record(
+        rotation_id: str, share_id: str, staged: object
+    ) -> dict:
+        """逐份密码学校验一份新份额：形状/hex/长度/私钥推导公钥必须一致。
+        通过返回记录，否则抛 RecoveryError，绝不猜写密钥。"""
+        if not isinstance(staged, dict) or staged.get("share_id") != share_id:
             raise RecoveryError(
-                f"rotation {rotation_id!r} activated event does not match record"
+                f"rotation {rotation_id!r} missing new share {share_id!r}"
             )
-
-        new_share_records: list[dict] = []
-        for share_id in record["share_ids"]:
-            staged = self.get_share(wallet_id, share_id)
-            if staged is None:
-                # 崩溃可能发生在新份额全部换入前：暂存里仍有新份额
-                staged = self.get_staging_share(
-                    wallet_id, rotation_id, share_id
-                )
-            if not isinstance(staged, dict) or staged.get(
-                "share_id"
-            ) != share_id:
+        public_hex = staged.get("public_key")
+        private_hex = staged.get("private_key")
+        if not isinstance(public_hex, str) or not isinstance(private_hex, str):
+            raise RecoveryError(
+                f"rotation {rotation_id!r} malformed new share"
+            )
+        try:
+            public_bytes = bytes.fromhex(public_hex)
+            private_bytes = bytes.fromhex(private_hex)
+        except ValueError:
+            raise RecoveryError(
+                f"rotation {rotation_id!r} non-hex new share"
+            )
+        if len(public_bytes) != 32 or len(private_bytes) != 32:
+            raise RecoveryError(
+                f"rotation {rotation_id!r} bad-length new share"
+            )
+        try:
+            if public_key_from_private(private_bytes) != public_bytes:
                 raise RecoveryError(
-                    f"rotation {rotation_id!r} missing new share {share_id!r}"
+                    f"rotation {rotation_id!r} new share key mismatch"
                 )
-            new_share_records.append(staged)
+        except ValueError:
+            raise RecoveryError(
+                f"rotation {rotation_id!r} invalid new share private key"
+            )
+        return staged
 
-        # 前滚绝不猜写密钥：逐份校验 32 字节私钥能推导出对应公钥，
-        # 且两份新公钥按序拼接恰为已提交事件里的钱包公钥。
-        new_public_keys: list[bytes] = []
-        for staged in new_share_records:
-            public_hex = staged.get("public_key")
-            private_hex = staged.get("private_key")
-            if not isinstance(public_hex, str) or not isinstance(
-                private_hex, str
+    def _build_activation_chain(
+        self,
+        wallet_id: str,
+        activated: dict[str, dict],
+        records_by_rid: dict[str, dict],
+    ) -> list[tuple[int, str, dict]]:
+        """按审计 seq 建立已提交激活链 ``[(seq, rotation_id, event)]``。
+
+        拒绝缺失（有激活事件无记录）、重复（同 seq/同公钥/跨轮次份额
+        重叠）、乱序（previous_public_key 接不上上一轮 public_key、首项
+        前驱指向任一轮在用公钥）、以及事件与记录的 share_ids/public_key/
+        previous_public_key 不相容。任一矛盾抛 RecoveryError（fail-closed）。
+        """
+        ordered = sorted(
+            activated.values(), key=lambda event: event.get("seq", 0)
+        )
+        all_pubkeys = {
+            d.get("public_key")
+            for d in (
+                e.get("details") for e in ordered if isinstance(e.get("details"), dict)
+            )
+        }
+        chain: list[tuple[int, str, dict]] = []
+        seen_pubkeys: set[str] = set()
+        seen_share_ids: set[str] = set()
+        previous_pubkey: Optional[str] = None
+        last_seq = 0
+        for event in ordered:
+            seq = event.get("seq")
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or seq <= last_seq
             ):
                 raise RecoveryError(
-                    f"rotation {rotation_id!r} malformed new share"
+                    f"wallet {wallet_id!r} rotation activation events have a "
+                    "missing, duplicated or out-of-order seq"
+                )
+            last_seq = seq
+            details = event.get("details")
+            if not isinstance(details, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation activation event {seq!r} "
+                    "has no object details"
+                )
+            rid = details.get("rotation_id")
+            share_ids = details.get("share_ids")
+            public_key = details.get("public_key")
+            prev_key = details.get("previous_public_key")
+            if (
+                not isinstance(rid, str)
+                or not _SAFE_ID.match(rid)
+                or not isinstance(share_ids, list)
+                or len(share_ids) != 2
+                or len(set(share_ids)) != 2
+                or any(
+                    not isinstance(sid, str) or not _SAFE_SHARE_ID.match(sid)
+                    for sid in share_ids
+                )
+                or not isinstance(public_key, str)
+                or not isinstance(prev_key, str)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation activation event {seq!r} "
+                    "is malformed"
                 )
             try:
-                public_bytes = bytes.fromhex(public_hex)
-                private_bytes = bytes.fromhex(private_hex)
+                if len(bytes.fromhex(public_key)) != 64 or len(
+                    bytes.fromhex(prev_key)
+                ) != 64:
+                    raise ValueError
             except ValueError:
                 raise RecoveryError(
-                    f"rotation {rotation_id!r} non-hex new share"
+                    f"wallet {wallet_id!r} rotation activation event {seq!r} "
+                    "has a bad-length public key"
                 )
-            if len(public_bytes) != 32 or len(private_bytes) != 32:
+            record = records_by_rid.get(rid)
+            if record is None:
+                # 提交点事件存在却没有轮换记录：缺失，拒绝猜写
                 raise RecoveryError(
-                    f"rotation {rotation_id!r} bad-length new share"
+                    f"wallet {wallet_id!r} has a committed activation for "
+                    f"{rid!r} but no rotation record"
                 )
-            try:
-                if public_key_from_private(private_bytes) != public_bytes:
-                    raise RecoveryError(
-                        f"rotation {rotation_id!r} new share key mismatch"
-                    )
-            except ValueError:
+            if record["public_key"] != public_key or list(
+                record["share_ids"]
+            ) != list(share_ids):
                 raise RecoveryError(
-                    f"rotation {rotation_id!r} invalid new share private key"
+                    f"wallet {wallet_id!r} rotation {rid!r} record is "
+                    "inconsistent with its activated event"
                 )
-            new_public_keys.append(public_bytes)
-        if (
-            combine_public_keys(new_public_keys).hex()
-            != record["public_key"]
-        ):
+            record_previous = record.get("previous_public_key")
+            if (
+                isinstance(record_previous, str)
+                and record_previous != prev_key
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rid!r} "
+                    "previous_public_key disagrees with its activated event"
+                )
+            if public_key == prev_key:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rid!r} does not change "
+                    "the wallet public key"
+                )
+            if previous_pubkey is not None and prev_key != previous_pubkey:
+                # 乱序/跨轮次不相容：本轮的 previous 必须恰为上一轮在用公钥
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rid!r} previous_public_key "
+                    "does not extend the prior rotation"
+                )
+            if previous_pubkey is None and prev_key in all_pubkeys:
+                # 首项的前驱指向某一轮在用公钥：链被截断或乱序
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rid!r} chains from another "
+                    "rotation public key, the chain is incomplete"
+                )
+            if public_key in seen_pubkeys:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rid!r} repeats a public key"
+                )
+            overlap = seen_share_ids.intersection(share_ids)
+            if overlap:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation {rid!r} reuses shares "
+                    f"{sorted(overlap)!r} from an earlier rotation"
+                )
+            seen_pubkeys.add(public_key)
+            seen_share_ids.update(share_ids)
+            chain.append((seq, rid, event))
+            previous_pubkey = public_key
+        return chain
+
+    def _roll_forward_to_tail(
+        self,
+        wallet_id: str,
+        chain: list[tuple[int, str, dict]],
+        records_by_rid: dict[str, dict],
+    ) -> None:
+        """把磁盘现场前滚为激活链链顶（最后一次已提交激活）的唯一结果。
+
+        只有链顶需要对账磁盘份额/钱包元数据：更早的历史激活只把记录校准
+        为 active 并清理其暂存私钥残留，绝不重放它们的换入（否则会向后一
+        轮已合法删除的份额索要密钥、或把旧公钥写回钱包）。前滚逐份做密码
+        学校验，缺份额/对不上时抛 RecoveryError，绝不猜写密钥。
+        """
+        # 所有已提交激活的记录都校准为 active，previous_public_key 以
+        # 提交点事件为准（补齐崩溃窗口里停在 activating/缺字段的记录）。
+        for _seq, rid, event in chain:
+            record = records_by_rid[rid]
+            details = event["details"]
+            correct = dict(record)
+            correct["state"] = "active"
+            correct["share_ids"] = list(details["share_ids"])
+            correct["public_key"] = details["public_key"]
+            correct["previous_public_key"] = details["previous_public_key"]
+            if correct != record:
+                self.update_rotation(wallet_id, rid, correct)
+
+        if not chain:
+            return
+        _tail_seq, tail_rid, tail_event = chain[-1]
+        tail_details = tail_event["details"]
+        tail_share_ids = list(tail_details["share_ids"])
+        tail_public_key = tail_details["public_key"]
+
+        # 链顶两份新份额：在用目录优先，崩溃窗口可能仍在暂存目录。
+        tail_share_records: list[dict] = []
+        for share_id in tail_share_ids:
+            staged = self.get_share(wallet_id, share_id)
+            if staged is None:
+                staged = self.get_staging_share(
+                    wallet_id, tail_rid, share_id
+                )
+            tail_share_records.append(
+                self._validated_share_record(tail_rid, share_id, staged)
+            )
+        new_public_keys = [
+            bytes.fromhex(r["public_key"]) for r in tail_share_records
+        ]
+        if combine_public_keys(new_public_keys).hex() != tail_public_key:
             raise RecoveryError(
-                f"rotation {rotation_id!r} new shares do not match "
-                "committed public_key"
+                f"rotation {tail_rid!r} new shares do not match the "
+                "committed public key"
             )
 
         current_meta = self.get_wallet(wallet_id)
         backup_meta = self._read_json(
-            self._staging_wallet_backup_path(wallet_id, rotation_id)
+            self._staging_wallet_backup_path(wallet_id, tail_rid)
         )
 
-        # 旧份额 id 集合：激活前备份的 wallet.bak.json 是权威旧清单；
-        # 当前元数据若仍指向旧公钥，也纳入待删除集合。
-        old_share_ids: set[str] = set()
-        if isinstance(backup_meta, dict) and isinstance(
-            backup_meta.get("shares"), list
-        ):
-            for entry in backup_meta["shares"]:
-                if isinstance(entry, dict) and isinstance(
-                    entry.get("share_id"), str
-                ):
-                    old_share_ids.add(entry["share_id"])
-        if (
-            isinstance(current_meta, dict)
-            and current_meta.get("public_key") != record["public_key"]
-            and isinstance(current_meta.get("shares"), list)
-        ):
-            for entry in current_meta["shares"]:
-                if isinstance(entry, dict) and isinstance(
-                    entry.get("share_id"), str
-                ):
-                    old_share_ids.add(entry["share_id"])
-        old_share_ids.difference_update(record["share_ids"])
-
-        previous_public_key = record.get("previous_public_key")
-        if not isinstance(previous_public_key, str) and isinstance(
-            backup_meta, dict
-        ):
-            previous_public_key = backup_meta.get("public_key")
-        if not isinstance(previous_public_key, str) and isinstance(
-            current_meta, dict
-        ) and current_meta.get("public_key") != record["public_key"]:
-            previous_public_key = current_meta.get("public_key")
-        if not isinstance(previous_public_key, str):
-            raise RecoveryError(
-                f"rotation {rotation_id!r} cannot determine previous_public_key"
+        def meta_matches(meta: object) -> bool:
+            if not isinstance(meta, dict):
+                return False
+            if meta.get("public_key") != tail_public_key:
+                return False
+            entries = meta.get("shares")
+            if not isinstance(entries, list) or len(entries) != 2:
+                return False
+            halves = (
+                bytes.fromhex(tail_public_key)[:32].hex(),
+                bytes.fromhex(tail_public_key)[32:].hex(),
             )
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    return False
+                if entry.get("share_id") != tail_share_ids[index]:
+                    return False
+                if entry.get("public_key") != halves[index]:
+                    return False
+            return True
 
-        base_meta = current_meta if isinstance(current_meta, dict) else backup_meta
-        if not isinstance(base_meta, dict):
-            raise RecoveryError(
-                f"wallet {wallet_id!r} metadata missing during roll-forward"
-            )
-        new_meta = dict(base_meta)
-        new_meta["wallet_id"] = wallet_id
-        new_meta["shares"] = [
-            {"share_id": r["share_id"], "public_key": r["public_key"]}
-            for r in new_share_records
-        ]
-        new_meta["public_key"] = record["public_key"]
-        active_record = dict(record)
-        active_record["state"] = "active"
-        active_record["previous_public_key"] = previous_public_key
+        if not meta_matches(current_meta):
+            base_meta = current_meta if isinstance(current_meta, dict) else backup_meta
+            if not isinstance(base_meta, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} metadata missing during roll-forward"
+                )
+            new_meta = dict(base_meta)
+            new_meta["wallet_id"] = wallet_id
+            new_meta["shares"] = [
+                {"share_id": r["share_id"], "public_key": r["public_key"]}
+                for r in tail_share_records
+            ]
+            new_meta["public_key"] = tail_public_key
+            self.save_wallet_meta(wallet_id, new_meta)
 
-        # 前滚：新份额、钱包元数据、删除残留旧份额、active 状态
-        for share_record in new_share_records:
+        # 链顶份额逐份落盘；shares/ 目录最终只能剩链顶两份（清掉创世及
+        # 历史各轮残留，也清掉崩溃窗口换入到一半的杂份）。
+        for share_record in tail_share_records:
             self.save_share(wallet_id, share_record)
-        self.save_wallet_meta(wallet_id, new_meta)
-        for share_id in old_share_ids:
-            if _SAFE_SHARE_ID.match(share_id):
+        tail_set = set(tail_share_ids)
+        for share_id in self.list_share_files(wallet_id):
+            if share_id not in tail_set:
                 self.delete_share(wallet_id, share_id)
-        self.update_rotation(wallet_id, rotation_id, active_record)
-        # 激活已生效：暂存的新份额副本与全部备份必须清干净
-        self.delete_staging(wallet_id, rotation_id)
+
+        # 已提交各轮的暂存私钥/备份残留全部清干净（历史轮一般已无目录）。
+        for _seq, rid, _event in chain:
+            self.delete_staging(wallet_id, rid)
+
+    def forward_complete_activation(
+        self, wallet_id: str, record: dict, event: dict
+    ) -> None:
+        """share_rotation_activated 事件已落盘后的前滚入口（激活事务
+        异常分支与恢复共用）。
+
+        不孤立地只处理本轮：而是按审计中的全部已提交激活事件重建链，
+        把磁盘对账到真正的链顶，并校验链连续/事件与记录一致。这样连续
+        多轮轮换后，任一轮换的异常收尾都不会把历史轮误当未完成轮换重做。
+        缺新份额或现场自相矛盾时抛 RecoveryError（fail-closed）。"""
+        from .audit import AuditStore
+
+        audit_store = AuditStore(self.data_dir)
+        activated = audit_store.activated_rotation_events(wallet_id)
+        prepared = audit_store.prepared_rotation_events(wallet_id)
+        # 调用方持锁且传入的事件必定已落盘；防御性确保它在链映射中。
+        details = event.get("details")
+        rid = details.get("rotation_id") if isinstance(details, dict) else None
+        if isinstance(rid, str):
+            activated.setdefault(rid, event)
+        self.recover_wallet_rotation(wallet_id, activated, prepared)
+
+    def verify_rotation_scene_consistent(
+        self,
+        wallet_id: str,
+        activated: dict[str, dict],
+        prepared: dict[str, dict],
+    ) -> bool:
+        """只读判定轮换现场是否静止且与激活链一致（不写盘、不清理）。
+
+        常驻请求的自愈快路径用它在"看似静止"时仍做一次链对账：任一已
+        提交激活缺记录、链乱序/跨轮次不相容、链顶公钥/份额与钱包元数据或
+        磁盘份额不符、仍有暂存/备份残留，都返回 False，由调用方走完整
+        恢复（恢复会在真正矛盾时 fail-closed）。现场完全静止才返回 True。
+        """
+        try:
+            entries = self.list_rotation_entries(wallet_id)
+            records_by_rid: dict[str, dict] = {}
+            for _key, record in entries:
+                rid = record.get("rotation_id")
+                if not self._rotation_record_shape_ok(record):
+                    return False
+                rid = record["rotation_id"]
+                if rid in records_by_rid:
+                    return False
+                records_by_rid[rid] = record
+            chain = self._build_activation_chain(
+                wallet_id, activated, records_by_rid
+            )
+            # 有暂存残留（prepared 暂存目录除外）即非静止。这里只判定目录
+            # 是否存在（每请求快路径不做暂存份额密码学重验；完整密码学
+            # 校验仍由启动恢复/激活事务路径负责）。
+            kept_prepared = {
+                rid
+                for rid, record in records_by_rid.items()
+                if rid not in activated
+                and record["state"] == "prepared"
+                and os.path.isdir(
+                    self._staging_dir(wallet_id, rid)
+                )
+            }
+            for staging_rid in self.list_staging_rotation_ids(wallet_id):
+                if staging_rid not in kept_prepared:
+                    return False
+            # 未提交的 activating/active 记录是崩溃现场
+            for rid, record in records_by_rid.items():
+                if rid not in activated and record["state"] in (
+                    "activating",
+                    "active",
+                ):
+                    return False
+            if not chain:
+                # 无已提交激活：钱包应为创世份额且份额文件齐
+                current = self.get_wallet(wallet_id)
+                if not isinstance(current, dict):
+                    return False
+                ids = [
+                    s.get("share_id")
+                    for s in current.get("shares", [])
+                    if isinstance(s, dict)
+                ]
+                if ids != ["share-1", "share-2"]:
+                    return False
+                return all(
+                    self.get_share(wallet_id, sid) is not None for sid in ids
+                )
+            tail = chain[-1][2]["details"]
+            tail_pub = tail["public_key"]
+            tail_ids = list(tail["share_ids"])
+            current = self.get_wallet(wallet_id)
+            if not isinstance(current, dict):
+                return False
+            if current.get("public_key") != tail_pub:
+                return False
+            ids = [
+                s.get("share_id")
+                for s in current.get("shares", [])
+                if isinstance(s, dict)
+            ]
+            if ids != tail_ids:
+                return False
+            # shares/ 目录只能有链顶两份，且逐份与链顶公钥密码学一致
+            if set(self.list_share_files(wallet_id)) != set(tail_ids):
+                return False
+            halves = (
+                bytes.fromhex(tail_pub)[:32],
+                bytes.fromhex(tail_pub)[32:],
+            )
+            for index, sid in enumerate(tail_ids):
+                share = self.get_share(wallet_id, sid)
+                if not isinstance(share, dict):
+                    return False
+                try:
+                    priv = bytes.fromhex(share.get("private_key", ""))
+                    pub = bytes.fromhex(share.get("public_key", ""))
+                except ValueError:
+                    return False
+                if len(priv) != 32 or pub != halves[index]:
+                    return False
+                if public_key_from_private(priv) != pub:
+                    return False
+            # 各已提交 active 记录的字段必须与事件一致
+            for _seq, rid, event in chain:
+                record = records_by_rid[rid]
+                d = event["details"]
+                if record["state"] != "active":
+                    return False
+                if record["public_key"] != d["public_key"]:
+                    return False
+                if list(record["share_ids"]) != list(d["share_ids"]):
+                    return False
+                if record.get("previous_public_key") != d[
+                    "previous_public_key"
+                ]:
+                    return False
+            return True
+        except (RecoveryError, OSError, ValueError):
+            return False
 
     def recover_wallet_rotation(
         self,
         wallet_id: str,
         activated: Optional[dict[str, dict]] = None,
+        prepared: Optional[dict[str, dict]] = None,
     ) -> None:
         """按钱包恢复轮换现场（调用方须持有该钱包的跨进程事务锁）。
 
-        以 share_rotation_activated 审计事件是否已持久化作为激活是否生效
-        的唯一判据（activated 为 {rotation_id: event}）：
+        先按审计 seq 建立连续的已提交激活公钥/份额时间线，再分三类对账：
 
-        - 事件在：激活已提交，无论记录停在 activating/active、暂存或
-          备份是否已清理，都把钱包元数据/在用份额/轮换状态前滚为唯一
-          active 结果并清理全部残留，不重复记事件；
-        - 事件不在：activating/active 一律回滚为 prepared（恢复旧公钥与
-          旧份额、删除换入的新份额），再按 prepared 规则校验暂存；
-          缺少回滚所需备份时抛 RecoveryError 阻止就绪，绝不静默；
+        - 已提交激活（share_rotation_activated 事件在）：链上各轮记录校准
+          为 active，磁盘份额/钱包公钥只前滚到**链顶**一轮并清理全部暂存/
+          备份；历史轮不再触碰在用份额。链缺失/重复/乱序/跨轮次不相容/
+          事件与记录不一致一律 RecoveryError（fail-closed），绝不猜写；
+        - 事件未落盘的 activating/active（含状态已写 active）：恢复上一轮
+          完整份额与公钥、置回 prepared，保留经校验有效的暂存份额；缺
+          回滚备份或与激活链不相容时 fail-closed；
         - prepared：暂存经密码学校验通过才保留，否则连记录带暂存删除；
-        - 无效记录：安全删除记录及其暂存目录；
-        - 孤儿暂存目录：安全删除。
+          若该轮存在 share_rotation_prepared 事件，其 share_ids/public_key
+          必须与记录一致，否则 fail-closed；
+        - 形状无效且**无**激活事件的记录、无记录的孤儿暂存：安全删除。
 
         全程不新增审计事件、不分配 seq；被删除暂存私钥不留副本。
         """
         _check_id("wallet_id", wallet_id)
         activated = activated or {}
-        kept_prepared: set[str] = set()
-        for key, record in self.list_rotation_entries(wallet_id):
-            rotation_id = record.get("rotation_id")
+        prepared = prepared or {}
+
+        entries = self.list_rotation_entries(wallet_id)
+        records_by_rid: dict[str, dict] = {}
+        for key, record in entries:
+            rid = record.get("rotation_id")
             if not self._rotation_record_shape_ok(record):
-                # 无效记录：连记录带暂存一起安全删除
+                # 形状无效：若该轮已有激活提交点则属"事件与记录不一致"，
+                # 绝不能删除提交记录掩盖矛盾，直接 fail-closed。
+                if isinstance(rid, str) and rid in activated:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} rotation {rid!r} is committed "
+                        "but its record is malformed"
+                    )
                 self.delete_rotation(wallet_id, key)
-                if isinstance(rotation_id, str) and _SAFE_ID.match(
-                    rotation_id
-                ):
-                    self.delete_staging(wallet_id, rotation_id)
+                if isinstance(rid, str) and _SAFE_ID.match(rid):
+                    self.delete_staging(wallet_id, rid)
                 continue
-            rotation_id = record["rotation_id"]
-            event = activated.get(rotation_id)
-            if event is not None:
-                # 激活事件已落盘：保持 active、前滚补齐、清理全部残留
-                self.forward_complete_activation(wallet_id, record, event)
+            rid = record["rotation_id"]
+            if rid in records_by_rid:
+                # 同一 rotation_id 出现两条记录：重复，拒绝猜测保留哪条
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has duplicate rotation records for "
+                    f"{rid!r}"
+                )
+            records_by_rid[rid] = record
+
+        # 提交点事件在却没有任何记录（缺失）：链构建内统一 fail-closed。
+        chain = self._build_activation_chain(
+            wallet_id, activated, records_by_rid
+        )
+        chain_tail_public = (
+            chain[-1][2]["details"]["public_key"] if chain else None
+        )
+
+        kept_prepared: set[str] = set()
+        for rid, record in records_by_rid.items():
+            if rid in activated:
+                # 已提交轮：磁盘对账统一在链顶前滚中处理，这里不动。
                 continue
             if record["state"] in ("activating", "active"):
-                # 激活状态已写入但事件未落盘：提交未生效，无论记录停在
-                # activating 还是 active，都恢复旧公钥与旧份额、置回
-                # prepared，保留经校验有效的暂存份额。
-                self._assert_rollback_possible(wallet_id, record)
+                # 激活状态已写但提交点事件未落盘：提交未生效，恢复上一轮
+                # 完整份额与公钥、置回 prepared，保留有效暂存。
+                self._assert_rollback_possible(
+                    wallet_id, record, chain_tail_public
+                )
                 record = self._rollback_incomplete_activation(
                     wallet_id, record
                 )
-            # prepared（含刚回滚的）：暂存经密码学校验通过才保留
-            if self._prepared_staging_valid(wallet_id, record):
-                kept_prepared.add(rotation_id)
-            else:
-                # 暂存缺失/损坏/不匹配：记录与残留一起安全删除，
-                # 绝不留下来路不明的私钥副本
-                self.delete_rotation(wallet_id, rotation_id)
-                self.delete_staging(wallet_id, rotation_id)
-        # 孤儿暂存目录：没有对应有效 prepared 记录的一律安全删除
+            # prepared（含刚回滚的）：暂存经密码学校验通过才保留。
+            if not self._prepared_staging_valid(wallet_id, record):
+                # 暂存缺失/损坏/不匹配：记录与残留一起安全删除，绝不留下
+                # 来路不明的私钥副本（此轮无激活事件，删除不丢已提交状态）。
+                self.delete_rotation(wallet_id, rid)
+                self.delete_staging(wallet_id, rid)
+                continue
+            # 有 prepared 事件时，事件与记录必须一致；不一致 fail-closed，
+            # 绝不带着矛盾现场继续服务。
+            prepared_event = prepared.get(rid)
+            if prepared_event is not None:
+                details = prepared_event.get("details")
+                if (
+                    not isinstance(details, dict)
+                    or details.get("public_key") != record["public_key"]
+                    or list(details.get("share_ids") or [])
+                    != list(record["share_ids"])
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} rotation {rid!r} record is "
+                        "inconsistent with its prepared event"
+                    )
+            kept_prepared.add(rid)
+
+        # 已提交链：校准记录并把磁盘对账到链顶唯一结果。
+        self._roll_forward_to_tail(wallet_id, chain, records_by_rid)
+
+        # 孤儿暂存目录：保留中的 prepared 暂存除外，其余（含历史轮遗留）
+        # 一律安全删除；已提交轮的暂存已在链顶前滚中清理，此处删除幂等。
         for rotation_id in self.list_staging_rotation_ids(wallet_id):
             if rotation_id not in kept_prepared:
                 self.delete_staging(wallet_id, rotation_id)
@@ -1632,26 +2023,20 @@ class WalletStore:
         """启动恢复（无跨进程锁的独立入口；serve 使用 service 层的加锁
         编排）。activated 为各钱包激活事件映射；为 None 时从审计日志读取。
         恢复失败向上抛出 RecoveryError/OSError，由调用方阻止服务就绪。"""
-        from .audit import AuditStore, TYPE_SHARE_ROTATION_ACTIVATED
+        from .audit import AuditStore
 
         wallet_ids = sorted(
             set(self.list_rotation_wallet_ids())
             | set(self.list_staging_wallet_ids())
         )
         for wallet_id in wallet_ids:
+            audit_store = AuditStore(self.data_dir)
             wallet_activated = activated
             if wallet_activated is None:
-                events = AuditStore(self.data_dir).list_events(wallet_id)
-                wallet_activated = {}
-                for e in events:
-                    if e.get("type") != TYPE_SHARE_ROTATION_ACTIVATED:
-                        continue
-                    details = e.get("details")
-                    rid = (
-                        details.get("rotation_id")
-                        if isinstance(details, dict)
-                        else None
-                    )
-                    if isinstance(rid, str):
-                        wallet_activated[rid] = e
-            self.recover_wallet_rotation(wallet_id, wallet_activated)
+                wallet_activated = audit_store.activated_rotation_events(
+                    wallet_id
+                )
+            wallet_prepared = audit_store.prepared_rotation_events(wallet_id)
+            self.recover_wallet_rotation(
+                wallet_id, wallet_activated, wallet_prepared
+            )

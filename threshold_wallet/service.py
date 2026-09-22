@@ -148,6 +148,11 @@ class WalletService:
         """该钱包已落盘的 share_rotation_activated 事件映射。"""
         return self._audit.activated_rotation_events(wallet_id)
 
+    def _prepared_rotations(self, wallet_id: str) -> dict[str, dict]:
+        """该钱包已落盘的 share_rotation_prepared 事件映射（同 id 多条时
+        取最后一条）。"""
+        return self._audit.prepared_rotation_events(wallet_id)
+
     def _recover_wallet(self, wallet_id: str) -> None:
         """在已持有该钱包事务锁的前提下，恢复轮换现场与未完成的资产提交。
 
@@ -161,7 +166,9 @@ class WalletService:
             # 先校验资产账本：账本损坏时任何对账都不可信，直接 fail-closed。
             self._store.check_asset_ledger(wallet_id)
             self._store.recover_wallet_rotation(
-                wallet_id, self._activated_rotations(wallet_id)
+                wallet_id,
+                self._activated_rotations(wallet_id),
+                self._prepared_rotations(wallet_id),
             )
             self._recover_wallet_asset_commits(wallet_id)
             self._recover_sign_sessions(wallet_id)
@@ -233,6 +240,19 @@ class WalletService:
                     ):
                         needs_recovery = True
                         break
+            if not needs_recovery and (rotations or staging_ids):
+                # 看似静止也要按审计 seq 对账一次激活链：连续多轮轮换后，
+                # 历史记录缺失、链乱序/跨轮次不相容、链顶公钥/份额与磁盘
+                # 不符等矛盾不会体现为 activating/暂存残留，必须在此拦住，
+                # 绝不带矛盾现场对外服务。
+                if not active_check:
+                    activated = self._activated_rotations(wallet_id)
+                if not self._store.verify_rotation_scene_consistent(
+                    wallet_id,
+                    activated,
+                    self._prepared_rotations(wallet_id),
+                ):
+                    needs_recovery = True
             if not needs_recovery and staging_ids:
                 # 无对应 prepared 记录的孤儿暂存目录
                 needs_recovery = True

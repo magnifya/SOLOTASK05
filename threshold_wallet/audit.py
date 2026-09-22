@@ -30,7 +30,7 @@ import os
 import threading
 from typing import Optional
 
-from .store import WalletStore, _check_id
+from .store import CorruptDataError, WalletStore, _check_id
 
 #: 审计事件类型
 TYPE_POLICY_UPDATED = "policy_updated"
@@ -175,8 +175,35 @@ class AuditStore:
 
         启动/运行时轮换恢复据此判定激活是否已提交（事件在则前滚为
         active，事件不在则回滚 prepared）。每个 rotation 至多一条激活事件；
-        纯只读，不分配 seq。
+        同一 rotation_id 出现两条激活事件属于不可对账的重复提交点，抛
+        CorruptDataError（fail-closed），绝不任取一条。纯只读。
         """
+        return self._rotation_events(
+            wallet_id, TYPE_SHARE_ROTATION_ACTIVATED, "activated"
+        )
+
+    def prepared_rotation_events(self, wallet_id: str) -> dict[str, dict]:
+        """返回该钱包已落盘的 share_rotation_prepared 事件映射
+        ``{rotation_id: event}``。
+
+        恢复据此判定轮换首次准备是否已提交（事件在则 prepared 记录合法；
+        记录在但准备事件缺失说明记录是崩溃窗口残留）。准备记录在暂存
+        失效被安全删除后允许以同 rotation_id 重新准备，因此同一 id 可能
+        有多条准备事件，这里以最后一条为准、不报错；真正唯一的提交点是
+        share_rotation_activated。纯只读。
+        """
+        return self._rotation_events(
+            wallet_id, TYPE_SHARE_ROTATION_PREPARED, "prepared",
+            strict_unique=False,
+        )
+
+    def _rotation_events(
+        self,
+        wallet_id: str,
+        event_type: str,
+        kind: str,
+        strict_unique: bool = True,
+    ) -> dict[str, dict]:
         data = self._read(wallet_id)
         result: dict[str, dict] = {}
         if not data:
@@ -184,7 +211,7 @@ class AuditStore:
         for event in data.get("events", []):
             if not isinstance(event, dict):
                 continue
-            if event.get("type") != TYPE_SHARE_ROTATION_ACTIVATED:
+            if event.get("type") != event_type:
                 continue
             details = event.get("details")
             rotation_id = (
@@ -192,7 +219,25 @@ class AuditStore:
                 if isinstance(details, dict)
                 else None
             )
-            if isinstance(rotation_id, str):
+            if not isinstance(rotation_id, str):
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has a share rotation "
+                    f"{kind} event without a rotation_id"
+                )
+            if strict_unique and rotation_id in result:
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has multiple share "
+                    f"rotation {kind} events for {rotation_id!r}"
+                )
+            # 非唯一（prepared）：保留 seq 最大的一条
+            existing = result.get(rotation_id)
+            if existing is None or (
+                isinstance(event.get("seq"), int)
+                and (
+                    not isinstance(existing.get("seq"), int)
+                    or event["seq"] > existing["seq"]
+                )
+            ):
                 result[rotation_id] = dict(event)
         return result
 
