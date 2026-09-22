@@ -263,6 +263,88 @@ class SignSessionServiceTest(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.status, 409)
 
+    def _ready_session(self, sid="g1", message="msg", timeout=1):
+        """构造一个齐份但门控未过的 ready 会话。"""
+        self.svc.put_policy("w1", 1, 3600)
+        self._open(sid=sid, message=message, timeout=timeout)
+        sigs = {
+            sid_: self.h.share_signature("w1", sid_, sid, message)
+            for sid_ in ("share-1", "share-2")
+        }
+        self.svc.submit_sign_session_share("w1", sid, "share-1", sigs["share-1"])
+        code, view = self.svc.submit_sign_session_share(
+            "w1", sid, "share-2", sigs["share-2"]
+        )
+        self.assertEqual(code, 409)
+        self.assertEqual(view["state"], "ready")
+        return sigs
+
+    def test_ready_session_lazy_expires_on_get(self):
+        sigs = self._ready_session(sid="re1")
+        time.sleep(1.1)
+        view = self.svc.get_sign_session("w1", "re1")
+        self.assertEqual(view["state"], "expired")
+        self.assertNotIn("aggregate_signature", view)
+        # 再查不重复记 expired
+        self.svc.get_sign_session("w1", "re1")
+        actions = [
+            e["details"]["action"] for e in _session_events(self.svc, "w1")
+        ]
+        self.assertEqual(
+            actions,
+            ["created", "share_received", "share_received", "expired"],
+        )
+
+    def test_ready_session_expires_on_delivery_and_terminal_wont_aggregate(self):
+        sigs = self._ready_session(sid="re2")
+        time.sleep(1.1)
+        # 投递到点：原子 expired，返回 409
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.submit_sign_session_share(
+                "w1", "re2", "share-2", sigs["share-2"]
+            )
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(
+            self.svc.get_sign_session("w1", "re2")["state"], "expired"
+        )
+        # 门控补齐后再投递：终态不再聚合，仍 409
+        self.svc.create_sign_request("w1", "re2", "msg")
+        self.svc.approve("w1", "re2", "ops-1")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.submit_sign_session_share(
+                "w1", "re2", "share-2", sigs["share-2"]
+            )
+        self.assertEqual(ctx.exception.status, 409)
+        actions = [
+            e["details"]["action"] for e in _session_events(self.svc, "w1")
+        ]
+        self.assertEqual(actions.count("expired"), 1)
+        self.assertNotIn("signed", actions)
+
+    def test_ready_session_before_timeout_still_retries(self):
+        sigs = self._ready_session(sid="re3", timeout=600)
+        self.svc.create_sign_request("w1", "re3", "msg")
+        self.svc.approve("w1", "re3", "ops-1")
+        code, view = self.svc.submit_sign_session_share(
+            "w1", "re3", "share-2", sigs["share-2"]
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(view["state"], "signed")
+
+    def test_ready_session_persists_expired_across_restart(self):
+        self._ready_session(sid="re4", timeout=1)
+        time.sleep(1.1)
+        self.svc.get_sign_session("w1", "re4")
+        h2 = make_harness(self.d)
+        view = h2.service.get_sign_session("w1", "re4")
+        self.assertEqual(view["state"], "expired")
+        actions = [
+            e["details"]["action"]
+            for e in h2.service.get_audit_events("w1")["events"]
+            if e["type"] == "session_event"
+        ]
+        self.assertEqual(actions.count("expired"), 1)
+
     def test_complete_returns_201_signed_with_valid_aggregate(self):
         wallet = self.svc.get_wallet("w1")
         self._open()
@@ -603,7 +685,8 @@ class SignSessionServiceTest(unittest.TestCase):
 
     # ---- 份额轮换兼容 ---------------------------------------------------
 
-    def test_rotation_signed_replay_survives_old_share_rejected(self):
+    def test_rotation_migrates_inflight_session_to_current_shares(self):
+        # 已 signed 的会话保留原聚合：构成该聚合的旧份额同值重放仍 200 同体
         self._open(sid="done1", message="m")
         a = self.h.share_signature("w1", "share-1", "done1", "m")
         b = self.h.share_signature("w1", "share-2", "done1", "m")
@@ -623,34 +706,122 @@ class SignSessionServiceTest(unittest.TestCase):
         )
         new_ids = rot["share_ids"]
 
-        # 已 signed 的会话用旧份额重放仍 200 同体
+        # 已 signed 的会话用构成其聚合的旧份额重放仍 200 同体
         code, view = self.svc.submit_sign_session_share(
             "w1", "done1", "share-1", a
         )
         self.assertEqual(code, 200)
         self.assertEqual(view, signed)
-        # 在途会话：旧份额 400，新份额也无法补入旧快照会话
+        code, view = self.svc.submit_sign_session_share(
+            "w1", "done1", "share-2", b
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(view, signed)
+
+        # 在途会话迁移到当前在用快照：已收旧份额被剔除，视图同步
+        view = self.svc.get_sign_session("w1", "infl1")
+        self.assertEqual(view["state"], "collecting")
+        self.assertEqual(view["received_shares"], [])
+        self.assertEqual(view["missing_shares"], list(new_ids))
+        # 旧份额补投一律 400（此前未收的旧份额与已收旧份额的同值重放）
         with self.assertRaises(ServiceError) as ctx:
             self.svc.submit_sign_session_share(
                 "w1", "infl1", "share-2", b_old
             )
         self.assertEqual(ctx.exception.status, 400)
-        b_new = self.h.share_signature("w1", new_ids[1], "infl1", "m")
         with self.assertRaises(ServiceError) as ctx:
             self.svc.submit_sign_session_share(
-                "w1", "infl1", new_ids[1], b_new
+                "w1", "infl1", "share-1", a1
             )
         self.assertEqual(ctx.exception.status, 400)
-        # 轮换后的新会话用新份额正常聚合
-        self._open(sid="after1", message="m")
-        x = self.h.share_signature("w1", new_ids[0], "after1", "m")
-        y = self.h.share_signature("w1", new_ids[1], "after1", "m")
-        self.svc.submit_sign_session_share("w1", "after1", new_ids[0], x)
+
+    def test_rotation_inflight_collecting_completes_with_new_shares(self):
+        self._open(sid="infl2", message="m")
+        a1 = self.h.share_signature("w1", "share-1", "infl2", "m")
+        self.svc.submit_sign_session_share("w1", "infl2", "share-1", a1)
+        _, rot = self.svc.create_share_rotation("w1", "rot-1")
+        self.assertEqual(
+            self.svc.activate_share_rotation("w1", "rot-1")[0], 201
+        )
+        new_ids = rot["share_ids"]
+        self.assertEqual(
+            self.svc.get_sign_session("w1", "infl2")["missing_shares"],
+            list(new_ids),
+        )
+        x = self.h.share_signature("w1", new_ids[0], "infl2", "m")
+        y = self.h.share_signature("w1", new_ids[1], "infl2", "m")
         code, view = self.svc.submit_sign_session_share(
-            "w1", "after1", new_ids[1], y
+            "w1", "infl2", new_ids[0], x
+        )
+        self.assertEqual(code, 201)
+        self.assertEqual(view["received_shares"], [new_ids[0]])
+        code, view = self.svc.submit_sign_session_share(
+            "w1", "infl2", new_ids[1], y
         )
         self.assertEqual(code, 201)
         self.assertEqual(view["state"], "signed")
+        # 旧 share-1 的投递事件保留在仅追加审计，但不再出现在会话视图；
+        # 新聚合只由两份新份额构成，独立验证通过
+        wallet = self.svc.get_wallet("w1")
+        pks = crypto.split_public_key(bytes.fromhex(wallet["public_key"]))
+        parts = crypto.split_signature(bytes.fromhex(view["aggregate_signature"]))
+        payload = crypto.build_payload("infl2", "m")
+        self.assertTrue(crypto.verify_share(pks[0], payload, parts[0]))
+        self.assertTrue(crypto.verify_share(pks[1], payload, parts[1]))
+        # 已剔除的旧份额再投 400；旧审计事件不重复
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.submit_sign_session_share("w1", "infl2", "share-1", a1)
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_rotation_migrates_ready_session_and_new_shares_complete(self):
+        # ready（门控未过）会话在轮换后同样迁移：剔除旧两份，新份额补齐后
+        # 门控通过即可聚合
+        self.svc.put_policy("w1", 1, 3600)
+        self._open(sid="gr1", message="msg")
+        old = {
+            sid: self.h.share_signature("w1", sid, "gr1", "msg")
+            for sid in ("share-1", "share-2")
+        }
+        self.svc.submit_sign_session_share("w1", "gr1", "share-1", old["share-1"])
+        code, view = self.svc.submit_sign_session_share(
+            "w1", "gr1", "share-2", old["share-2"]
+        )
+        self.assertEqual(code, 409)
+        self.assertEqual(view["state"], "ready")
+        _, rot = self.svc.create_share_rotation("w1", "rot-1")
+        self.svc.activate_share_rotation("w1", "rot-1")
+        new_ids = rot["share_ids"]
+        view = self.svc.get_sign_session("w1", "gr1")
+        self.assertEqual(view["state"], "collecting")
+        self.assertEqual(view["received_shares"], [])
+        self.assertEqual(view["missing_shares"], list(new_ids))
+        # 门控补齐
+        self.svc.create_sign_request("w1", "gr1", "msg")
+        self.svc.approve("w1", "gr1", "ops-1")
+        new = {
+            sid: self.h.share_signature("w1", sid, "gr1", "msg")
+            for sid in new_ids
+        }
+        self.svc.submit_sign_session_share("w1", "gr1", new_ids[0], new[new_ids[0]])
+        code, view = self.svc.submit_sign_session_share(
+            "w1", "gr1", new_ids[1], new[new_ids[1]]
+        )
+        self.assertEqual(code, 201)
+        self.assertEqual(view["state"], "signed")
+
+    def test_rotation_signed_old_share_different_value_is_409(self):
+        self._open(sid="done2", message="m")
+        a = self.h.share_signature("w1", "share-1", "done2", "m")
+        b = self.h.share_signature("w1", "share-2", "done2", "m")
+        self.svc.submit_sign_session_share("w1", "done2", "share-1", a)
+        self.svc.submit_sign_session_share("w1", "done2", "share-2", b)
+        _, rot = self.svc.create_share_rotation("w1", "rot-1")
+        self.svc.activate_share_rotation("w1", "rot-1")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.submit_sign_session_share(
+                "w1", "done2", "share-1", "00" * 64
+            )
+        self.assertEqual(ctx.exception.status, 409)
 
 
 class SignSessionCorruptionTest(unittest.TestCase):
@@ -683,6 +854,219 @@ class SignSessionCorruptionTest(unittest.TestCase):
         # 现场保留
         with open(self._session_file(d, "w1")) as f:
             self.assertEqual(f.read(), "{broken json")
+
+
+class SignSessionStrictRecoveryTest(unittest.TestCase):
+    """严格加载：UTC 时间、事件动作顺序、已收份额集合、逐份公钥重验与
+    signed 聚合重算一致；JSON 可解析但语义矛盾的现场原样保留、拒绝就绪。"""
+
+    def _sessions_path(self, d):
+        return os.path.join(d, "sign-sessions", "w1.json")
+
+    def _audit_path(self, d):
+        return os.path.join(d, "audit", "w1.json")
+
+    def _one_share_scene(self):
+        d = tempfile.mkdtemp()
+        h = make_harness(d)
+        h.service.create_wallet("w1", 2)
+        h.service.create_sign_session("w1", "s1", "m", 600)
+        sig = h.share_signature("w1", "share-1", "s1", "m")
+        h.service.submit_sign_session_share("w1", "s1", "share-1", sig)
+        return d, h, sig
+
+    def _tamper_sessions(self, d, mutate):
+        path = self._sessions_path(d)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        mutate(data)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def _assert_refuses_ready(self, d, label):
+        with self.assertRaises(RecoveryError, msg=label):
+            make_harness(d)
+        # 现场原样保留，不归一、不覆盖
+        self.assertTrue(os.path.exists(self._sessions_path(d)), label)
+
+    def test_bad_expires_at_refuses(self):
+        d, _, _ = self._one_share_scene()
+        self._tamper_sessions(
+            d, lambda data: data["s1"].__setitem__("expires_at", "nonsense")
+        )
+        self._assert_refuses_ready(d, "unparseable expires_at")
+
+    def test_naive_expires_at_refuses(self):
+        d, _, _ = self._one_share_scene()
+        self._tamper_sessions(
+            d, lambda data: data["s1"].__setitem__(
+                "expires_at", "2026-09-22T00:00:00"
+            )
+        )
+        self._assert_refuses_ready(d, "naive expires_at")
+
+    def test_non_utc_offset_expires_at_refuses(self):
+        d, _, _ = self._one_share_scene()
+        self._tamper_sessions(
+            d, lambda data: data["s1"].__setitem__(
+                "expires_at", "2026-09-22T03:00:00+03:00"
+            )
+        )
+        self._assert_refuses_ready(d, "non-UTC offset expires_at")
+
+    def test_forged_stored_signature_refuses(self):
+        d, _, _ = self._one_share_scene()
+        self._tamper_sessions(
+            d,
+            lambda data: data["s1"]["shares"][0].__setitem__(
+                "signature", "00" * 64
+            ),
+        )
+        self._assert_refuses_ready(d, "forged stored signature")
+
+    def test_committed_share_without_storage_refuses(self):
+        d, _, _ = self._one_share_scene()
+        # 有 share_received 事件，却删掉已存份额（无轮换可解释）
+        self._tamper_sessions(
+            d, lambda data: data["s1"].__setitem__("shares", [])
+        )
+        self._assert_refuses_ready(d, "event without stored share")
+
+    def test_signed_aggregate_mismatch_refuses(self):
+        d = tempfile.mkdtemp()
+        h = make_harness(d)
+        h.service.create_wallet("w1", 2)
+        h.service.create_sign_session("w1", "s1", "m", 600)
+        for sid in ("share-1", "share-2"):
+            h.service.submit_sign_session_share(
+                "w1", "s1", sid,
+                h.share_signature("w1", sid, "s1", "m"),
+            )
+        self._tamper_sessions(
+            d, lambda data: data["s1"].__setitem__(
+                "aggregate_signature", "ab" * 128
+            )
+        )
+        self._assert_refuses_ready(d, "aggregate mismatch")
+
+    def test_event_after_terminal_refuses(self):
+        d = tempfile.mkdtemp()
+        h = make_harness(d)
+        h.service.create_wallet("w1", 2)
+        h.service.create_sign_session("w1", "s1", "m", 1)
+        time.sleep(1.1)
+        h.service.get_sign_session("w1", "s1")  # expired
+        with open(self._audit_path(d), encoding="utf-8") as f:
+            audit = json.load(f)
+        extra = dict(audit["events"][-1])
+        extra["seq"] = audit["next_seq"]
+        extra["details"] = {
+            "action": "share_received",
+            "share_id": "share-1",
+            "state": "collecting",
+        }
+        audit["events"].append(extra)
+        audit["next_seq"] += 1
+        with open(self._audit_path(d), "w", encoding="utf-8") as f:
+            json.dump(audit, f)
+        self._assert_refuses_ready(d, "action after terminal")
+
+    def test_duplicate_share_received_event_refuses(self):
+        d, _, _ = self._one_share_scene()
+        with open(self._audit_path(d), encoding="utf-8") as f:
+            audit = json.load(f)
+        src = next(
+            e for e in audit["events"]
+            if isinstance(e.get("details"), dict)
+            and e["details"].get("action") == "share_received"
+        )
+        extra = dict(src)
+        extra["seq"] = audit["next_seq"]
+        audit["events"].append(extra)
+        audit["next_seq"] += 1
+        with open(self._audit_path(d), "w", encoding="utf-8") as f:
+            json.dump(audit, f)
+        self._assert_refuses_ready(d, "duplicate share_received")
+
+    def test_created_event_without_record_refuses(self):
+        # 文件存在但被清空成 {}，而审计里留有 created 事件：JSON 可解析、
+        # 事件与记录矛盾，原样保留并拒绝就绪（区别于“文件不存在”的空状态）。
+        d, _, _ = self._one_share_scene()
+        with open(self._sessions_path(d), "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        self._assert_refuses_ready(d, "created event without record")
+
+    def test_missing_session_file_is_normal_empty_state(self):
+        # 文件整体缺失即正常空状态（创建回滚正是删除文件）：不读审计、
+        # 不阻止就绪，未知会话 404。
+        d, h, _ = self._one_share_scene()
+        os.unlink(self._sessions_path(d))
+        h2 = make_harness(d)
+        with self.assertRaises(ServiceError) as ctx:
+            h2.service.get_sign_session("w1", "s1")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_stored_share_without_event_is_rolled_back(self):
+        # 崩溃窗口：份额落盘、share_received 事件未落 -> 重启剔除该份额
+        d, h, sig = self._one_share_scene()
+        with open(self._audit_path(d), encoding="utf-8") as f:
+            audit = json.load(f)
+        audit["events"] = [
+            e for e in audit["events"]
+            if not (
+                isinstance(e.get("details"), dict)
+                and e["details"].get("action") == "share_received"
+            )
+        ]
+        for i, event in enumerate(audit["events"], 1):
+            event["seq"] = i
+        audit["next_seq"] = len(audit["events"]) + 1
+        with open(self._audit_path(d), "w", encoding="utf-8") as f:
+            json.dump(audit, f)
+        h2 = make_harness(d)
+        view = h2.service.get_sign_session("w1", "s1")
+        self.assertEqual(view["state"], "collecting")
+        self.assertEqual(view["received_shares"], [])
+        # 该份额可再次首收 201（无孤立状态）
+        code, _ = h2.service.submit_sign_session_share(
+            "w1", "s1", "share-1", sig
+        )
+        self.assertEqual(code, 201)
+
+    def test_signed_event_forward_rolls_ready_record(self):
+        # signed 事件在、记录退回 ready（聚合状态丢失）-> 前滚 signed 重算
+        d = tempfile.mkdtemp()
+        h = make_harness(d)
+        h.service.create_wallet("w1", 2)
+        h.service.create_sign_session("w1", "s1", "m", 600)
+        for sid in ("share-1", "share-2"):
+            h.service.submit_sign_session_share(
+                "w1", "s1", sid,
+                h.share_signature("w1", sid, "s1", "m"),
+            )
+        signed = h.service.get_sign_session("w1", "s1")
+        self._tamper_sessions(
+            d,
+            lambda data: (
+                data["s1"].__setitem__("state", "ready"),
+                data["s1"].pop("aggregate_signature", None),
+            ),
+        )
+        h2 = make_harness(d)
+        view = h2.service.get_sign_session("w1", "s1")
+        self.assertEqual(view["state"], "signed")
+        self.assertEqual(
+            view["aggregate_signature"], signed["aggregate_signature"]
+        )
+
+    def test_recovered_sessions_have_continuous_seq(self):
+        # 多次恢复不产生重复事件或 seq 缺口
+        d, _, _ = self._one_share_scene()
+        for _ in range(3):
+            make_harness(d).service.get_sign_session("w1", "s1")
+        h = make_harness(d)
+        seqs = [e["seq"] for e in h.service.get_audit_events("w1")["events"]]
+        self.assertEqual(seqs, list(range(1, len(seqs) + 1)))
 
 
 class SignSessionHttpTest(unittest.TestCase):

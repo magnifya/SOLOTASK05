@@ -117,9 +117,10 @@
   仅在 `signed` 时存在（128 字节 hex，即两份份额签名的有序拼接）。
   视图不回传单个份额签名。
 - `GET .../sign-sessions/{id}` 返回视图；未知会话 `404`。查询与份额
-  投递都会**懒过期**：到点的 `collecting` 会话持久化为 `expired`。
+  投递都会**懒过期**：到点的 `collecting`/`ready` 会话持久化为
+  `expired`。创建重放（同参 `200`）不触发懒过期。
 - `POST .../sign-sessions/{id}/shares` 投递 `{"share_id", "signature"}`：
-  仅接受**在用份额**对会话 `id` 与 `message` **直接拼接载荷**的有效
+  仅接受**当前在用份额**对会话 `id` 与 `message` **直接拼接载荷**的有效
   Ed25519 份额签名（64 字节 hex）。首收 `201`；同份额同值重放 `200`、
   异值 `409`；编码/长度/校验失败、份额未知或已因轮换失效 `400`；
   未知会话 `404`；会话已 `expired`（含投递时懒过期）`409`。
@@ -127,18 +128,39 @@
   （与 `POST /sign` 同一套规则；只读校验，不改审批单状态）：门控通过
   转 `signed`（`201`）；门控失败返回 `409` 并保留 `ready`，审批补齐后
   重放任一份已收份额即重试，成功 `200`。`signed` 后任意重放均 `200`
-  同体。`ready`/`signed` 不再受会话超时约束。
+  同体。`collecting` 与 `ready` **都受会话超时约束**：`ready` 到点同样
+  原子转 `expired`（仅一条 `action=expired` 事件），此后投递一律 `409`、
+  终态不再聚合；只有 `signed`/`expired` 不受到期时间影响。
 - 会话记录（`sign-sessions/<wallet_id>.json`，含份额签名但**不含任何
   私钥**）与审计事件都在每钱包跨进程事务锁内原子持久化：服务重启后
   collecting/ready/signed/expired 全部续作，并发（含多进程共用同一
-  data-dir）只有一个首次聚合。创建以 `action=created` 事件为提交点
-  （事件未落盘的残留记录重启即清），聚合以 `action=signed` 事件为唯一
-  提交点（事件在则前滚补齐为唯一 signed，事件不在则回滚 ready 可重试）。
+  data-dir）只有一个首次状态推进（首次收份额、首次过期、首次聚合）。
+  创建以 `action=created` 事件为提交点（事件未落盘的残留记录重启即清），
+  聚合以 `action=signed` 事件为唯一提交点（事件在则前滚补齐为唯一
+  signed，事件不在则回滚 ready 可重试），过期以 `action=expired` 为唯一
+  提交点（事件在则前滚终态，事件不在则回滚原态由下次访问重新过期）。
   会话文件 JSON 损坏或形状异常时 fail-closed：常驻请求统一 `503`，
   `serve` 拒绝就绪，保留现场不归一、不覆盖。
-- 份额轮换后：已 `signed` 会话的旧份额同值重放仍 `200`；未齐份会话只
-  能使用创建时快照的在用份额，旧份额补投 `400`；轮换后新建的会话使用
-  新份额。既有 `sign`、`share-sign` 与轮换行为不受影响。
+- **持久化严格加载**：重启或下次持锁访问时，逐会话严格校验——
+  `expires_at`/`created_at` 必须是可解析的 UTC 时间（拒绝朴素时间与
+  非零偏移）；`session_event` 的动作顺序必须合法（`created` 首个且唯一，
+  其后只能是 `share_received`，`expired`/`signed` 至多一次且为最后动作、
+  二者互斥），每次 `share_received` 的份额必须属于该 seq 时刻的在用快照、
+  不重复，且 `details.state` 与当时有效已收份数一致；已收份额集合必须与
+  事件一致（无事件的已存份额是崩溃窗口残留，回滚剔除；有事件却无份额且
+  无轮换可解释则 fail-closed）；每份已存签名都用其**相应历史公钥**重新
+  校验（旧份额公钥沿轮换记录链解析）；`signed` 还按有序快照重算 128 字节
+  聚合签名并与记录一致。任何 JSON 可解析但时间、状态、事件、份额或聚合
+  结果自相矛盾的现场都原样保留、fail-closed。
+- 份额轮换后：
+  - **已 `signed` 会话**冻结创建时快照与原聚合结果：构成该聚合的旧份额
+    同值重放仍 `200` 同体、异值 `409`；轮换不重算、不改变其聚合；
+  - **`collecting`/`ready` 在途会话**在轮换激活后的下次持锁访问时迁移到
+    钱包当前两份在用份额：已收的旧份额被剔除，视图的 `received_shares`/
+    `missing_shares` 同步为新快照，旧份额（含此前已收旧份额的同值重放）
+    投递一律 `400`，两份新份额可继续投递并完成；
+  - 轮换后新建的会话使用新份额。既有 `sign`、`share-sign` 与轮换行为
+    不受影响。
 
 会话审计事件统一为 `session_event`（七字段
 `seq, type, at, request_id, actor_id, reason, details`，`request_id` 为
@@ -148,7 +170,7 @@
 | ---- | ---- | ---- |
 | `created` | 会话首次创建 | `{message, timeout_seconds}` |
 | `share_received` | 份额首次收妥（每份一次） | `{share_id, state: collecting\|ready}` |
-| `expired` | collecting 会话到点被懒过期（仅一次） | `{state: expired}` |
+| `expired` | collecting/ready 会话到点被懒过期（仅一次） | `{state: expired}` |
 | `signed` | 首次聚合成功（仅一次） | `{state: signed}` |
 
 重放（创建重放、同值份额重放、signed 重放、门控重试）不产生新事件；

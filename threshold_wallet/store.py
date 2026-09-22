@@ -49,6 +49,7 @@ import re
 import shutil
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .crypto import ShareKey, combine_public_keys, public_key_from_private
@@ -77,6 +78,31 @@ def _is_plain_int(value: object) -> bool:
 
 def _valid_safe_id(value: object) -> bool:
     return isinstance(value, str) and bool(_SAFE_ID.match(value))
+
+
+def parse_utc_iso(value: object) -> Optional[datetime]:
+    """严格解析 UTC 时间戳字符串。
+
+    仅接受带时区信息的 ISO-8601 字符串（服务自身始终写 ``...Z``）；
+    朴素时间（无 tz）、非字符串、不可解析或偏移非零固定值之外的内容
+    一律返回 None。返回统一到 UTC 的 aware datetime，便于严格比较。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value
+    try:
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # 朴素时间无法判定时区，绝不按本地时间猜测
+        return None
+    if parsed.utcoffset() != timedelta(0):
+        # 只接受 UTC（零偏移），其他时区不做隐式换算
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def approval_policy_shape_ok(policy: object) -> bool:
@@ -506,10 +532,18 @@ class WalletStore:
         """签名会话记录形状的严格校验（损坏文件 fail-closed 用）。
 
         要求：id 为安全标识且与键一致；message 为非空字符串；
-        timeout_seconds 为非布尔正整数；expires_at 为字符串；state 仅
-        collecting/ready/signed/expired；shares 为条目数组，share_id
-        不重复且为当前记录的份额；signed 时必须带 128 字节聚合签名；
-        collecting/ready/expired 不得带签名。"""
+        timeout_seconds 为非布尔正整数；expires_at/created_at 为可解析的
+        UTC 时间字符串；state 仅 collecting/ready/signed/expired；
+        share_ids 恰为两个不重复的合法份额标识；shares 为条目数组，
+        share_id 不重复且属于 share_ids 快照，每份签名恰为 64 字节；
+        signed 必须带恰两份份额与 128 字节聚合签名；ready 必须恰两份；
+        collecting/expired 可有 0~2 份——ready 到点同样会原子转 expired，
+        故 expired 允许保留齐备份额；这两个非终态/终态不得携带聚合签名。
+
+        状态、事件序列与份额集合的语义一致性（含逐份公钥重验与 signed
+        聚合重算）由 service 层恢复对账完成：崩溃窗口内磁盘可能短暂出现
+        “事件未落盘的终态”，形状合法即可加载，由恢复按提交点前滚/回滚。
+        """
         if not isinstance(record, dict):
             return False
         if record.get("id") != key or not _valid_safe_id(key):
@@ -520,7 +554,7 @@ class WalletStore:
         timeout = record.get("timeout_seconds")
         if not _is_plain_int(timeout) or timeout <= 0:
             return False
-        if not isinstance(record.get("expires_at"), str):
+        if parse_utc_iso(record.get("expires_at")) is None:
             return False
         if not isinstance(record.get("created_at"), str):
             return False
@@ -538,7 +572,7 @@ class WalletStore:
         if len(set(expected)) != 2:
             return False
         shares = record.get("shares")
-        if not isinstance(shares, list):
+        if not isinstance(shares, list) or len(shares) > 2:
             return False
         seen: set[str] = set()
         for entry in shares:
@@ -561,18 +595,15 @@ class WalletStore:
             if len(aggregate) != 128:
                 return False
         elif state == "ready":
+            # ready 必须两份齐备；不到两份的 ready 是矛盾状态
             if len(seen) != 2:
                 return False
             if aggregate_hex is not None:
                 return False
-        elif state == "collecting":
-            if len(seen) >= 2:
-                return False
-            if aggregate_hex is not None:
-                return False
         else:
-            # expired：超时只发生在收齐之前（collecting），故不足两份且无签名
-            if len(seen) >= 2 or aggregate_hex is not None:
+            # collecting / expired：0~2 份（ready 到点同样转 expired），
+            # 但不得携带聚合签名
+            if aggregate_hex is not None:
                 return False
         return True
 
@@ -605,6 +636,10 @@ class WalletStore:
         文件不存在（尚无会话）视为正常空状态。"""
         _check_id("wallet_id", wallet_id)
         self._read_sign_sessions(wallet_id)
+
+    def sign_session_file_exists(self, wallet_id: str) -> bool:
+        """该钱包的签名会话文件是否存在（存在即需与审计对账，哪怕为空）。"""
+        return os.path.exists(self._sign_sessions_path(wallet_id))
 
     def list_sign_session_wallet_ids(self) -> list[str]:
         """返回存在签名会话文件的全部 wallet_id（启动恢复扫描用）。"""
