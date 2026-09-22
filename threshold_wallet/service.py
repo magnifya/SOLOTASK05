@@ -144,9 +144,9 @@ class WalletService:
             with self._wallet_lock(wallet_id):
                 self._recover_wallet(wallet_id)
 
-    def _activated_rotations(self, wallet_id: str) -> dict[str, dict]:
-        """该钱包已落盘的 share_rotation_activated 事件映射。"""
-        return self._audit.activated_rotation_events(wallet_id)
+    def _rotation_events(self, wallet_id: str) -> list[dict]:
+        """该钱包全部 prepared/activated 轮换审计事件（按 seq 升序）。"""
+        return self._audit.rotation_events(wallet_id)
 
     def _recover_wallet(self, wallet_id: str) -> None:
         """在已持有该钱包事务锁的前提下，恢复轮换现场与未完成的资产提交。
@@ -156,15 +156,16 @@ class WalletService:
 
         损坏 JSON / 形状异常在存储层表现为 ValueError：恢复无法对账时同样
         fail-closed，统一转成 RecoveryError，绝不把 ValueError 漏给调用方
-        当成普通参数错误。"""
+        当成普通参数错误。返回轮换时间线供签名会话恢复复用。"""
         try:
             # 先校验资产账本：账本损坏时任何对账都不可信，直接 fail-closed。
             self._store.check_asset_ledger(wallet_id)
-            self._store.recover_wallet_rotation(
-                wallet_id, self._activated_rotations(wallet_id)
+            timeline = self._store.recover_wallet_rotation(
+                wallet_id, self._rotation_events(wallet_id)
             )
             self._recover_wallet_asset_commits(wallet_id)
-            self._recover_sign_sessions(wallet_id)
+            self._recover_sign_sessions(wallet_id, timeline)
+            return timeline
         except RecoveryError:
             raise
         except (OSError, ValueError) as exc:
@@ -205,44 +206,49 @@ class WalletService:
             if self._store.list_asset_intents(wallet_id):
                 self._recover_wallet(wallet_id)
                 return
-            rotations = self._store.list_rotations(wallet_id)
-            staging_ids = set(self._store.list_staging_rotation_ids(wallet_id))
-            needs_recovery = False
-            active_check = False
-            for record in rotations:
-                state = record.get("state")
-                rid = record.get("rotation_id")
-                if state == "activating":
-                    needs_recovery = True
-                elif state == "active":
-                    # 干净完成的 active：事件在且暂存已清空。暂存残留或
-                    # 事件缺失才是崩溃现场（后者需读审计判定）。
-                    if rid in staging_ids:
-                        needs_recovery = True
-                    else:
-                        active_check = True
-                elif state == "prepared" and isinstance(rid, str):
-                    # prepared 的暂存目录是预期现场，不算孤儿
-                    staging_ids.discard(rid)
-            if not needs_recovery and active_check:
-                activated = self._activated_rotations(wallet_id)
-                for record in rotations:
-                    if (
-                        record.get("state") == "active"
-                        and record.get("rotation_id") not in activated
-                    ):
-                        needs_recovery = True
-                        break
-            if not needs_recovery and staging_ids:
-                # 无对应 prepared 记录的孤儿暂存目录
-                needs_recovery = True
-            if needs_recovery:
-                # 内含轮换 -> 资产提交 -> 会话的完整有序恢复
+            # 轮换现场的快速检测只看磁盘（记录/暂存/元数据/在用份额），不
+            # 读审计：静止的 prepared 现场零审计开销，审计文件损坏时不依赖
+            # 审计的路由仍可服务；一旦磁盘显示他进程崩溃残留
+            # （activating、active 带暂存、孤儿暂存、元数据与链尖不一致），
+            # 再读审计按 seq 时间线严格对账。探测读到畸形记录（无法仅凭
+            # 磁盘判定它是否已提交）时同样转入完整恢复：读审计后已激活则
+            # fail-closed，未激活则按契约安全删除。磁盘静止但存在 active
+            # 记录时，追加一次只读审计校验（不写盘）：捕获激活事件被删/
+            # 重复/断链等纯磁盘探测发现不了的篡改；校验通过即静止，不产生
+            # 任何写入。
+            try:
+                needs_rotation_recovery = (
+                    self._store.rotation_recovery_needed(wallet_id)
+                )
+            except CorruptDataError:
+                needs_rotation_recovery = True
+            if needs_rotation_recovery:
                 self._recover_wallet(wallet_id)
                 return
+            # 磁盘探测静止时，仅当存在 active 记录才追加只读审计校验
+            # （纯 prepared/无轮换现场不读审计，审计损坏不影响无关路由）。
+            records = self._store.list_rotations(wallet_id)
+            if any(r.get("state") == "active" for r in records):
+                timeline = self._store.load_rotation_timeline(
+                    wallet_id, self._rotation_events(wallet_id)
+                )
+                if not self._store.rotation_timeline_is_static(
+                    wallet_id,
+                    timeline,
+                    set(self._store.list_staging_rotation_ids(wallet_id)),
+                ):
+                    self._recover_wallet(wallet_id)
+                    return
             # 轮换现场静止后，再对他进程崩溃遗留的半完成会话对账（无会话
-            # 文件时立即返回，零开销；此时读取审计不影响审计无关路由）。
-            self._recover_sign_sessions(wallet_id)
+            # 文件时立即返回，零开销且不读审计：审计文件损坏时不依赖审计
+            # 的路由仍可用）。
+            if self._store.sign_session_file_exists(wallet_id):
+                self._recover_sign_sessions(
+                    wallet_id,
+                    self._store.load_rotation_timeline(
+                        wallet_id, self._rotation_events(wallet_id)
+                    ),
+                )
         except RecoveryError:
             raise
         except (OSError, ValueError) as exc:
@@ -1126,23 +1132,26 @@ class WalletService:
                     )
                 except BaseException:
                     # 以激活事件是否真正落盘为唯一判据，而不是是否抛错：
-                    landed = (
-                        self._activated_rotations(wallet_id).get(rotation_id)
+                    # 在同一把钱包锁内按审计 seq 时间线重放恢复——事件在
+                    # 则前滚为唯一 active 并清理残留（绝不回滚、不重复记
+                    # 事件），事件不在则恢复上一轮公钥/份额、置回 prepared
+                    # （保留经校验的暂存，可重试）。
+                    timeline = self._store.recover_wallet_rotation(
+                        wallet_id, self._rotation_events(wallet_id)
+                    )
+                    landed = next(
+                        (
+                            a
+                            for a in timeline.committed
+                            if a.rotation_id == rotation_id
+                        ),
+                        None,
                     )
                     if landed is not None:
-                        # 事件已落盘（提交不可撤回）：前滚为唯一 active 并
-                        # 清理残留，绝不回滚、不重复记事件
-                        self._store.forward_complete_activation(
-                            wallet_id, active_record, landed
+                        view = self._store.get_rotation(
+                            wallet_id, rotation_id
                         )
-                        return 201, self._rotation_view(active_record)
-                    # 事件未落盘：回滚份额文件、公钥与状态，清理激活备份
-                    # （保留暂存的新份额文件，prepared 轮换可重试激活）
-                    self._store.rollback_activation_files(wallet_id, record)
-                    self._store.update_rotation(wallet_id, rotation_id, record)
-                    self._store.delete_activation_backups(
-                        wallet_id, rotation_id
-                    )
+                        return 201, self._rotation_view(view)
                     raise
                 # 激活成功：删除暂存的新份额文件与备份。此清理非提交点，
                 # 若清理 I/O 失败也不改结果（事件已落盘，激活已生效），
@@ -1945,25 +1954,21 @@ class WalletService:
     # -- 会话历史公钥解析（轮换后恢复重验 / signed 旧份额重放）--------------
 
     def _session_share_public_keys(
-        self, wallet_id: str, share_ids: list[str], current_meta: dict
+        self,
+        wallet_id: str,
+        share_ids: list[str],
+        current_meta: dict,
+        timeline,
     ) -> dict[str, str]:
-        """收集给定份额 id 对应的份额公钥。
+        """收集给定份额 id 的权威份额公钥（恢复重验用）。
 
-        当前在用份额取自钱包元数据；已轮换失效的旧份额公钥从轮换记录链
-        获取（每个轮换记录带其在用时的有序 share_ids 与钱包 public_key），
-        确保 signed 会话旧份额同值重放与启动恢复的逐份重验有权威公钥，
-        而不是信任请求自报或猜写。
-
-        - 轮换 R 的两份新份额公钥＝R.public_key 的前/后 32 字节，顺序按
-          R.share_ids；
-        - 最初的 share-1/share-2 公钥＝"创世旧公钥"（任一激活记录的
-          previous_public_key 中不等于任何轮换 public_key 的那一个）的
-          前/后 32 字节。
-        任一份额找不到权威公钥或记录自相矛盾即 fail-closed。
+        公钥只来自严格校验过的轮换时间线：创世份额公钥＝首个激活事件
+        previous_public_key 的两半（无任何激活时＝钱包元数据当前公钥的
+        两半）；各历史轮次份额公钥＝其激活事件 public_key 按 share_ids
+        顺序拆分。钱包元数据必须与时间线链尖一致，否则 fail-closed。
+        任一份额找不到权威公钥即 RecoveryError，绝不信任请求自报或猜写。
         """
-        public: dict[str, str] = {}
-        rotations = self._store.list_rotations(wallet_id)
-        rotation_pubkeys: set[str] = set()
+        public = dict(timeline.share_public_keys())
 
         def halves(pub_hex: str, where: str) -> tuple[str, str]:
             try:
@@ -1978,77 +1983,41 @@ class WalletService:
                 )
             return raw[:32].hex(), raw[32:].hex()
 
-        # 当前在用份额：钱包元数据 shares 有序，公钥两半按其顺序
         current_list = current_meta.get("shares")
+        current_pub = current_meta.get("public_key")
         if (
-            isinstance(current_list, list)
-            and len(current_list) == 2
-            and isinstance(current_meta.get("public_key"), str)
+            not isinstance(current_list, list)
+            or len(current_list) != 2
+            or not all(isinstance(s, dict) for s in current_list)
+            or not isinstance(current_pub, str)
         ):
-            first, second = halves(
-                current_meta["public_key"], "wallet public_key"
-            )
-            ordered_current = [first, second]
-            for index, entry in enumerate(current_list):
-                if (
-                    isinstance(entry, dict)
-                    and isinstance(entry.get("share_id"), str)
-                    and isinstance(entry.get("public_key"), str)
-                    and entry["public_key"] == ordered_current[index]
-                ):
-                    public[entry["share_id"]] = ordered_current[index]
-                else:
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} metadata shares are inconsistent"
-                    )
-        else:
             raise RecoveryError(
                 f"wallet {wallet_id!r} metadata is malformed"
             )
-
-        # 各已激活轮换在用时的份额公钥（prepared 未激活的暂存份额绝不能
-        # 成为重验依据）
-        previous_pubkeys: set[str] = set()
-        for rotation in rotations:
-            rid = rotation.get("rotation_id")
-            rids = rotation.get("share_ids")
-            pub_hex = rotation.get("public_key")
-            if (
-                not isinstance(rid, str)
-                or not isinstance(rids, list)
-                or len(rids) != 2
-                or not all(isinstance(sid, str) for sid in rids)
-                or not isinstance(pub_hex, str)
-            ):
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} rotation record {rid!r} is malformed"
-                )
-            if rotation.get("state") != "active":
-                # prepared/activating（未提交激活）的份额绝不能成为重验依据
-                continue
-            rotation_pubkeys.add(pub_hex)
-            previous = rotation.get("previous_public_key")
-            if isinstance(previous, str):
-                previous_pubkeys.add(previous)
-            first, second = halves(
-                pub_hex, f"rotation {rid!r} public_key"
-            )
-            public.setdefault(rids[0], first)
-            public.setdefault(rids[1], second)
-
-        # 创世旧公钥：previous 链顶端（不等于任何轮换在用公钥）
-        genesis_candidates = previous_pubkeys - rotation_pubkeys - {
-            current_meta["public_key"]
-        }
-        if len(genesis_candidates) == 1:
-            genesis = next(iter(genesis_candidates))
-            first, second = halves(genesis, "genesis previous public_key")
-            public.setdefault("share-1", first)
-            public.setdefault("share-2", second)
-        elif genesis_candidates:
+        live_ids = timeline.live_share_ids()
+        live_pub = timeline.live_public_key(current_pub)
+        if current_pub != live_pub:
             raise RecoveryError(
-                f"wallet {wallet_id!r} has ambiguous rotation history"
+                f"wallet {wallet_id!r} metadata public_key does not match "
+                "the rotation timeline tip"
             )
+        first, second = halves(current_pub, "wallet public_key")
+        ordered = [first, second]
+        for index, entry in enumerate(current_list):
+            sid = entry.get("share_id")
+            pub = entry.get("public_key")
+            if sid != live_ids[index] or pub != ordered[index]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} metadata shares are inconsistent "
+                    "with the rotation timeline"
+                )
+            existing = public.get(sid)
+            if existing is not None and existing != pub:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share {sid!r} has conflicting "
+                    "public keys between metadata and the rotation timeline"
+                )
+            public[sid] = pub
 
         absent = [sid for sid in share_ids if sid not in public]
         if absent:
@@ -2431,50 +2400,11 @@ class WalletService:
 
     # -- 签名会话严格加载与崩溃恢复 ----------------------------------------
 
-    def _rotation_timeline(self, wallet_id: str) -> list[tuple[int, tuple[str, str]]]:
-        """返回按 seq 升序的份额轮换激活时间线 [(seq, (share-1, share-2))]。
-
-        恢复据此判定任一审计 seq 时刻"在用两份份额"的快照：首个激活之前
-        为创世份额 ("share-1", "share-2")，之后取最近一次激活的 share_ids。
-        """
-        timeline: list[tuple[int, tuple[str, str]]] = []
-        events = self._audit.activated_rotation_events(wallet_id)
-        for rotation_id, event in events.items():
-            details = event.get("details")
-            seq = event.get("seq")
-            if not isinstance(details, dict) or not isinstance(seq, int):
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} rotation activation event for "
-                    f"{rotation_id!r} is malformed"
-                )
-            share_ids = details.get("share_ids")
-            if (
-                not isinstance(share_ids, list)
-                or len(share_ids) != 2
-                or not all(isinstance(sid, str) for sid in share_ids)
-            ):
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} rotation activation event for "
-                    f"{rotation_id!r} has malformed share_ids"
-                )
-            timeline.append((seq, (share_ids[0], share_ids[1])))
-        timeline.sort(key=lambda item: item[0])
-        return timeline
-
-    @staticmethod
-    def _active_share_set_at(
-        timeline: list[tuple[int, tuple[str, str]]], seq: int
-    ) -> tuple[str, str]:
-        active = ("share-1", "share-2")
-        for activation_seq, share_ids in timeline:
-            if activation_seq <= seq:
-                active = share_ids
-            else:
-                break
-        return active
-
-    def _recover_sign_sessions(self, wallet_id: str) -> None:
+    def _recover_sign_sessions(self, wallet_id: str, timeline) -> None:
         """启动/持锁恢复签名会话崩溃现场（调用方须持钱包事务锁）。
+
+        ``timeline`` 为已严格校验的轮换时间线（轮换恢复先于本方法完成），
+        各 seq 时刻的在用份额快照与历史份额公钥均以它为权威。
 
         形状/UTC 时间严格校验由存储层完成（损坏即 CorruptDataError ->
         503/阻止就绪，保留现场）。对账以 session_event 为唯一提交点：
@@ -2507,7 +2437,6 @@ class WalletService:
         if not file_exists:
             return
         events_by_session = self._audit.session_events(wallet_id)
-        timeline = self._rotation_timeline(wallet_id)
         wallet = self._store.get_wallet(wallet_id)
         if records and not isinstance(wallet, dict):
             raise RecoveryError(
@@ -2525,6 +2454,18 @@ class WalletService:
                     f"wallet {wallet_id!r} metadata shares are malformed"
                 )
             current_ids = (shares[0]["share_id"], shares[1]["share_id"])
+            if current_ids != timeline.live_share_ids():
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} metadata shares do not match the "
+                    "rotation timeline during session recovery"
+                )
+            if wallet.get("public_key") != timeline.live_public_key(
+                wallet.get("public_key")
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} metadata public_key does not match "
+                    "the rotation timeline during session recovery"
+                )
 
         recorded_ids = {record["id"] for record in records}
         for session_id, session_events in events_by_session.items():
@@ -2624,7 +2565,7 @@ class WalletService:
                         f"wallet {wallet_id!r} sign session {session_id!r} "
                         "share_received event has malformed share_id"
                     )
-                active_set = self._active_share_set_at(timeline, seq)
+                active_set = timeline.active_share_set_at(seq)
                 if sid not in active_set:
                     raise RecoveryError(
                         f"wallet {wallet_id!r} sign session {session_id!r} "
@@ -2646,7 +2587,7 @@ class WalletService:
                     e
                     for e in committed_events
                     if e["details"]["share_id"]
-                    in self._active_share_set_at(timeline, seq)
+                    in timeline.active_share_set_at(seq)
                 ]
                 expected_state = (
                     "ready" if len(effective) == 2 else "collecting"
@@ -2663,7 +2604,7 @@ class WalletService:
                         f"wallet {wallet_id!r} sign session {session_id!r} "
                         "signed event has malformed state"
                     )
-                active_set = self._active_share_set_at(timeline, seq)
+                active_set = timeline.active_share_set_at(seq)
                 effective = [
                     e
                     for e in committed_events
@@ -2713,9 +2654,9 @@ class WalletService:
 
         # 终态冻结其提交时刻的在用快照；非终态以钱包当前在用份额为准。
         if terminal == "signed":
-            effective_ids = self._active_share_set_at(timeline, signed_seq)
+            effective_ids = timeline.active_share_set_at(signed_seq)
         elif terminal == "expired":
-            effective_ids = self._active_share_set_at(timeline, expired_seq)
+            effective_ids = timeline.active_share_set_at(expired_seq)
         else:
             if current_ids is None:
                 raise RecoveryError(
@@ -2758,7 +2699,9 @@ class WalletService:
                 if e["details"]["share_id"] == sid
             )
             evicted = False
-            for act_seq, act_ids in timeline:
+            for attempt in timeline.committed:
+                act_seq = attempt.activated_seq
+                act_ids = attempt.share_ids
                 if act_seq <= event_seq:
                     continue
                 if terminal_seq is not None and act_seq > terminal_seq:
@@ -2766,7 +2709,7 @@ class WalletService:
                 if (
                     sid not in act_ids
                     and sid
-                    in self._active_share_set_at(timeline, act_seq - 1)
+                    in timeline.active_share_set_at(act_seq - 1)
                 ):
                     evicted = True
                     break
@@ -2779,9 +2722,9 @@ class WalletService:
         # 非终态记录的 share_ids 必须等于某一历史时刻的在用快照；终态记录
         # 的 share_ids 必须冻结为终态提交时刻快照。
         historical_sets = {("share-1", "share-2")}
-        for act_seq, act_ids in timeline:
+        for attempt in timeline.committed:
             historical_sets.add(
-                self._active_share_set_at(timeline, act_seq)
+                timeline.active_share_set_at(attempt.activated_seq)
             )
         recorded_ids = tuple(record["share_ids"])
         if recorded_ids not in historical_sets:
@@ -2798,7 +2741,7 @@ class WalletService:
         # 用相应公钥重新校验每份已存签名（历史份额公钥沿轮换记录链解析）。
         verify_ids = sorted(stored)
         public_map = self._session_share_public_keys(
-            wallet_id, verify_ids, wallet
+            wallet_id, verify_ids, wallet, timeline
         )
         payload = crypto.build_payload(session_id, record["message"])
         for sid, entry in stored.items():

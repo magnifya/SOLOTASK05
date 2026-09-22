@@ -196,6 +196,34 @@ class AuditStore:
                 result[rotation_id] = dict(event)
         return result
 
+    def rotation_events(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部份额轮换事件（prepared/activated），按 seq 升序。
+
+        连续份额轮换的恢复据此建立公钥/份额时间线：prepared 与 activated
+        都纳入，按审计 seq 排序而不是轮换记录的落盘顺序。纯只读，不分配
+        seq。事件的形状/顺序/跨轮一致性由 service 层严格校验，损坏即
+        fail-closed，绝不猜写。
+        """
+        data = self._read(wallet_id)
+        result: list[dict] = []
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") not in (
+                TYPE_SHARE_ROTATION_PREPARED,
+                TYPE_SHARE_ROTATION_ACTIVATED,
+            ):
+                continue
+            result.append(dict(event))
+        result.sort(
+            key=lambda event: event.get("seq")
+            if isinstance(event.get("seq"), int)
+            else 0
+        )
+        return result
+
     def list_events(
         self, wallet_id: str, from_seq: int = 1, limit: int = 1000
     ) -> list[dict]:
