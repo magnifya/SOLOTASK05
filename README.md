@@ -1,385 +1,213 @@
 # SOLOTASK05 门限签名托管后端
 
-用 Python 加 cryptography 实现的两方门限（2-of-2）Ed25519 签名托管后端，
-对外提供 HTTP 服务与命令行入口。
+两方门限（2-of-2）Ed25519 签名托管后端，用 Python 加 `cryptography`
+实现，对外提供 HTTP 服务与命令行入口。无任何完整私钥落盘，支持审批
+工作流、冷热钱包交易策略、份额轮换、资产账本、可恢复签名会话与离线
+灾备（backup/restore）。
 
 ## 密码学设计
 
-- 建钱包时生成两个**彼此独立**的 Ed25519 密钥对（份额 `share-1`、`share-2`）。
-  系统中任何位置都**不存在完整私钥**，只有两个 32 字节份额私钥。
-- 钱包公钥 `public_key` ＝ 两个份额公钥按序拼接（64 字节，hex）。
-- 每个份额用自己的私钥对 `signing_request_id` 与 `message` 的**直接拼接**
+- 建钱包生成两个**彼此独立**的 Ed25519 密钥对（份额 `share-1`、
+  `share-2`）。系统中任何位置都**不存在完整私钥**，只有两个 32 字节份额。
+- 钱包公钥 `public_key` ＝ 两个份额公钥按序拼接（64 字节 hex）。
+- 每个份额用自己的私钥对 `signing_request_id` 与 `message` 的直接拼接
   （UTF-8）做 Ed25519 签名。
 - 门限签名 `signature` ＝ 两个份额签名按 `share-1, share-2` 顺序拼接
-  （128 字节，hex）。任何持有 `public_key` 的人都可以把公钥与签名各拆成
-  两半，用标准 Ed25519 分别独立验证。
+  （128 字节 hex）。任何持公钥者可把公钥与签名各拆两半，用标准
+  Ed25519 独立验证。
+
+## 安装、启动与测试
+
+唯一运行依赖是 `cryptography`：
+
+```bash
+pip install -r requirements.txt
+python -m threshold_wallet.cli serve --host 0.0.0.0 --port 8080 --data-dir ./data
+python -m unittest discover -s tests -v
+```
+
+启动时若任一钱包现场无法对账恢复，`serve` 打印单行 JSON 错误并以非零
+码退出（fail-closed，不绑定端口）；常驻请求遇到不可对账现场统一返回
+`503`。
 
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
-| POST | `/v1/wallets` | 建钱包，请求体 `{"wallet_id", "shares"}`，`shares` 必须为 2 |
-| GET  | `/v1/wallets/{wallet_id}` | 返回 `public_key` 与 `created_at` |
-| PUT  | `/v1/wallets/{wallet_id}/approval-policy` | 设置审批策略 `{"required_approvals": 1\|2, "timeout_seconds": >0}` |
-| PUT  | `/v1/wallets/{wallet_id}/transaction-policy` | 设置冷热钱包交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
-| GET  | `/v1/wallets/{wallet_id}/transaction-policy` | 查询冷热钱包交易策略（未配置 404） |
-| POST | `/v1/wallets/{wallet_id}/sign-requests` | 创建签名请求审批单 `{"id", "message"}` |
-| GET  | `/v1/wallets/{wallet_id}/sign-requests/{id}` | 查询审批单 |
-| POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/approve` | 批准 `{"approver_id", "reason"?}` |
-| POST | `/v1/wallets/{wallet_id}/sign-requests/{id}/reject` | 拒绝 `{"approver_id", "reason"?}` |
-| GET  | `/v1/wallets/{wallet_id}/audit-events` | 查询审计事件（seq 升序，分页 `from_seq`/`limit`） |
-| POST | `/v1/wallets/{wallet_id}/sign` | 提交两份份额签名，返回聚合 `signature` |
-| POST | `/v1/wallets/{wallet_id}/share-rotations` | 准备份额轮换 `{"rotation_id"}` |
-| GET  | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}` | 查询轮换状态 |
-| POST | `/v1/wallets/{wallet_id}/share-rotations/{rotation_id}/activate` | 激活轮换 |
-| POST | `/v1/wallets/{wallet_id}/asset-operations` | 创建资产操作 `{"operation_id", "asset_id", "delta"}` |
-| POST | `/v1/wallets/{wallet_id}/asset-operations/{operation_id}/commit` | 提交资产操作 |
-| GET  | `/v1/wallets/{wallet_id}/assets/{asset_id}` | 查询资产 `balance` 与 `version` |
-| POST | `/v1/wallets/{wallet_id}/sign-sessions` | 创建可恢复签名会话 `{"id", "message", "timeout_seconds"}` |
-| GET  | `/v1/wallets/{wallet_id}/sign-sessions/{id}` | 查询签名会话视图 |
-| POST | `/v1/wallets/{wallet_id}/sign-sessions/{id}/shares` | 向会话投递一份额签名 `{"share_id", "signature"}` |
+| POST | `/v1/wallets` | 建钱包 `{"wallet_id", "shares"`，`shares` 必须为 2 |
+| GET  | `/v1/wallets/{id}` | 返回 `public_key` 与 `created_at` |
+| PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
+| PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
+| GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
+| POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
+| GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
+| POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
+| POST | `/v1/wallets/{id}/sign-requests/{rid}/reject` | 拒绝 |
+| GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`） |
+| POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
+| POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
+| GET  | `/v1/wallets/{id}/share-rotations/{rid}` | 查轮换状态 |
+| POST | `/v1/wallets/{id}/share-rotations/{rid}/activate` | 激活轮换 |
+| POST | `/v1/wallets/{id}/asset-operations` | 建资产操作 `{"operation_id","asset_id","delta"}` |
+| POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
+| GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version` |
+| POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
+| GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
+| POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
 
-状态码：
+ID（wallet/rotation/operation/asset/session 等）一律匹配
+`[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
+JSON 对象。
 
-- 建钱包成功 `201`，返回 `wallet_id`、`public_key`、`share_ids`；
-  `shares != 2` 返回 `400`；`wallet_id` 重复返回 `409`。
-- 查询成功 `200`；钱包不存在 `404`。
-- 签名两份齐备且全部校验通过返回 `201`；缺一份、份额重复/未知、
-  签名非法或校验失败返回 `400`；钱包不存在 `404`。
-- 同一 `signing_request_id` 重复提交幂等返回已有签名（`200`）。
+### 建钱包 / 查询 / 签名
 
-## 审批工作流（可选）
+- 建钱包成功 `201`（返回 `wallet_id`、`public_key`、`share_ids`），
+  `shares != 2` 为 `400`，`wallet_id` 重复为 `409`。
+- 查询成功 `200`，钱包不存在 `404`。
+- `/sign`：两份齐备且全部校验通过 `201`；缺份、份额重复/未知、签名
+  非法或校验失败 `400`；钱包不存在 `404`。同一 `signing_request_id`
+  重复提交幂等返回已有签名（`200`）。
 
-- `PUT approval-policy`：`required_approvals` 必须为整数 1 或 2，
-  `timeout_seconds` 必须为正整数；成功 `200`，参数非法 `400`，
-  钱包不存在 `404`。
-- `POST sign-requests`：`id`、`message` 均须非空；未设策略 `409`；
-  首次创建 `201`；同 id 同文幂等 `200`；同 id 异文 `409`。
-- `GET sign-requests/{id}` 返回 `{id, message, state, approvers, count,
-  req, t0, t1, reason}`；`state` 为 `pending | approved | rejected |
-  expired | signed`。任何操作前会把已超时的 `pending` 单持久化为
-  `expired`（懒过期）。
-- `approve` / `reject`：`approver_id` 必填（非空白字符串）；`reason`
-  可选，字符串且不超过 1024 字符；类型错误、空白、布尔值一律 `400`。
-  `pending` 单批准返回 `200`（同一 approver 重复批准不计数，达到
-  `required_approvals` 门槛转为 `approved`）；拒绝返回 `200` 并转为
-  `rejected`；对非 `pending` 单操作返回 `409`。
-- 设置策略后，`POST /sign` 要求存在同 id、同 message 且已 `approved`
-  的审批单，两份额签名齐备返回 `201` 并把审批单推进为 `signed`；
-  未设策略时行为不变（首签 `201`，重放 `200`）。
+### 审批工作流（可选）
 
-## 冷热钱包交易策略（可选）
+- `PUT approval-policy`：`required_approvals` 为 1 或 2，
+  `timeout_seconds` 为正整数；成功 `200`，非法 `400`，钱包不存在 `404`。
+- `POST sign-requests`：`id`、`message` 非空；未设策略 `409`；首建
+  `201`；同 id 同文幂等 `200`；同 id 异文 `409`。
+- 审批单视图 `{id,message,state,approvers,count,req,t0,t1,reason}`，
+  `state` 为 `pending|approved|rejected|expired|signed`；操作前懒过期
+  到点的 pending 单为 `expired`。
+- `approve`/`reject`：`approver_id` 为非空白字符串，`reason` 可选且
+  ≤1024 字符；非法 `400`。pending 单批准 `200`（同一 approver 重复
+  批准不计数，达门槛转 `approved`），拒绝转 `rejected`；对终态单操作
+  `409`。
+- 设策略后 `/sign` 须存在同 id、同 message 且 `approved` 的审批单，
+  两份额齐备 `201` 并推进审批单为 `signed`；未设策略时行为不变。
 
-`PUT /v1/wallets/{wallet_id}/transaction-policy` 设置每钱包的冷热钱包
-交易策略，请求体与成功响应（`200`）同为
+### 冷热钱包交易策略（可选）
 
-```json
-{"mode": "hot|cold", "max_delta": 正整数,
- "allowed_assets": ["BTC", "ETH"]}
-```
+请求/成功响应（`200`）同为
+`{"mode","max_delta","allowed_assets"}`。`mode` 为 `hot|cold`；
+`max_delta` 为正整数（拒绝布尔/0/负/小数）；`allowed_assets` 为非空
+数组，每项匹配安全标识并去重（重复 `400`）。`GET` 已配置 `200` 同体、
+未配置 `404`。**同值更新也记事件。**
 
-- `mode` 必须是字符串 `"hot"` 或 `"cold"`；`max_delta` 必须是正整数
-  （拒绝布尔、0、负数、小数）；`allowed_assets` 必须是**非空数组**，
-  每项匹配 `[A-Za-z0-9_-]{1,128}`，**去重**（重复项 `400`）。
-  类型错误、空值、重复或非法资产一律 `400`；钱包不存在 `404`。
-- 策略状态与 `transaction_policy_updated` 事件在每钱包事务锁内原子
-  持久化（失败回滚策略，不产生事件或 seq 缺口）；**同值更新也记事件**，
-  `details` 恰为 `mode`/`max_delta`/`allowed_assets` 三项。
-- `GET .../transaction-policy`：已配置 `200` 同体，未配置 `404`。
-  策略文件（`transaction-policies/<wallet_id>.json`）只含标识与整数，
-  重启后保持。
-- **对资产操作的影响**：未配置策略时行为完全不变。配置后，pending
-  资产操作**首次创建**按创建时刻的策略检查：`asset_id` 必须在
-  `allowed_assets` 白名单内且 `abs(delta) <= max_delta`，否则 `409`，
-  且账本、`version`、操作状态、审计与幂等结果均不变（检查先于任何
-  写入）；`committed` 重放 `200` 同体、不再校验；策略后续更新不影响
-  已存在的 pending 操作，重放也不按新策略复查。
-- **对签名的影响**：
-  - `hot` 沿用审批章节既有规则：配置了审批策略才要求 approved 审批单，
-    未配置审批策略时行为不变；
-  - `cold` 的**首签**必须存在同 `id`、同 `message` 且 `approved` 的
-    审批单；未配置审批策略（无法建单）、无单或单未 `approved` 一律
-    `409`；签名重放 `200` 且不再校验。
+- 资产操作：未配置策略时行为不变。配置后仅**首次创建**按创建时刻策略
+  检查白名单与 `abs(delta) <= max_delta`，否则 `409`（先检查后写，
+  账本/version/状态/审计/幂等均不变）；`committed` 重放 `200` 同体、
+  不再校验；策略更新不影响已存在的 pending 操作与重放。
+- 签名：`hot` 沿用审批规则（配了审批策略才要求 approved 单）；`cold`
+  **首签**必须有同 id、同 message 的 approved 审批单，否则 `409`；
+  签名重放 `200` 不再校验。
 
-## 可恢复签名会话
+### 可恢复签名会话
 
-`POST /v1/wallets/{wallet_id}/sign-sessions` 创建一个可恢复的签名会话，
-把"两份份额分两次投递、收齐后再聚合"的过程持久化：
+- 首建 `201`；同 id 同 `message`/`timeout_seconds` 重放 `200` 同体；
+  同 id 异参 `409`；非法 `400`；钱包不存在 `404`。
+- 视图（创建/查询/投递同形）
+  `{id,message,state,received_shares,missing_shares,expires_at}`，
+  `state` 为 `collecting|ready|signed|expired`，`aggregate_signature`
+  仅 signed 时存在（128 字节 hex），不回传单份额签名。
+- 未知会话 `404`；查询与投递均懒过期，到点的 collecting/ready 原子转
+  `expired`（创建重放不触发）。
+- 投递 `{"share_id","signature"}`：仅接受**当前在用份额**对 id+message
+  直接拼接载荷的有效 64 字节 hex 份额签名。首收 `201`；同份额同值重放
+  `200`、异值 `409`；编码/长度/校验失败或份额未知/已轮换失效 `400`；
+  会话已 expired `409`。
+- 两份齐备转 ready，随即按既有审批/hot-cold 门控聚合：门控通过转
+  signed（`201`），门控失败 `409` 且保留 ready（补齐审批后重放在用
+  份额即重试，成功 `200`）。signed 后任意重放 `200` 同体。
+- 会话与审计在每钱包跨进程事务锁内原子持久化，服务重启后续作；多进程
+  共用 data-dir 时只有一个首次状态推进。轮换后：signed 会话冻结创建时
+  快照（旧份额同值重放仍 `200`、异值 `409`）；collecting/ready 在途
+  会话迁移到当前两份在用份额（旧份额被剔除，投递旧份额 `400`）。
+- 会话文件 JSON 损坏或形状/事件/历史公钥/聚合签名自相矛盾时
+  fail-closed：常驻请求 `503`、`serve` 拒绝就绪，保留现场不归一。
+- 审计事件统一为 `session_event`，动作 `created`/`share_received`/
+  `expired`/`signed`；重放不产生事件，details 只含标识/状态/整数/原文，
+  绝不含签名或私钥。
 
-- 请求体 `{"id", "message", "timeout_seconds"}`：`id` 沿用安全标识
-  （`[A-Za-z0-9_-]{1,128}`）；`message` 为非空字符串；`timeout_seconds`
-  为非布尔正整数。非法 `400`；钱包不存在 `404`。
-- 首次创建 `201`；同 `id` 且同 `message`、同 `timeout_seconds` 重放
-  `200` 同体；同 `id` 异参 `409`。
-- 会话视图（创建/查询/投递响应同形）为
-  `{id, message, state, received_shares, missing_shares, expires_at}`；
-  `state` 为 `collecting | ready | signed | expired`。`aggregate_signature`
-  仅在 `signed` 时存在（128 字节 hex，即两份份额签名的有序拼接）。
-  视图不回传单个份额签名。
-- `GET .../sign-sessions/{id}` 返回视图；未知会话 `404`。查询与份额
-  投递都会**懒过期**：到点的 `collecting`/`ready` 会话持久化为
-  `expired`。创建重放（同参 `200`）不触发懒过期。
-- `POST .../sign-sessions/{id}/shares` 投递 `{"share_id", "signature"}`：
-  仅接受**当前在用份额**对会话 `id` 与 `message` **直接拼接载荷**的有效
-  Ed25519 份额签名（64 字节 hex）。首收 `201`；同份额同值重放 `200`、
-  异值 `409`；编码/长度/校验失败、份额未知或已因轮换失效 `400`；
-  未知会话 `404`；会话已 `expired`（含投递时懒过期）`409`。
-- 两份齐备后会话转 `ready`，随即按**既有审批及 hot/cold 门控**聚合
-  （与 `POST /sign` 同一套规则；只读校验，不改审批单状态）：门控通过
-  转 `signed`（`201`）；门控失败返回 `409` 并保留 `ready`，审批补齐后
-  重放任一份已收份额即重试，成功 `200`。`signed` 后任意重放均 `200`
-  同体。`collecting` 与 `ready` **都受会话超时约束**：`ready` 到点同样
-  原子转 `expired`（仅一条 `action=expired` 事件），此后投递一律 `409`、
-  终态不再聚合；只有 `signed`/`expired` 不受到期时间影响。
-- 会话记录（`sign-sessions/<wallet_id>.json`，含份额签名但**不含任何
-  私钥**）与审计事件都在每钱包跨进程事务锁内原子持久化：服务重启后
-  collecting/ready/signed/expired 全部续作，并发（含多进程共用同一
-  data-dir）只有一个首次状态推进（首次收份额、首次过期、首次聚合）。
-  创建以 `action=created` 事件为提交点（事件未落盘的残留记录重启即清），
-  聚合以 `action=signed` 事件为唯一提交点（事件在则前滚补齐为唯一
-  signed，事件不在则回滚 ready 可重试），过期以 `action=expired` 为唯一
-  提交点（事件在则前滚终态，事件不在则回滚原态由下次访问重新过期）。
-  会话文件 JSON 损坏或形状异常时 fail-closed：常驻请求统一 `503`，
-  `serve` 拒绝就绪，保留现场不归一、不覆盖。
-- **持久化严格加载**：重启或下次持锁访问时，逐会话严格校验——
-  `expires_at`/`created_at` 必须是可解析的 UTC 时间（拒绝朴素时间与
-  非零偏移）；`session_event` 的动作顺序必须合法（`created` 首个且唯一，
-  其后只能是 `share_received`，`expired`/`signed` 至多一次且为最后动作、
-  二者互斥），每次 `share_received` 的份额必须属于该 seq 时刻的在用快照、
-  不重复，且 `details.state` 与当时有效已收份数一致；已收份额集合必须与
-  事件一致（无事件的已存份额是崩溃窗口残留，回滚剔除；有事件却无份额且
-  无轮换可解释则 fail-closed）；每份已存签名都用其**相应历史公钥**重新
-  校验（旧份额公钥沿轮换记录链解析）；`signed` 还按有序快照重算 128 字节
-  聚合签名并与记录一致。任何 JSON 可解析但时间、状态、事件、份额或聚合
-  结果自相矛盾的现场都原样保留、fail-closed。
-- 份额轮换后：
-  - **已 `signed` 会话**冻结创建时快照与原聚合结果：构成该聚合的旧份额
-    同值重放仍 `200` 同体、异值 `409`；轮换不重算、不改变其聚合；
-  - **`collecting`/`ready` 在途会话**在轮换激活后的下次持锁访问时迁移到
-    钱包当前两份在用份额：已收的旧份额被剔除，视图的 `received_shares`/
-    `missing_shares` 同步为新快照，旧份额（含此前已收旧份额的同值重放）
-    投递一律 `400`，两份新份额可继续投递并完成；
-  - 轮换后新建的会话使用新份额。既有 `sign`、`share-sign` 与轮换行为
-    不受影响。
+### 份额轮换
 
-会话审计事件统一为 `session_event`（七字段
-`seq, type, at, request_id, actor_id, reason, details`，`request_id` 为
-会话 id，`actor_id`/`reason` 为 `null`，seq 连续、重启接续）：
+- `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
+  首建生成两份新份额（`<rotation_id>-share-1/2`），新私钥只写暂存文件，
+  激活前不碰在用份额；成功 `201` 返回
+  `{rotation_id,state:"prepared",share_ids,public_key}`。每钱包同时
+  只允许一个 prepared 轮换，冲突 `409`；同 id 重放 `200` 不重新生成。
+- `GET`：`200`，未知 `404`。
+- `activate`：仅 prepared 可激活（锁内原子替换份额/公钥/状态），成功
+  `201`（`state:"active"`）；active 重放 `200`；其余状态 `409`。
+- 激活后未首签的请求必须用新 share_ids（旧份额 `400`）；已首签请求
+  重放仍 `200`。
+- 审计事件 `share_rotation_prepared` / `share_rotation_activated`，
+  details 只含标识与公钥，重放不重复记；**历史签名按其签名时刻（由轮换
+  链确定）的钱包公钥拆半独立验通，轮换后连续有效**。
 
-| details.action | 何时记录 | 其余 details |
-| ---- | ---- | ---- |
-| `created` | 会话首次创建 | `{message, timeout_seconds}` |
-| `share_received` | 份额首次收妥（每份一次） | `{share_id, state: collecting\|ready}` |
-| `expired` | collecting/ready 会话到点被懒过期（仅一次） | `{state: expired}` |
-| `signed` | 首次聚合成功（仅一次） | `{state: signed}` |
+### 资产账本
 
-重放（创建重放、同值份额重放、signed 重放、门控重试）不产生新事件；
-所有 details 都只含标识/状态/整数/原文，**绝不含签名或私钥**。
+每钱包一本账（`assets/<id>.json`），操作状态机 `pending|committed`，
+原子写入，只含标识与整数。
 
-## 审计事件
+- `POST asset-operations`：两个 ID 为安全标识，`delta` 为非布尔非零
+  整数；非法 `400`，钱包不存在 `404`。首建 `201` 返回
+  `R={operation_id,asset_id,delta,state,balance,version}`（pending，
+  balance/version 为创建时刻快照）；同 id 同参重放 `200` 同体，异参
+  `409`。创建不记事件。
+- `POST commit`：仅 pending 可提交；`balance+delta < 0` 为 `409`
+  （状态不变、可重试）；成功原子改余额、`version+1`、转 committed，
+  `201` 返回 R。并发恰一个 `201`，其余幂等 `200`；committed 重放
+  `200` 同体不重复改账。操作不存在 `404`。
+- `GET assets/{asset_id}`：返回 `{asset_id,balance,version}`；资产无
+  已提交操作 `404`。
+- 重启后 pending/committed 与幂等保持，version 单调不回退、不重号。
+  账本或提交意图损坏/矛盾时 fail-closed（常驻 `503`、阻止就绪），绝不
+  归一为空或覆盖删除。
+- 审计事件 `asset_operation_committed`（details 即 committed 视图 R，
+  仅首次提交记一次）与 `transaction_policy_updated`。
 
-`GET /v1/wallets/{wallet_id}/audit-events` 返回
-`{"wallet_id": ..., "events": [...]}`，事件按 `seq` **升序**。
-查询参数 `from_seq`、`limit` 均为正整数，默认 `1` / `1000`，
-`limit` 上限 `1000`；非法（0、负数、小数、非数字、超限）返回 `400`，
-钱包不存在返回 `404`。审计查询是纯只读，**不触发** pending 懒过期。
+### 审计事件
 
-每条事件字段为
-`seq, type, at, request_id, actor_id, reason, details`，
-`at` 为 UTC（`...Z`），不适用的字段取 `null`。`seq` 从 1 起、
-落盘后单调递增；服务重启后续写，接续文件中已有最大 seq。
+`GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
+`from_seq`/`limit` 为正整数，默认 1/1000，limit 上限 1000；非法 `400`，
+钱包不存在 `404`。纯只读，不触发懒过期、不分配 seq。
 
-| 类型 | 何时记录 | request_id / actor_id / reason / details |
-| ---- | ---- | ---- |
-| `policy_updated` (P) | 策略设置成功，**同值更新也记** | rid/actor/reason 为 null；`d={required_approvals, timeout_seconds, operation: created\|updated}` |
-| `request_created` (C) | 审批单**首次创建** | `rid=id`，其余 null；`d={message}`。同 id 异文 `409`，重放不记 |
-| `request_approved` (A) | **首次**批准（同一 approver 重复批准不计数、不记） | `rid=id, a=approver_id, r=传入\|null`；`d={count, req, state}` |
-| `request_rejected` (R) | **首次**拒绝 | `rid=id, a=approver_id, r=传入\|null`；`d={count, req, state: rejected}` |
-| `request_expired` (E) | pending 单超时被懒过期 | `rid=id`，actor/reason 为 null；`d={state: expired}`。GET 审批单、approve、reject、sign 触发，每个单只记一次 |
-| `request_signed` (S) | **首次**签名成功 | `rid=id`，actor/reason 为 null；`d={message, state: signed}`。重放 `200` 不记 |
+每条事件七字段 `seq,type,at,request_id,actor_id,reason,details`，
+`at` 为 UTC（`...Z`），不适用字段为 `null`。seq 从 1 起、落盘后单调
+递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
+`policy_updated`、`request_created/approved/rejected/expired/signed`、
+`share_rotation_prepared/activated`、`asset_operation_committed`、
+`transaction_policy_updated`、`session_event`。
 
-对终态单（approved/rejected/expired/signed）再 approve/reject 返回 `409`
-且不记事件；签名重放、审批单创建重放均不产生事件。
+## 多进程与故障恢复（保证）
 
-## 份额轮换灾备
-
-`POST /v1/wallets/{wallet_id}/share-rotations` 准备一次份额轮换：
-
-- 请求体 `{"rotation_id"}`，`rotation_id` 必须匹配
-  `[A-Za-z0-9_-]{1,128}`，否则 `400`；钱包不存在 `404`。
-- 首次准备生成两份新份额，`share_ids` 为 `{rotation_id}-share-1` 与
-  `{rotation_id}-share-2`，新份额私钥只写入**暂存文件**
-  （`rotation-staging/<wallet_id>/<rotation_id>/`，一份一个文件），
-  在激活前绝不触碰在用份额与钱包元数据。成功 `201`，返回
-  `{rotation_id, state: prepared, share_ids, public_key}`。
-- 每钱包同时只允许一个 `prepared` 轮换，冲突 `409`；
-  同 `rotation_id` 重放返回 `200` 且不重新生成。
-- `GET .../share-rotations/{rotation_id}` 查询轮换（`200`），
-  未知轮换 `404`。
-- `POST .../share-rotations/{rotation_id}/activate` 仅 `prepared`
-  可激活：在每钱包事务锁内原子替换份额文件、钱包 `shares`/`public_key`
-  与轮换状态，成功 `201`（`state: active`）；`active` 重放 `200`；
-  其余状态 `409`。激活成功后删除暂存的新份额文件与备份。
-- **失败回滚**：激活任一环节失败，回滚份额文件、公钥与轮换状态并
-  清理备份；崩溃恢复以 `share_rotation_activated` 事件为唯一提交点——
-  事件未落盘（含状态已写到 `active`）重启回滚为 `prepared`，事件已
-  落盘则保持 `active` 前滚补齐，轮换状态跨重启持久（详见"多进程与
-  故障恢复"）。
-- 激活后未首签的签名请求必须使用新 `share_ids`，旧份额提交返回
-  `400`；已首签的请求重放仍 `200`。
-
-轮换审计事件（七字段 `seq, type, at, request_id, actor_id, reason,
-details`，`seq` 连续，`request_id`/`actor_id`/`reason` 为 `null`）：
-
-| 类型 | 何时记录 | details |
-| ---- | ---- | ---- |
-| `share_rotation_prepared` | 轮换**首次准备** | `{rotation_id, share_ids, public_key}` |
-| `share_rotation_activated` | 轮换**首次激活** | `{rotation_id, share_ids, public_key, previous_public_key}` |
-
-`details` 只含标识与公钥，绝不含私钥；状态变更与事件追加在每钱包
-事务锁内原子完成，失败不产生事件或 seq 缺口；重放不重复记事件。
-
-**状态/事件原子性**：状态变更与事件追加在每钱包事务锁内完成；
-若事件落盘失败，则回滚本次状态（删除新建策略/审批单/签名，或恢复
-更新前的旧值/原 pending 状态），保证状态与事件一致。
-
-## 资产账本
-
-每个钱包维护一本资产账本（`assets/<wallet_id>.json`）：资产操作
-（asset-operations，状态机 `pending | committed`）与每个资产的
-`balance`/`version` 存放于同一文件、原子写入；文件只含标识与整数，
-不含任何私钥材料。
-
-- `POST asset-operations`：请求体 `{"operation_id", "asset_id",
-  "delta"}`。两个 ID 均须非空且匹配 `[A-Za-z0-9_-]{1,128}`，`delta`
-  必须是非布尔、非零整数；参数非法 `400`，钱包不存在 `404`。
-  首次创建 `201`，返回 `R={operation_id, asset_id, delta, state,
-  balance, version}`（`state: pending`，`balance`/`version` 为资产
-  在创建时刻的账本快照）；同 `operation_id` 同参数重放 `200` 同体，
-  异参数 `409`；`operation_id` 钱包内唯一。创建不记审计事件。
-- `POST .../commit`：仅 `pending` 可提交。在每钱包事务锁内检查
-  `balance + delta >= 0`：不足 `409`，状态不变、可重试；成功则原子
-  改余额、`version+1`、状态转 `committed`，`201` 返回 R。并发提交
-  恰一个 `201`，其余幂等重放 `200`；`committed` 重放 `200` 同体，
-  不重复改账。操作不存在 `404`。
-- `GET assets/{asset_id}`：返回 `{asset_id, balance, version}`；
-  资产无任何已提交操作 `404`，钱包不存在 `404`。
-- 重启后 `pending`/`committed` 状态与幂等性保持，`version` 单调
-  递增、不回退、不重号。
-- 账本文件（`assets/<wallet_id>.json`）存在却 JSON 损坏、顶层不是
-  对象、缺少 `operations`/`assets` 或二者类型错误、资产条目
-  `balance`/`version` 不是非布尔整数、操作条目缺合法
-  `operation_id`/`asset_id`/`delta`/`state`（`state` 仅
-  pending/committed）时，任何资产创建、提交、查询、审计读取以及
-  启动/持锁恢复一律 fail-closed：常驻请求返回统一 `503` JSON，
-  `serve` 拒绝就绪（非零退出）；绝不把文件归一为空账本，也不覆盖
-  或删除原数据。文件**不存在**仍是正常的空状态，行为不变。
-- `asset-intents` 中残留损坏 JSON、非对象或缺少恢复所需标识与整数
-  的意图时同样保留现场：阻止就绪或返回 `503`，绝不转换成空意图后
-  继续提交、回滚或清理（即使对应提交事件已落盘，也只在意图形状
-  完整时才前滚）。
-
-账本审计事件（七字段，`seq` 连续）：
-
-| 类型 | 何时记录 | request_id / actor_id / reason / details |
-| ---- | ---- | ---- |
-| `asset_operation_committed` | 操作**首次提交成功** | `rid=operation_id`，actor/reason 为 null；`d=R`（committed 视图）。重放与余额不足失败均不记 |
-| `transaction_policy_updated` | 交易策略设置成功，**同值更新也记** | rid/actor/reason 为 null；`d={mode, max_delta, allowed_assets}`。事件追加失败回滚策略，无事件、无 seq 缺口 |
-
-提交是一个**可恢复事务**（在每钱包跨进程事务锁内）：先写只含标识与
-整数的提交意图（`asset-intents/<wallet_id>/<operation_id>.json`），再
-原子改账本（状态转 committed、`balance`、`version+1`），随后追加唯一
-的 `asset_operation_committed` 事件（`details` 即 committed 视图 R），
-成功后删除意图。任一落盘阶段被强制终止，同一 data-dir 重启（或下一次
-持锁访问）先恢复：**事件已持久化则保留事件并按 R 把账本前滚补齐**为
-唯一 committed 结果；**事件未持久化则恢复 pending 与提交前余额/版本**，
-事件从未分配 seq，故无事件、无 seq 缺口、可重试。恢复后不会出现提交
-无事件、事件与余额不符、重复 version 或重复事件；意图文件不含私钥。
-
-## 多进程与故障恢复
-
-- 多个服务进程可**共用同一 data-dir**：策略、审批单、签名、份额轮换
-  与审计追加都在每钱包跨进程事务锁（`locks/<wallet_id>.lock`，
-  fcntl.flock）内提交；进程异常退出后内核自动释放文件锁，后续进程
-  不会被陈旧锁阻塞。跨进程并发或重启交错时，同一操作只有一个首次
-  提交，其余按幂等重放处理。
-- 启动恢复在每个钱包的事务锁内扫描轮换残留：仅当轮换记录为
-  `prepared`、暂存目录名与 `rotation_id` 一致、目录内恰有记录中两个
-  `share_ids` 的份额文件、JSON 可解析且 `share_id`、`public_key`、
-  32 字节私钥相互匹配时保留；其余目录与无效记录安全删除，不改动在
-  用钱包，不留私钥副本。
-- **激活以 `share_rotation_activated` 事件为唯一提交点**：事件已落盘
-  则激活不可撤回——无论轮换记录停在 `activating` 还是 `active`、暂存
-  或备份是否已清理，恢复都把在用份额、钱包 `shares`/`public_key`
-  与轮换状态前滚补齐为唯一 `active` 结果（新份额逐份做密码学校验，
-  绝不猜写密钥），并清掉全部暂存/备份残留，且不重复记事件；
-  事件未落盘则激活未生效——即使轮换状态已写到 `active`，也恢复旧
-  公钥与旧份额、把轮换置回 `prepared`，保留经校验有效的暂存份额。
-  仅当换入已发生却又缺失回滚所需备份等无法安全对账时，恢复失败、
-  **阻止服务就绪**（`serve` 以非零码退出；常驻进程对该钱包的请求
-  返回 `503`），绝不静默跳过或暴露半完成状态。恢复与孤儿清理不产生
-  审计事件，审计 seq 跨重启接续、连续不重号。
-- 资产提交的恢复在同一把钱包事务锁内完成：启动时扫描 `asset-intents`
-  残留逐一对账；常驻进程在持锁的查询/创建/提交前自愈他进程崩溃遗留
-  的意图（轮换现场同样在持锁的查询/签名/激活/审批/资产操作前自愈）。
-  多进程同时启动或提交同一操作时，恢复与提交按钱包串行，最终仅一个
-  首次 `201`，其余 `200` 同体；恢复完成前查询与重放都读不到半
-  完成状态；意图损坏且无法安全对账时同样阻止就绪/返回 `503`。
-
-## 安装
-
-```bash
-pip install -r requirements.txt   # 唯一运行依赖：cryptography
-```
-
-## 启动服务
-
-```bash
-python -m threshold_wallet.cli serve --host 0.0.0.0 --port 8080 --data-dir ./data
-```
+- 多进程可共用同一 data-dir：状态变更与审计追加都在每钱包跨进程事务锁
+  （`locks/<id>.lock`，fcntl.flock）内提交；进程异常退出内核自动释放
+  锁。跨进程并发或重启交错时同一操作只有一个首次提交，其余按幂等重放。
+- 轮换激活、资产提交、签名会话、灾备恢复都以审计事件/事务标记为唯一
+  提交点：崩溃后启动或下一次持锁访问自动前滚或回滚到一致现场，恢复窗口
+  内任何请求都看不到半状态；无法安全对账时 fail-closed（阻止就绪 /
+  `503`），保留现场、不猜写、不静默跳过。恢复不新增审计、不改余额/
+  version，后续签名、轮换、会话与历史公钥验证继续有效。
 
 ## 命令行
 
-`create` / `sign` / `show` 与三个接口一一对应，成功打印单行 JSON 到 stdout，
-失败打印单行 JSON 到 stderr 并以非零码退出。
+`create`/`sign`/`show` 及 `policy`/`request-create`/`request-show`/
+`approve`/`reject` 与 HTTP 接口一一对应，成功打印单行 JSON 到 stdout，
+失败打印单行 `{"error":...}` 到 stderr 并非零退出；客户端命令用 `--url`
+（默认 `http://127.0.0.1:8080`）。
+
+`share-sign` 为份额持有方本地辅助命令，用 `--data-dir` 在该钱包事务锁
+内先自愈再按当前在用份额签名（不经网络）：
 
 ```bash
-# 建钱包
 python -m threshold_wallet.cli create --wallet-id alice --shares 2
-
-# 查询
-python -m threshold_wallet.cli show --wallet-id alice
-
-# 两个份额持有方各自在本地用本机房份额私钥生成份额签名（不经过网络）
 S1=$(python -m threshold_wallet.cli share-sign --wallet-id alice --share-id share-1 \
      --signing-request-id req-1 --message pay-100 | python -c "import sys,json;print(json.load(sys.stdin)['signature'])")
 S2=$(python -m threshold_wallet.cli share-sign --wallet-id alice --share-id share-2 \
      --signing-request-id req-1 --message pay-100 | python -c "import sys,json;print(json.load(sys.stdin)['signature'])")
-
-# 收齐两份份额签名后提交
 python -m threshold_wallet.cli sign --wallet-id alice --signing-request-id req-1 \
      --message pay-100 --signature share-1=$S1 --signature share-2=$S2
 ```
-
-审批工作流对应的子命令为 `policy` / `request-create` / `request-show` /
-`approve` / `reject`，同样支持 `--url` 与 `--wallet-id`，失败时打印单行
-JSON 到 stderr 并以退出码 1 结束：
-
-```bash
-python -m threshold_wallet.cli policy --wallet-id alice \
-     --required-approvals 2 --timeout-seconds 3600
-python -m threshold_wallet.cli request-create --wallet-id alice \
-     --signing-request-id req-1 --message pay-100
-python -m threshold_wallet.cli approve --wallet-id alice \
-     --signing-request-id req-1 --approver-id ops-1
-python -m threshold_wallet.cli request-show --wallet-id alice \
-     --signing-request-id req-1
-```
-
-可用 `--url` 指定服务地址（默认 `http://127.0.0.1:8080`），
-`share-sign` 用 `--data-dir` 指向服务端数据目录：读取份额前会先在该
-钱包事务锁内做懒恢复（自愈轮换/资产提交崩溃现场），再按当前在用份额
-签名；恢复失败或份额不存在时输出单行 JSON 到 stderr 并非零退出。
 
 ## 兼容灾备（backup / restore）
 
@@ -387,88 +215,86 @@ python -m threshold_wallet.cli request-show --wallet-id alice \
 钱包 `--wallet-id W`，绝不触碰 data-dir 内其他钱包的任何文件。
 
 ```bash
-# 打包快照
 python -m threshold_wallet.cli backup --data-dir ./data \
-     --wallet-id alice --snapshot-id snap-2026-09-23 --output ./alice.tar
-
-# 在（通常是空的）新 data-dir 上对账恢复
+     --wallet-id alice --snapshot-id snap-1 --output ./alice.tar
 python -m threshold_wallet.cli restore --data-dir ./data2 \
      --wallet-id alice --input ./alice.tar
 ```
 
 ### backup
 
-- `snapshot_id` 必须匹配 `[A-Za-z0-9_-]{1,128}`，否则失败退出。
-- 在该钱包的跨进程事务锁内**先恢复轮换、资产意图、签名会话现场**
-  （与线上同一套启动/懒恢复），无法对账即失败（**不能对账不出包**）。
-- 仅打包该钱包白名单内文件：`wallets/W.json`、`shares/W/*`、业务目录
-  中 W 的单文件（`audit`/`signatures`/`policies`/`requests`/
-  `rotations`/`assets`/`transaction-policies`/`sign-sessions`）、以及
-  `rotation-staging/W/*`。
-- 拒绝：绝对路径、`..` 穿越、重复成员、符号链接、白名单外的额外文件、
-  锁文件（`locks/`）、原子写临时文件与激活备份（`*.bak.json`，只可能
-  存在于激活事务窗口，持锁自愈后必已清理）。
-- 产物为确定性 tar：首项 `manifest.json`（manifest v1），其余为白名单
-  普通文件成员。manifest 含 `version`、`wallet_id`、`snapshot_id` 与
-  每项 `{path, bytes, sha256}`；`manifest_sha256` 绑定**含 S 在内**的
-  manifest 主体 sha256，故 S 与内容不可被分别篡改。manifest 只含
-  标识/公钥/哈希/整数/业务原文，**绝不含份额私钥**。
-- 成功 stdout 为单行 JSON：`{"status": 201, "snapshot_id", "manifest"}`；
-  失败 stderr 为单行 `{"error": ...}` 且退出码 1（钱包不存在 404、
-  非法标识 400、无法对账/读盘失败 503）。
+参数：`--data-dir D`、`--wallet-id W`、`--snapshot-id S`（匹配
+`[A-Za-z0-9_-]{1,128}`，否则失败退出）、`--output B`。
+
+- 在该钱包跨进程事务锁内先自愈轮换/资产意图/签名会话现场（与线上同一套
+  恢复），无法对账即失败——**不能对账不出包**。
+- 仅打包该钱包白名单内普通文件：`wallets/W.json`、`shares/W/*`、业务
+  目录中的 W 单文件（`audit`/`signatures`/`policies`/`requests`/
+  `rotations`/`assets`/`transaction-policies`/`sign-sessions`）与
+  `rotation-staging/W/*`。拒绝绝对路径、`..` 穿越、重复成员、符号链接、
+  白名单外额外文件、锁文件、原子写临时文件与激活备份（`*.bak.json`）。
+- 产物为确定性 tar，首项 `manifest.json`（**manifest v1**），含
+  `version`、`wallet_id`、`snapshot_id` 与每项 `{path,bytes,sha256}`；
+  `manifest_sha256` 绑定**含 S 在内**的 manifest 主体 sha256，使 S 与
+  内容不可分别篡改。manifest 只含标识/公钥/哈希/整数/业务原文，**绝不
+  含份额私钥**。
+- 成功 stdout 单行 `{"status":201,"snapshot_id","manifest"}`；失败
+  stderr 单行 `{"error":...}`、退出码 1（钱包不存在 404、非法标识 400、
+  无法对账/读盘失败 503）。
 
 ### restore
 
-- `--input` 指向 backup 产物。在该钱包事务锁内：先按 `restore-txn`
-  标记收敛上一次崩溃的恢复，再自愈线上现场，然后做**全量校验，失败绝不
-  写盘**：
-  - 身份：manifest 的 `wallet_id` 必须等于命令行 W，否则 409；
-  - 白名单与哈希：成员路径合法、无重复/链接/额外文件，每项字节数与
-    sha256 必须与 manifest 一致，manifest 绑定哈希必须验通；
-  - 形状/公私钥：各 JSON 形状严格校验；当前在用两份份额私钥各为 32 字节、
-    可推导出份额公钥、两份拼成钱包公钥；
-  - 审计 `seq` 必须自 1 起连续；账本 version/余额重算自洽且与
-    `asset_operation_committed` 事件一一对应；签名会话按其
-    `session_event` 严格对账（含历史公钥逐份重验、聚合签名重算）；
-    轮换激活链连续；审批单与请求类事件双向一致；
-  - 每条已完成签名都能用其**签名时刻**（由轮换链确定）的钱包公钥拆半
-    独立验通，保证历史签名连续。
-- 提交是崩溃安全事务：先在 `restore-txn/W/S/` 写 `prepared.json` 并把
-  替换前的文件完整备份到其 `old/`，再原子替换目标文件、删除多余文件，
-  最后写 `committed.json` 作为唯一提交点。崩溃后（启动恢复或下次持锁
-  访问）按标记处理：`committed` 在则**前滚**补齐，否则用 `old/`
-  **整体回滚**并清理。恢复窗口期内任何请求都看不到半状态。
-- 提交完成后在 `restore-records/W.json` 记录 `S` 与 `manifest_sha256`。
-  恢复本身**不新增审计事件**、不改余额/version、不破坏幂等与历史签名。
-- 结果语义：首次恢复 `status=201`；同 S 且同 manifest 重放 `status=200`
-  且返回体逐字节相同（同体）；同 S 但内容不同返回 `409`（不覆盖既有
-  恢复点）；快照损坏或不可对账返回 `503` 且现场不变。
-- 成功 stdout 为单行 JSON：`{"status", "wallet_id", "snapshot_id",
-  "manifest_sha256", "manifest"}`；失败 stderr 单行 `{"error": ...}`、
-  退出码 1。响应、日志与快照都不泄露份额私钥。
+参数：`--data-dir D`、`--wallet-id W`、`--input B`。在该钱包事务锁内
+先收敛上一次崩溃的恢复、再自愈线上现场，然后做**全量校验，失败绝不
+写盘**：
 
-## 测试
+- 身份：manifest 的 `wallet_id` 必须等于命令行 W，否则 `409`；
+- 白名单与哈希：成员路径合法、无重复/链接/额外，每项字节数与 sha256
+  与 manifest 一致，manifest 绑定哈希验通；
+- 形状/公私钥：各 JSON 形状严格；当前两份份额私钥各 32 字节、可推出
+  份额公钥并拼成钱包公钥；
+- 审计 `seq` 自 1 起连续；账本 version/余额重算自洽且与
+  `asset_operation_committed` 事件一一对应；会话按 `session_event`
+  严格对账（历史公钥逐份重验、聚合签名重算）；轮换激活链连续；审批单
+  与请求类事件双向一致；
+- 每条已完成签名都能用其**签名时刻**（由轮换链确定）的钱包公钥拆半
+  独立验通，保证历史签名连续。
 
-```bash
-python -m unittest discover -s tests -v
-```
+提交是崩溃安全事务：先写 `restore-txn/W/S/prepared.json` 并把替换前
+文件完整备份到其 `old/`（备份清单带每项 path/bytes/sha256），再原子
+替换目标、删除多余文件，最后写 `committed.json` 作为唯一提交点。
 
-覆盖：份额原语、持久化、全部 HTTP 状态码、幂等重放、聚合公钥独立验证，
-以及磁盘/响应/日志的"无完整私钥"安全审计。
+崩溃后（启动恢复或下一次持钱包锁访问）按标记收敛：
+
+- **committed 在**：先封闭校验标记的 `wallet_id`、`snapshot_id`、
+  `manifest_sha256` 与 `files` 项（path/bytes/sha256）。路径必须是目标
+  钱包白名单内的相对普通文件，不能重复、越界、缺失、符号链接或额外；
+  逐项核对 bytes 与 sha256，并核对目标集合严格相等。任一不符统一
+  **503**、阻止 serve 就绪、该钱包访问失败，**保留 restore-txn，不
+  补写、不删除、不登记 restore-records**。校验通过后才前滚、清理残留
+  并补登唯一恢复记录；记录哈希冲突仍 503。
+- **prepared 无 committed**：先完整校验 `old_files` 备份清单、路径、
+  类型、存在性、长度与哈希（备份闭集无额外），再整体回滚并清理；无法
+  安全还原时保持现场、fail-closed。
+
+恢复窗口期内任何请求都看不到半状态；并发、强制终止与重启交错只能提交
+一次。提交完成后在 `restore-records/W.json` 记录 S 与 manifest_sha256。
+恢复本身**不新增审计事件、不改余额/version、不破坏幂等与历史签名**。
+
+结果语义：首次恢复 `status=201`；同 S 且同 manifest 重放 `status=200`
+且返回体逐字节相同（同体）；同 S 但内容不同 `409`（不覆盖既有恢复
+点）；快照损坏或不可对账 `503` 且现场不变。成功 stdout 单行
+`{"status","wallet_id","snapshot_id","manifest_sha256","manifest"}`；
+失败 stderr 单行 `{"error":...}`、退出码 1。响应、日志与快照都不泄露
+份额私钥或签名载荷。
 
 ## 私钥安全边界
 
 - **响应**：建钱包只返回 `share_ids` 与公钥，任何接口都不返回私钥。
-- **磁盘**：钱包元数据文件不含任何私钥；两个份额私钥分文件存放
-  （`shares/<wallet_id>/<share_id>.json`），轮换准备期的新份额私钥
-  分文件暂存于 `rotation-staging/<wallet_id>/<rotation_id>/`，
-  任何文件至多含一个份额私钥，从不存在两者拼接后的完整私钥。
-  资产账本（`assets/<wallet_id>.json`）只含标识与整数，不含私钥。
-  提交意图（`asset-intents/<wallet_id>/<operation_id>.json`）同样只含
-  标识与整数，不含私钥。
-  冷热钱包交易策略（`transaction-policies/<wallet_id>.json`）只含
-  mode 标识、整数上限与资产标识，不含私钥。
-  可恢复签名会话（`sign-sessions/<wallet_id>.json`）只含原文、标识、
-  到期时间、份额签名与 signed 时的聚合签名，**不含任何份额私钥**。
-  写入采用临时文件 + 原子替换。
-- **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录请求/响应体。
+- **磁盘**：钱包元数据与账本/策略/会话/审批单等业务文件不含任何私钥；
+  两个份额私钥分文件存放（`shares/<id>/<share_id>.json`），轮换准备期
+  新份额私钥分文件暂存于 `rotation-staging/<id>/<rid>/`，任何文件至多
+  含一个份额私钥，从不存在两者拼接的完整私钥。写入一律临时文件 + 原子
+  替换。
+- **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录
+  请求/响应体。

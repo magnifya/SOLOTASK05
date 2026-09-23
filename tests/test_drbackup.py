@@ -756,9 +756,11 @@ class RestoreCrashRecoveryTest(unittest.TestCase):
             self.dst, "alice", "S1", self.manifest, self.files
         )
         mhash = self.backup_body["manifest"]["manifest_sha256"]
+        # committed 标记携带与 manifest 同形的完整 files 项
         drbackup._atomic_write_json(os.path.join(txn, "committed.json"), {
             "wallet_id": "alice", "snapshot_id": "S1",
-            "manifest_sha256": mhash, "files": sorted(self.files),
+            "manifest_sha256": mhash,
+            "files": list(self.manifest["files"]),
         })
         WalletService(WalletStore(self.dst))  # 启动前滚
         records = drbackup._read_restore_records(self.dst, "alice")
