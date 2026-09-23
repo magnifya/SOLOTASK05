@@ -1662,6 +1662,10 @@ def _scan_backup_tree(old_root: str, wallet_id: str) -> list[str]:
             full = os.path.join(dp, name)
             if os.path.islink(full):
                 raise RecoveryError("refusing symbolic link in restore backup")
+        # 合法备份只含清单文件及其父目录链：任何空目录都是标记之外的
+        # 额外条目（闭集破坏），fail-closed。
+        if os.path.abspath(dp) != abs_root and not dirnames and not filenames:
+            raise RecoveryError("unexpected empty directory in restore backup")
         for name in filenames:
             full = os.path.join(dp, name)
             if os.path.islink(full):
@@ -1818,10 +1822,26 @@ def _resume_pending_restore(
             )
         prepared_path = os.path.join(txn, MARKER_PREPARED)
         committed_path = os.path.join(txn, MARKER_COMMITTED)
-        for marker in (prepared_path, committed_path):
-            if os.path.islink(marker):
+        # 闭集：restore-txn/<W>/<S>/ 内只允许 prepared.json、committed.json
+        # 与 old/ 目录。任何未知条目（原子写临时文件、符号链接、目录冒充
+        # 标记、陌生文件）都意味着事务现场不可信：统一 fail-closed，保留
+        # 现场、不补写、不删除、不登记 restore-records。
+        for name in sorted(os.listdir(txn)):
+            full = os.path.join(txn, name)
+            if name in (MARKER_PREPARED, MARKER_COMMITTED):
+                if os.path.islink(full) or not os.path.isfile(full):
+                    raise RecoveryError(
+                        f"restore marker {full!r} is not a regular file"
+                    )
+            elif name == "old":
+                if os.path.islink(full) or not os.path.isdir(full):
+                    raise RecoveryError(
+                        f"restore backup root {full!r} is not a directory"
+                    )
+            else:
                 raise RecoveryError(
-                    f"refusing symbolic link restore marker {marker!r}"
+                    f"unexpected entry {name!r} in restore transaction "
+                    f"for {wallet_id!r}/{snapshot_id!r}"
                 )
         if os.path.exists(committed_path):
             # committed 是唯一提交点：封闭校验（标记身份/哈希/逐项目标集合）
