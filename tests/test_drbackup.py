@@ -857,5 +857,178 @@ class BackupRestoreCliTest(unittest.TestCase):
         self.assertIn("error", json.loads(err))
 
 
+class BackupOutputBoundaryTest(unittest.TestCase):
+    """--output 绝不能落入 data-dir：否则成功写入会用快照覆盖在线状态。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.data = os.path.join(self.tmp, "data")
+        self.h = make_harness(self.data)
+        self.h.service.create_wallet("alice", 2)
+        self.h.service.put_policy("alice", 1, 3600)
+        self.wallet_file = os.path.join(self.data, "wallets", "alice.json")
+        with open(self.wallet_file, "rb") as f:
+            self.before = f.read()
+        self.existing = os.path.join(self.tmp, "existing.tar")
+        drbackup.backup(self.data, "alice", "S0", self.existing)
+        with open(self.existing, "rb") as f:
+            self.existing_bytes = f.read()
+
+    def _assert_refused_400(self, output):
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", output)
+        self.assertEqual(cm.exception.status, 400)
+        # 钱包在线文件与既有快照都不得被改动
+        with open(self.wallet_file, "rb") as f:
+            self.assertEqual(f.read(), self.before)
+        with open(self.existing, "rb") as f:
+            self.assertEqual(f.read(), self.existing_bytes)
+
+    def test_refuses_business_file(self):
+        self._assert_refused_400(self.wallet_file)
+        self._assert_refused_400(
+            os.path.join(self.data, "policies", "alice.json"))
+
+    def test_refuses_share_and_staging_files(self):
+        self._assert_refused_400(
+            os.path.join(self.data, "shares", "alice", "share-1.json"))
+        # data-dir 内尚不存在的路径同样拒绝（覆盖只是风险之一）
+        self._assert_refused_400(
+            os.path.join(self.data, "shares", "alice", "new.tar"))
+
+    def test_refuses_nonexistent_and_temp_paths_inside(self):
+        self._assert_refused_400(os.path.join(self.data, "snapshot.tar"))
+        self._assert_refused_400(
+            os.path.join(self.data, "wallets", ".snapshot-x.tmp"))
+        self._assert_refused_400(self.data)
+
+    def test_refuses_internal_symlink_pointing_outside(self):
+        link = os.path.join(self.data, "audit", "evil.tar")
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(os.path.join(self.tmp, "outside.tar"), link)
+        self._assert_refused_400(link)
+
+    def test_refuses_external_symlink_pointing_inside(self):
+        out_dir = os.path.join(self.tmp, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        link = os.path.join(out_dir, "link.tar")
+        os.symlink(self.wallet_file, link)
+        self._assert_refused_400(link)
+
+    def test_refuses_path_traversal_into_datadir(self):
+        self._assert_refused_400(
+            os.path.join(self.data, "shares", "..", "wallets", "alice.json"))
+
+    def test_external_output_still_writes_atomically(self):
+        out = os.path.join(self.tmp, "ok.tar")
+        body = drbackup.backup(self.data, "alice", "S1", out)
+        self.assertEqual(body["status"], 201)
+        # 完整可读 tar，无半包/残留临时文件
+        manifest, files = _read_pack(out)
+        self.assertEqual(manifest["snapshot_id"], "S1")
+        self.assertIn("wallets/alice.json", files)
+        leftovers = [
+            n for n in os.listdir(os.path.dirname(out))
+            if n.startswith(".snapshot-")
+        ]
+        self.assertEqual(leftovers, [])
+        # 在线钱包未被触碰
+        with open(self.wallet_file, "rb") as f:
+            self.assertEqual(f.read(), self.before)
+
+
+class BackupRestoreLinearizationTest(unittest.TestCase):
+    """同一钱包并发 backup/restore 必须经其事务锁线性化，且快照只来自
+    锁内自愈完成的一致闭集；其他钱包不受影响。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "src")
+        self.dst = os.path.join(self.tmp, "dst")
+        hs = make_harness(self.src)
+        hs.service.create_wallet("alice", 2)
+        hs.service.put_policy("alice", 1, 3600)
+        self.pack = os.path.join(self.tmp, "b.tar")
+        drbackup.backup(self.src, "alice", "S1", self.pack)
+        make_harness(self.dst).service.create_wallet("alice", 2)
+        # 另一个钱包，验证其锁/文件不被波及
+        make_harness(self.dst).service.create_wallet("bob", 2)
+
+    def test_concurrent_backups_all_complete_and_valid(self):
+        import threading
+
+        errors = []
+        barrier = threading.Barrier(6)
+
+        def worker(i):
+            out = os.path.join(self.tmp, f"c{i}.tar")
+            try:
+                barrier.wait()
+                body = drbackup.backup(self.src, "alice", f"SNAP-{i}", out)
+                if body["status"] != 201:
+                    errors.append(f"bad status {body['status']}")
+                manifest, files = _read_pack(out)
+                if manifest["wallet_id"] != "alice":
+                    errors.append("bad wallet")
+                if "wallets/alice.json" not in files:
+                    errors.append("missing wallet member")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        self.assertEqual(errors, [])
+
+    def test_concurrent_restore_same_snapshot_one_201_rest_200(self):
+        import threading
+
+        results = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(6)
+
+        def worker():
+            try:
+                barrier.wait()
+                status, body = drbackup.restore(self.dst, "alice", self.pack)
+                with lock:
+                    results.append((status, body))
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    results.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        statuses = sorted(r[0] for r in results if isinstance(r, tuple))
+        self.assertEqual(len(results), 6)
+        self.assertEqual(statuses.count(201), 1)
+        self.assertEqual(statuses.count(200), 5)
+        # 所有返回体除 status 外逐字段相同（manifest/snapshot/哈希同体）
+        def payload(body):
+            return {k: v for k, v in body.items() if k != "status"}
+
+        first_payload = payload(results[0][1])
+        for _, body in results:
+            self.assertEqual(payload(body), first_payload)
+        # 多个 200 之间连 status 也完全一致
+        two_hundred = [body for status, body in results if status == 200]
+        self.assertTrue(all(body == two_hundred[0] for body in two_hundred))
+        # 恢复记录只登记一次
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            list(records["snapshots"].keys()), ["S1"])
+        self.assertFalse(
+            os.path.exists(os.path.join(self.dst, "restore-txn")))
+        # 其他钱包不受影响
+        self.assertIsNotNone(
+            WalletStore(self.dst).get_wallet("bob"))
+
+
 if __name__ == "__main__":
     unittest.main()

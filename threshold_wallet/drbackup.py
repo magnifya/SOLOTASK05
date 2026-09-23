@@ -108,6 +108,45 @@ def _read_regular_file(path: str) -> bytes:
         return f.read()
 
 
+def _output_resolves_inside(data_dir: str, output: str) -> bool:
+    """``--output`` 的最终落盘位置是否位于 data-dir 目录树内。
+
+    同时做词法与解链接两种归属判定，堵住两条反向绕过：
+
+    - 词法路径在 data-dir 内（无论目标是否存在、无论是否符号链接，也无论
+      链接指向哪里）——防止"data-dir 内一个链接把快照写到外部"式攻击；
+    - 解析全部符号链接后的真实路径在 data-dir 内——防止"data-dir 外的
+      链接/经链接目录把 os.replace 导向内部业务文件"。
+
+    data-dir 自身也视为内部（快照绝不能写成 data-dir 目录）。
+    """
+    root_abs = os.path.abspath(data_dir)
+    out_abs = os.path.abspath(output)
+    root_real = os.path.realpath(root_abs)
+    out_real = os.path.realpath(out_abs)
+
+    def _inside(candidate: str, root: str) -> bool:
+        return candidate == root or candidate.startswith(root + os.sep)
+
+    return _inside(out_abs, root_abs) or _inside(out_real, root_real)
+
+
+def _reject_output_inside_data_dir(data_dir: str, output: str) -> None:
+    """持锁后、开始读取前拒绝落入 data-dir 的 --output（400）。
+
+    成功写入会以快照 tar 字节原子替换该路径：一旦 output 解析到 data-dir
+    内的业务/份额/事务文件（含其已存在文件、符号链接或原子写临时路径），
+    就会用快照覆盖在线状态。故这类路径一律在任何读取/写入之前拒绝，钱包
+    与任何原有快照都不受影响。
+    """
+    if _output_resolves_inside(data_dir, output):
+        raise BackupError(
+            400,
+            "--output must reside outside the --data-dir tree; refusing to "
+            "write a snapshot over live wallet data",
+        )
+
+
 # ---- 白名单 ---------------------------------------------------------------
 
 def _wallet_members(wallet_id: str) -> list[str]:
@@ -371,6 +410,10 @@ def backup(
     try:
         service = WalletService(WalletStore(data_dir), recover=False)
         with service._wallet_lock(wallet_id):
+            # 持锁后、任何自愈/读取之前先封死输出边界：output 解析进
+            # data-dir（含已存在文件、符号链接、原子写临时路径）一律拒绝，
+            # 绝不允许快照 tar 原子替换在线业务/份额/事务文件。
+            _reject_output_inside_data_dir(data_dir, output)
             # 持锁自愈：先把他进程崩溃遗留的半完成轮换/提交/会话对账干净，
             # 绝不打包半状态；恢复失败直接向上抛（fail-closed）。
             service._heal_wallet(wallet_id)

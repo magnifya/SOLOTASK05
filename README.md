@@ -226,6 +226,13 @@ python -m threshold_wallet.cli restore --data-dir ./data2 \
 参数：`--data-dir D`、`--wallet-id W`、`--snapshot-id S`（匹配
 `[A-Za-z0-9_-]{1,128}`，否则失败退出）、`--output B`。
 
+- `--output B` **必须位于 `--data-dir` 目录树之外**。取得钱包锁后、开始
+  读取前即做归属判定（词法路径与解析全部符号链接后的真实路径都不得落入
+  data-dir），故 B 指向 data-dir 内的业务/份额/事务文件、其已存在文件、
+  符号链接（无论指向树内还是树外）或原子写临时路径一律 `400` 拒绝，钱包
+  与任何原有快照都不改动。B 在 data-dir 外时先写同目录临时文件再原子
+  替换，写入中断或并发调用都不会留下半包。
+
 - 在该钱包跨进程事务锁内先自愈轮换/资产意图/签名会话现场（与线上同一套
   恢复），无法对账即失败——**不能对账不出包**。
 - 仅打包该钱包白名单内普通文件：`wallets/W.json`、`shares/W/*`、业务
@@ -239,8 +246,8 @@ python -m threshold_wallet.cli restore --data-dir ./data2 \
   内容不可分别篡改。manifest 只含标识/公钥/哈希/整数/业务原文，**绝不
   含份额私钥**。
 - 成功 stdout 单行 `{"status":201,"snapshot_id","manifest"}`；失败
-  stderr 单行 `{"error":...}`、退出码 1（钱包不存在 404、非法标识 400、
-  无法对账/读盘失败 503）。
+  stderr 单行 `{"error":...}`、退出码 1（钱包不存在 404、非法标识或
+  `--output` 落入 data-dir 400、无法对账/读盘失败 503）。
 
 ### restore
 
