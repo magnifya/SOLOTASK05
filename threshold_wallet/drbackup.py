@@ -1563,6 +1563,169 @@ def _read_txn_marker(path: str, what: str) -> dict:
     return value
 
 
+#: restore-txn/<W>/<S>/ 目录直接成员的唯一闭集
+_TXN_OLD_DIRNAME = "old"
+
+
+def _scan_txn_snapshot_dir(txn_dir: str) -> dict[str, bool]:
+    """封闭枚举单个 restore-txn/<W>/<S>/ 目录的直接成员。
+
+    契约闭集：该目录**只**能含 ``prepared.json``、``committed.json``（普通
+    文件）与 ``old/``（目录）。任何符号链接、非常规文件、原子写临时文件
+    （``.tmp-*``）、激活备份（``*.bak.json``）或其余未知文件/目录都意味着
+    事务现场被动过，统一抛 RecoveryError（保留现场、fail-closed）。
+
+    返回 ``{"prepared": bool, "committed": bool, "old": bool}`` 供调用方决定
+    前滚/回滚/空目录清理。
+    """
+    if os.path.islink(txn_dir) or not os.path.isdir(txn_dir):
+        raise RecoveryError("restore transaction entry is not a directory")
+    try:
+        with os.scandir(txn_dir) as it:
+            entries = list(it)
+    except OSError as exc:
+        raise RecoveryError("restore transaction directory is unreadable") from exc
+    flags = {
+        MARKER_PREPARED: False,
+        MARKER_COMMITTED: False,
+        _TXN_OLD_DIRNAME: False,
+    }
+    for entry in entries:
+        name = entry.name
+        if entry.is_symlink():
+            raise RecoveryError(
+                f"refusing symbolic link in restore transaction: {name!r}"
+            )
+        if name == MARKER_PREPARED or name == MARKER_COMMITTED:
+            if not entry.is_file(follow_symlinks=False):
+                raise RecoveryError(f"restore marker {name!r} is not a regular file")
+            flags[name] = True
+        elif name == _TXN_OLD_DIRNAME:
+            if not entry.is_dir(follow_symlinks=False):
+                raise RecoveryError("restore backup 'old' is not a directory")
+            flags[name] = True
+        else:
+            # .tmp-*、*.bak.json、未知文件、额外目录一律拒绝
+            raise RecoveryError(
+                f"unexpected entry in restore transaction directory: {name!r}"
+            )
+    return flags
+
+
+def _expected_backup_dirs(file_set: set[str]) -> set[str]:
+    """备份文件集合隐含的全部祖先目录（相对 old/，不含 "."）。"""
+    dirs: set[str] = set()
+    for rel in file_set:
+        parts = rel.split("/")
+        for depth in range(1, len(parts)):
+            dirs.add("/".join(parts[:depth]))
+    return dirs
+
+
+def _scan_old_backup_tree(old_root: str, wallet_id: str) -> tuple[set, set]:
+    """递归封闭枚举 old/ 备份树，返回 (备份文件相对路径集, 子目录相对路径集)。
+
+    与旧的纯文件枚举不同，这里**连目录也逐一对账**：
+
+    - 任何层级的符号链接（含指向目录的链接）一律拒绝（绝不跟随）；
+    - 套接字/FIFO/设备等非常规条目一律拒绝；
+    - 每个文件路径段合法、整体属于目标钱包白名单（拒绝 ``..``/绝对/非白名单）；
+    - 空子目录、与备份清单无关的额外目录也会出现在返回的目录集中，由调用方
+      与"清单文件的祖先目录闭包"严格比对后拒绝。
+    """
+    if not os.path.exists(old_root) and not os.path.islink(old_root):
+        return set(), set()
+    if os.path.islink(old_root) or not os.path.isdir(old_root):
+        raise RecoveryError("restore backup root is not a directory")
+    files: set[str] = set()
+    dirs: set[str] = set()
+
+    def walk(abs_dir: str, rel_dir: str) -> None:
+        try:
+            with os.scandir(abs_dir) as it:
+                entries = list(it)
+        except OSError as exc:
+            raise RecoveryError("restore backup directory is unreadable") from exc
+        for entry in entries:
+            rel = entry.name if not rel_dir else f"{rel_dir}/{entry.name}"
+            if entry.is_symlink():
+                raise RecoveryError(
+                    "refusing symbolic link in restore backup"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                # 目录名也必须是合法、白名单内的路径段
+                try:
+                    _validate_member_name(rel)
+                except BackupError as exc:
+                    raise RecoveryError(
+                        "restore backup contains an illegal directory"
+                    ) from exc
+                dirs.add(rel)
+                walk(entry.path, rel)
+            elif entry.is_file(follow_symlinks=False):
+                try:
+                    _validate_member_name(rel)
+                except BackupError as exc:
+                    raise RecoveryError(
+                        "restore backup contains an illegal path"
+                    ) from exc
+                if not _is_whitelisted(wallet_id, rel):
+                    raise RecoveryError(
+                        "restore backup contains a non-whitelisted path"
+                    )
+                files.add(rel)
+            else:
+                raise RecoveryError("non-regular entry in restore backup")
+
+    walk(old_root, "")
+    return files, dirs
+
+
+def _verify_old_backup(
+    txn: str, wallet_id: str, snapshot_id: str, prepared: dict
+) -> list[dict]:
+    """严格校验一个已确认形状自洽的 prepared 标记所登记的 old/ 备份。
+
+    - old_files 清单形状（路径/bytes/sha256、白名单、不重复/不越界）合法；
+    - old/ 现存文件集合与清单**严格相等**，目录恰为清单文件的祖先目录闭包
+      （额外/空目录、符号链接、非常规文件一律拒绝）；
+    - 逐项核对备份字节数与 sha256。
+
+    任一不符抛 RecoveryError（fail-closed，保留现场）。通过返回清单项列表。
+    """
+    old_root = os.path.join(txn, _TXN_OLD_DIRNAME)
+    old_entries = _validate_marker_entries(
+        wallet_id, prepared.get("old_files"), "prepared"
+    )
+    old_set = {entry["path"] for entry in old_entries}
+    backup_files, backup_dirs = _scan_old_backup_tree(old_root, wallet_id)
+    if backup_files != old_set:
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup set is "
+            "inconsistent with its prepared marker"
+        )
+    if backup_dirs != _expected_backup_dirs(old_set):
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup tree has an "
+            "unexpected directory"
+        )
+    # 逐项核对备份的字节数与 sha256（同时拒绝符号链接/非常规文件）。
+    for entry in old_entries:
+        try:
+            data = _read_regular_file(_safe_join(old_root, entry["path"]))
+        except BackupError as exc:
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup file "
+                "cannot be safely read"
+            ) from exc
+        if len(data) != entry["bytes"] or sha256_hex(data) != entry["sha256"]:
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup file "
+                "fails its recorded hash"
+            )
+    return old_entries
+
+
 def _rollback_restore(
     data_dir: str, wallet_id: str, snapshot_id: str, prepared: dict
 ) -> None:
@@ -1581,8 +1744,17 @@ def _rollback_restore(
     """
     txn = _txn_dir(data_dir, wallet_id, snapshot_id)
     old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
+    # 事务目录闭集先行：回滚路径只允许 prepared.json 与 old/，绝不能已有
+    # committed.json；任何未知文件/.tmp/*.bak.json/额外目录/符号链接都
+    # fail-closed 保持现场。
+    flags = _scan_txn_snapshot_dir(txn)
+    if flags.get(MARKER_COMMITTED):
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} unexpectedly carries "
+            "a committed marker during rollback"
+        )
     if (
-        not set(prepared) <= _PREPARED_MARKER_KEYS
+        set(prepared) != _PREPARED_MARKER_KEYS
         or prepared.get("wallet_id") != wallet_id
         or prepared.get("snapshot_id") != snapshot_id
     ):
@@ -1596,35 +1768,20 @@ def _rollback_restore(
             f"restore-txn for {wallet_id!r}/{snapshot_id!r} prepared marker "
             "has a bad manifest hash"
         )
-    old_entries = _validate_marker_entries(
-        wallet_id, prepared.get("old_files"), "prepared"
+
+    # 闭集校验：old/ 必须存在，且其内文件集合、目录闭包、逐项字节/sha256
+    # 全部与 prepared.old_files 一致。任何符号链接、非常规文件/套接字、额外
+    # 文件或额外（含空）子目录都意味着备份现场被动过，绝不基于不可信备份
+    # 整体回滚。
+    if not flags.get(_TXN_OLD_DIRNAME):
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} prepared marker "
+            "has no backup directory"
+        )
+    old_entries = _verify_old_backup(
+        txn, wallet_id, snapshot_id, prepared
     )
     old_set = {entry["path"] for entry in old_entries}
-
-    # 闭集校验：old/ 内只能存在清单登记的白名单文件，任何符号链接/非常规
-    # 文件/额外文件都意味着备份现场被动过，绝不基于不可信备份整体回滚。
-    backup_on_disk = _scan_backup_tree(old_root, wallet_id)
-    if set(backup_on_disk) != old_set:
-        raise RecoveryError(
-            f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup set is "
-            "inconsistent with its prepared marker"
-        )
-    # 逐项核对备份的字节数与 sha256（同时拒绝符号链接/非常规文件）。
-    for entry in old_entries:
-        try:
-            data = _read_regular_file(
-                _safe_join(old_root, entry["path"])
-            )
-        except BackupError as exc:
-            raise RecoveryError(
-                f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup file "
-                "cannot be safely read"
-            ) from exc
-        if len(data) != entry["bytes"] or sha256_hex(data) != entry["sha256"]:
-            raise RecoveryError(
-                f"restore-txn for {wallet_id!r}/{snapshot_id!r} backup file "
-                "fails its recorded hash"
-            )
 
     target_paths = _list_current_relpaths(data_dir, wallet_id)
     # 删除回滚后不应存在的文件（含本次新写入的目标）。
@@ -1645,44 +1802,41 @@ def _rollback_restore(
     _prune_empty_txn_parents(data_dir, wallet_id)
 
 
-def _scan_backup_tree(old_root: str, wallet_id: str) -> list[str]:
-    """枚举 old/ 备份树内的相对路径；不存在返回空。
+def _verify_committed_residual(
+    txn: str,
+    flags: dict,
+    wallet_id: str,
+    snapshot_id: str,
+    manifest_sha256: str,
+) -> None:
+    """committed 权威前滚时，核对**仍残留**的 prepared.json/old/（若有）。
 
-    只枚举、不读内容；任何符号链接/非常规文件/越界路径都抛 RecoveryError，
-    由调用方决定 fail-closed（绝不跟随链接或猜写）。
+    正常提交后整个事务目录会被清掉；崩溃/被杀可能在清理中途留下完整或部分
+    的 prepared.json 与 old/。committed 是唯一提交点，残留缺失可容忍，但
+    **仍在的残留不得与 committed 矛盾**，否则现场被篡改，fail-closed：
+
+    - prepared.json 在：必须恰为契约四键、身份一致、manifest_sha256 与
+      committed 相同，old_files 清单形状合法；
+    - old/ 也在：其文件闭集/目录闭包/逐项字节 sha256 必须与 prepared 一致
+      （old/ 在而 prepared 已被清掉时无可比对清单，属无害残留，随目录清理）。
     """
-    if not os.path.exists(old_root) and not os.path.islink(old_root):
-        return []
-    if os.path.islink(old_root) or not os.path.isdir(old_root):
-        raise RecoveryError("restore backup root is not a directory")
-    found: list[str] = []
-    abs_root = os.path.abspath(old_root)
-    for dp, dirnames, filenames in os.walk(old_root, followlinks=False):
-        for name in list(dirnames):
-            full = os.path.join(dp, name)
-            if os.path.islink(full):
-                raise RecoveryError("refusing symbolic link in restore backup")
-        for name in filenames:
-            full = os.path.join(dp, name)
-            if os.path.islink(full):
-                raise RecoveryError("refusing symbolic link in restore backup")
-            if not os.path.isfile(full):
-                raise RecoveryError("non-regular file in restore backup")
-            rel = os.path.relpath(os.path.abspath(full), abs_root).replace(
-                os.sep, "/"
-            )
-            try:
-                _validate_member_name(rel)
-            except BackupError as exc:
-                raise RecoveryError(
-                    "restore backup contains an illegal path"
-                ) from exc
-            if not _is_whitelisted(wallet_id, rel):
-                raise RecoveryError(
-                    "restore backup contains a non-whitelisted path"
-                )
-            found.append(rel)
-    return found
+    if not flags.get(MARKER_PREPARED):
+        return
+    prepared = _read_txn_marker(
+        os.path.join(txn, MARKER_PREPARED), "prepared restore"
+    )
+    if (
+        set(prepared) != _PREPARED_MARKER_KEYS
+        or prepared.get("wallet_id") != wallet_id
+        or prepared.get("snapshot_id") != snapshot_id
+        or prepared.get("manifest_sha256") != manifest_sha256
+    ):
+        raise RecoveryError(
+            f"committed restore for {wallet_id!r}/{snapshot_id!r} disagrees "
+            "with its prepared marker"
+        )
+    if flags.get(_TXN_OLD_DIRNAME):
+        _verify_old_backup(txn, wallet_id, snapshot_id, prepared)
 
 
 def _rollforward_restore(
@@ -1712,9 +1866,13 @@ def _rollforward_restore(
     """
     txn = _txn_dir(data_dir, wallet_id, snapshot_id)
     committed_path = os.path.join(txn, MARKER_COMMITTED)
+    # 事务目录闭集先行：前滚路径只允许 committed.json（必在）以及正常提交
+    # 后尚未清理的 prepared.json/old/；任何未知文件/.tmp/*.bak.json/额外
+    # 目录/符号链接都 fail-closed，原样保留事务目录。
+    flags = _scan_txn_snapshot_dir(txn)
     committed = _read_txn_marker(committed_path, "committed restore")
     if (
-        not set(committed) <= _COMMITTED_MARKER_KEYS
+        set(committed) != _COMMITTED_MARKER_KEYS
         or committed.get("wallet_id") != wallet_id
         or committed.get("snapshot_id") != snapshot_id
     ):
@@ -1755,6 +1913,11 @@ def _rollforward_restore(
             raise RecoveryError(
                 f"committed restore target {rel!r} fails its recorded hash"
             )
+    # committed 自身封闭校验全部通过后，再核对仍残留的 prepared/old（若在），
+    # 残留与 committed 矛盾同样 fail-closed。
+    _verify_committed_residual(
+        txn, flags, wallet_id, snapshot_id, manifest_sha
+    )
     _prune_empty_leaf_dirs(data_dir, wallet_id)
     return manifest_sha
 
@@ -1817,39 +1980,29 @@ def _resume_pending_restore(
                 f"unexpected restore-txn entry under wallet {wallet_id!r}"
             )
         prepared_path = os.path.join(txn, MARKER_PREPARED)
-        committed_path = os.path.join(txn, MARKER_COMMITTED)
-        for marker in (prepared_path, committed_path):
-            if os.path.islink(marker):
-                raise RecoveryError(
-                    f"refusing symbolic link restore marker {marker!r}"
-                )
-        if os.path.exists(committed_path):
-            # committed 是唯一提交点：封闭校验（标记身份/哈希/逐项目标集合）
-            # 通过后返回其绑定哈希；任何不符在此抛 RecoveryError，保留现场。
+        # 闭集枚举：只允许 prepared.json/committed.json/old/，并据此判定前滚
+        # 或回滚——绝不依赖裸 os.path.exists 而把未知文件/链接/临时文件静默
+        # 留在事务目录里。
+        flags = _scan_txn_snapshot_dir(txn)
+        if flags[MARKER_COMMITTED]:
+            # committed 是唯一提交点：封闭校验（标记身份/哈希/逐项目标集合，
+            # 以及仍残留的 prepared/old）通过后返回其绑定哈希；任何不符在此抛
+            # RecoveryError，保留现场。
             manifest_sha256 = _rollforward_restore(
                 data_dir, wallet_id, snapshot_id
             )
-            # prepared 与 committed 同时存在时，二者记录的 manifest 哈希必须
-            # 一致；prepared 缺失不影响前滚（committed 为权威提交点），但若
-            # 存在却自相矛盾则 fail-closed，绝不任取一个哈希登记。
-            if os.path.exists(prepared_path):
-                prepared = _read_marker(prepared_path)
-                prepared_sha = prepared.get("manifest_sha256")
-                if prepared_sha != manifest_sha256:
-                    raise RecoveryError(
-                        f"committed restore for {snapshot_id!r} disagrees with "
-                        "its prepared marker"
-                    )
             _finalize_committed_restore(
                 data_dir, wallet_id, snapshot_id, manifest_sha256
             )
             result = (snapshot_id, manifest_sha256)
             continue
-        if os.path.exists(prepared_path):
-            prepared = _read_marker(prepared_path)
+        if flags[MARKER_PREPARED]:
+            prepared = _read_txn_marker(prepared_path, "prepared restore")
             _rollback_restore(data_dir, wallet_id, snapshot_id, prepared)
             continue
-        # 空事务目录（极端残留）：直接清掉
+        # 无 prepared 也无 committed：prepared 标记只在 old/ 备份完整复制后才
+        # 原子落盘，故此刻替换尚未开始、目标现场从未被触碰；空目录或仅有部分
+        # old/ 都属备份中途被杀的无害残留，直接清掉，绝不猜写目标。
         shutil.rmtree(txn, ignore_errors=True)
     try:
         if os.path.isdir(wallet_txn_root) and not os.listdir(wallet_txn_root):
@@ -1978,7 +2131,7 @@ def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
                     if os.path.exists(prepared_path):
                         _rollback_restore(
                             data_dir, wallet_id, snapshot_id,
-                            _read_marker(prepared_path),
+                            _read_txn_marker(prepared_path, "prepared restore"),
                         )
                     else:
                         shutil.rmtree(txn, ignore_errors=True)

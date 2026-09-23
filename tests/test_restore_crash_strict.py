@@ -84,6 +84,17 @@ class _CrashScene(unittest.TestCase):
         )
         self.assertFalse(os.path.exists(self.records_path))
 
+    def _plant_prepared(self, *, corrupt_backup=None):
+        os.makedirs(self.txn, exist_ok=True)
+        drbackup._commit_restore(
+            self.dst, "alice", "S1", self.manifest, self.files
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.txn, "committed.json"))
+        )
+        if corrupt_backup:
+            corrupt_backup(self)
+
 
 class CommittedClosedVerificationTest(_CrashScene):
     def test_clean_committed_rolls_forward_and_records_once(self):
@@ -298,17 +309,6 @@ class CommittedClosedVerificationTest(_CrashScene):
 
 
 class PreparedRollbackStrictTest(_CrashScene):
-    def _plant_prepared(self, *, corrupt_backup=None):
-        os.makedirs(self.txn, exist_ok=True)
-        drbackup._commit_restore(
-            self.dst, "alice", "S1", self.manifest, self.files
-        )
-        self.assertFalse(
-            os.path.exists(os.path.join(self.txn, "committed.json"))
-        )
-        if corrupt_backup:
-            corrupt_backup(self)
-
     def _tree(self):
         out = {}
         for dp, _, fns in os.walk(self.dst):
@@ -402,6 +402,147 @@ class PreparedRollbackStrictTest(_CrashScene):
         with self.assertRaises(RecoveryError):
             WalletService(WalletStore(self.dst))
         self.assertTrue(os.path.isdir(self.txn))
+
+
+class TxnDirClosedSetTest(_CrashScene):
+    """restore-txn/<W>/<S>/ 是闭集：只允许 prepared.json、committed.json、
+    old/。任何未知文件、原子临时文件（.tmp-*）、激活备份（*.bak.json）、
+    额外目录或符号链接都必须 fail-closed（启动恢复抛 RecoveryError、serve
+    拒绝就绪、常驻请求 503），现场保留且不登记 restore-records。"""
+
+    # ---- prepared（回滚）侧 --------------------------------------------
+
+    def test_prepared_extra_unknown_file_blocks(self):
+        self._plant_prepared()
+        with open(os.path.join(self.txn, "evil.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertTrue(os.path.isfile(os.path.join(self.txn, "evil.json")))
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_prepared_atomic_tmp_file_blocks(self):
+        self._plant_prepared()
+        with open(os.path.join(self.txn, ".tmp-abc.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_prepared_bak_file_blocks(self):
+        self._plant_prepared()
+        with open(os.path.join(self.txn, "wallet.bak.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_prepared_extra_directory_blocks(self):
+        self._plant_prepared()
+        os.makedirs(os.path.join(self.txn, "weird"))
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_prepared_symlink_in_txn_blocks(self):
+        self._plant_prepared()
+        os.symlink("/etc/hostname", os.path.join(self.txn, "link"))
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_prepared_empty_extra_dir_under_old_blocks(self):
+        self._plant_prepared()
+        os.makedirs(os.path.join(self.txn, "old", "emptydir"))
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertFalse(os.path.exists(self.records_path))
+
+    # ---- committed（前滚）侧 -------------------------------------------
+
+    def test_committed_extra_unknown_file_blocks(self):
+        self._plant_committed()
+        with open(os.path.join(self.txn, "evil.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+        self.assertTrue(os.path.isfile(os.path.join(self.txn, "evil.json")))
+
+    def test_committed_atomic_tmp_file_blocks(self):
+        self._plant_committed()
+        with open(os.path.join(self.txn, ".tmp-abc.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_committed_bak_file_blocks(self):
+        self._plant_committed()
+        with open(os.path.join(self.txn, "x.bak.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_committed_extra_directory_blocks(self):
+        self._plant_committed()
+        os.makedirs(os.path.join(self.txn, "weird"))
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_committed_symlink_in_txn_blocks(self):
+        self._plant_committed()
+        os.symlink("/etc/hostname", os.path.join(self.txn, "link"))
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_committed_residual_old_extra_file_blocks(self):
+        # committed 与 prepared 都在（正常崩溃窗口），但残留 old/ 被塞入额外
+        # 文件：残留与 prepared.old_files 闭集矛盾，必须 fail-closed。
+        self._plant_committed()
+        extra = os.path.join(self.txn, "old", "sign-sessions", "alice.json")
+        os.makedirs(os.path.dirname(extra), exist_ok=True)
+        with open(extra, "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_committed_extra_file_http_503(self):
+        from tests.helpers import http_server
+
+        # 服务先于损坏现场就绪（模拟他进程在服务常驻期间摆出无法封闭核对的
+        # committed 现场）；持锁访问自愈时命中闭集违规 -> 503。
+        with http_server(self.dst) as srv:
+            self._plant_committed()
+            with open(os.path.join(self.txn, "evil.json"), "wb") as f:
+                f.write(b"{}")
+            status, body = srv.request("GET", "/v1/wallets/alice")
+            self.assertEqual(status, 503, body)
+            self.assertNotIn("private", json.dumps(body))
+        self._assert_scene_preserved()
+
+    def test_committed_extra_file_blocks_serve(self):
+        from threshold_wallet import cli
+
+        self._plant_committed()
+        with open(os.path.join(self.txn, "evil.json"), "wb") as f:
+            f.write(b"{}")
+        code = cli.main(
+            ["serve", "--host", "127.0.0.1", "--port", "0",
+             "--data-dir", self.dst]
+        )
+        self.assertNotEqual(code, 0)
+        self._assert_scene_preserved()
 
 
 if __name__ == "__main__":
