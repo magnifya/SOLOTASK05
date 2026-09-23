@@ -98,6 +98,57 @@ def _is_sha256_hex(value: object) -> bool:
     )
 
 
+def _is_inside(child: str, parent: str) -> bool:
+    """词法判定 ``child`` 是否等于 ``parent`` 或位于其目录树内。"""
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def _assert_output_outside_data_dir(output: str, data_dir: str) -> None:
+    """拒绝任何解析后落在 data-dir 内（含边界）的备份输出路径。
+
+    成功写包会以快照内容原子替换 ``--output`` 目标：若目标位于 data-dir
+    内（业务文件、份额文件、灾备事务/记录文件、锁文件、根目录本身），出包
+    即覆盖在线状态。故在**取得钱包锁之后、开始读取任何钱包文件之前**调用：
+
+    - 词法绝对路径位于 data-dir 内：拒绝（含尚不存在的目标，覆盖
+      ``data/audit/<W>.json``、``data/shares/<W>/...``、
+      ``data/restore-txn/...`` 等情形）；
+    - 路径或其任一已存在父级是符号链接、最终 realpath 落入 data-dir：
+      拒绝（防 data-dir 内符号链接指向外部、或外部链接回指 data-dir）；
+    - 输出同目录临时文件（``.snapshot-*.tmp``）的父目录位于 data-dir 内：
+      拒绝（连半包临时文件也不得落进 data-dir）。
+
+    命中抛 BackupError(400)——这是确定性的调用方参数错误，且绝不进行任何
+    读盘/自愈/写盘，钱包现场与既有快照都不受影响。
+    """
+    abs_data = os.path.abspath(data_dir)
+    real_data = os.path.realpath(abs_data)
+    abs_out = os.path.abspath(output)
+    real_out = os.path.realpath(abs_out)
+    # 词法判定先行：即使目标尚不存在（realpath 无法解析叶子），只要路径
+    # 串落在 data-dir 命名空间内即拒绝。
+    if _is_inside(abs_out, abs_data) or _is_inside(abs_out, real_data):
+        raise BackupError(
+            400, "--output must not point inside the data directory"
+        )
+    # 跟随符号链接后的真实落点（含外部链接回指 data-dir 的情形）。
+    if _is_inside(real_out, real_data) or _is_inside(real_out, abs_data):
+        raise BackupError(
+            400, "--output resolves inside the data directory via a link"
+        )
+    # 原子写出的临时文件与输出同目录：该目录在 data-dir 内同样拒绝。
+    parent = os.path.dirname(abs_out) or os.sep
+    real_parent = os.path.realpath(parent)
+    if (
+        _is_inside(parent, abs_data)
+        or _is_inside(real_parent, real_data)
+        or _is_inside(real_parent, abs_data)
+    ):
+        raise BackupError(
+            400, "--output temporary file would land inside the data directory"
+        )
+
+
 def _read_regular_file(path: str) -> bytes:
     """读取普通文件字节；符号链接/非常规文件一律拒绝（绝不跟随链接）。"""
     if os.path.islink(path):
@@ -371,6 +422,11 @@ def backup(
     try:
         service = WalletService(WalletStore(data_dir), recover=False)
         with service._wallet_lock(wallet_id):
+            # 取得钱包锁后、开始任何读取/自愈前先封闭输出路径：--output 落入
+            # data-dir（业务/份额/事务/记录/锁文件、已存在文件、符号链接或
+            # 同目录临时路径）一律 400 拒绝，绝不触发自愈或写盘，因而失败不会
+            # 改动任何钱包现场或既有快照。
+            _assert_output_outside_data_dir(output, data_dir)
             # 持锁自愈：先把他进程崩溃遗留的半完成轮换/提交/会话对账干净，
             # 绝不打包半状态；恢复失败直接向上抛（fail-closed）。
             service._heal_wallet(wallet_id)

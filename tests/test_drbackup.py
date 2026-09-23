@@ -243,6 +243,129 @@ class BackupTest(unittest.TestCase):
         paths = {f["path"] for f in body["manifest"]["files"]}
         self.assertTrue(all("bob" not in p for p in paths))
 
+    def _assert_400_and_scene_unchanged(self, out, live_files):
+        def hashes():
+            return {
+                rel: hashlib.sha256(open(os.path.join(self.data, rel), "rb")
+                                   .read()).hexdigest()
+                for rel in live_files
+            }
+        before = hashes()
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", out)
+        self.assertEqual(cm.exception.status, 400)
+        # 钱包现场逐字节不变，且目标位置没有出现新快照/半包临时文件
+        self.assertEqual(hashes(), before)
+        dp = os.path.dirname(os.path.abspath(out))
+        if os.path.isdir(dp):
+            self.assertFalse(
+                any(n.startswith(".snapshot-") for n in os.listdir(dp))
+            )
+
+    def test_output_refuses_existing_business_file(self):
+        self.h.service.put_policy("alice", 1, 3600)
+        self._assert_400_and_scene_unchanged(
+            os.path.join(self.data, "audit", "alice.json"),
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json", "audit/alice.json"],
+        )
+
+    def test_output_refuses_existing_share_file(self):
+        self._assert_400_and_scene_unchanged(
+            os.path.join(self.data, "shares/alice/share-1.json"),
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+
+    def test_output_refuses_nonexistent_path_inside_data_dir(self):
+        self._assert_400_and_scene_unchanged(
+            os.path.join(self.data, "wallets", "snapshot.tar"),
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.data, "wallets", "snapshot.tar"))
+        )
+
+    def test_output_refuses_nested_dotdot_path_inside_data_dir(self):
+        # 词法上等价于 data-dir 内的越界写法也必须拒绝
+        out = os.path.join(self.data, "shares", "..", "snap.tar")
+        self._assert_400_and_scene_unchanged(
+            out,
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+
+    def test_output_refuses_restore_txn_path(self):
+        out = os.path.join(
+            self.data, "restore-txn", "alice", "S1", "prepared.json"
+        )
+        self._assert_400_and_scene_unchanged(
+            out,
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+
+    def test_output_refuses_data_dir_root(self):
+        self._assert_400_and_scene_unchanged(
+            self.data,
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+
+    def test_output_refuses_symlink_inside_data_dir(self):
+        target = os.path.join(self.tmp, "elsewhere.tar")
+        link = os.path.join(self.data, "link.tar")
+        os.symlink(target, link)
+        self._assert_400_and_scene_unchanged(
+            link,
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+        # 链接目标（data-dir 外）也不得被创建或写入
+        self.assertFalse(os.path.exists(target))
+
+    def test_output_refuses_external_link_back_into_data_dir(self):
+        ext = os.path.join(self.tmp, "ext")
+        os.makedirs(ext, exist_ok=True)
+        link = os.path.join(ext, "back.tar")
+        os.symlink(os.path.join(self.data, "wallets", "alice.json"), link)
+        self._assert_400_and_scene_unchanged(
+            link,
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+
+    def test_output_refuses_atomic_temp_inside_data_dir(self):
+        # 即使给出 .snapshot-*.tmp 形态的临时路径也同样不得落进 data-dir
+        out = os.path.join(self.data, ".snapshot-x.tmp")
+        self._assert_400_and_scene_unchanged(
+            out,
+            ["wallets/alice.json", "shares/alice/share-1.json",
+             "shares/alice/share-2.json"],
+        )
+
+    def test_rejected_inside_output_runs_before_self_heal_changes(self):
+        # 现场被构造成"可自愈"状态：失败路径绝不能顺手做恢复改写。
+        # 用一个不存在于白名单枚举、但钱包仍可对账的输出点触发拒绝。
+        live = ["wallets/alice.json",
+                "shares/alice/share-1.json", "shares/alice/share-2.json"]
+        before = {
+            rel: hashlib.sha256(open(os.path.join(self.data, rel), "rb")
+                                .read()).hexdigest()
+            for rel in live
+        }
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1",
+                            os.path.join(self.data, "x.tar"))
+        self.assertEqual(cm.exception.status, 400)
+        after = {
+            rel: hashlib.sha256(open(os.path.join(self.data, rel), "rb")
+                                .read()).hexdigest()
+            for rel in live
+        }
+        self.assertEqual(before, after)
+
 
 class RestoreManifestContractTest(unittest.TestCase):
     def setUp(self):
@@ -546,6 +669,141 @@ class RestoreRotationTest(unittest.TestCase):
         self.assertEqual(status, 201)
         svc = WalletService(WalletStore(dst))
         self.assertEqual(svc.sign("dave", "q1", "msg", sigs)[0], 200)
+
+
+class RestoreMultiRotationTest(unittest.TestCase):
+    """连续两次以上轮换后出包/恢复：历史与最新签名、审计、账本、幂等。"""
+
+    def _build_wallet(self, src):
+        h = make_harness(src)
+        svc = h.service
+        svc.create_wallet("alice", 2)
+        svc.put_policy("alice", 1, 3600)
+        captured = {}
+
+        def sign(rid, message, share_ids):
+            svc.create_sign_request("alice", rid, message)
+            svc.approve("alice", rid, "ops", None)
+            sigs = [
+                {"share_id": sid,
+                 "signature": h.share_signature("alice", sid, rid, message)}
+                for sid in share_ids
+            ]
+            st, _ = svc.sign("alice", rid, message, sigs)
+            self.assertEqual(st, 201)
+            captured[rid] = (message, sigs)
+
+        sign("r0", "m0", ("share-1", "share-2"))
+        svc.create_asset_operation("alice", "op1", "BTC", 10)
+        svc.commit_asset_operation("alice", "op1")
+
+        svc.create_share_rotation("alice", "rot1")
+        svc.activate_share_rotation("alice", "rot1")
+        sign("r1", "m1", ("rot1-share-1", "rot1-share-2"))
+        svc.create_asset_operation("alice", "op2", "BTC", -3)
+        svc.commit_asset_operation("alice", "op2")
+
+        svc.create_share_rotation("alice", "rot2")
+        svc.activate_share_rotation("alice", "rot2")
+        sign("r2", "m2", ("rot2-share-1", "rot2-share-2"))
+
+        # 在途 collecting 会话：恢复后仍可用最新两份在用份额补齐
+        svc.create_sign_session("alice", "ses1", "ms", 3600)
+        return h, captured
+
+    def test_two_plus_rotations_restore_keeps_history_and_state(self):
+        tmp = tempfile.mkdtemp()
+        src, dst = f"{tmp}/src", f"{tmp}/dst"
+        h, captured = self._build_wallet(src)
+        events_before = AuditStore(src).list_events("alice")
+        pack = f"{tmp}/b.tar"
+        body = drbackup.backup(src, "alice", "S1", pack)
+        self.assertEqual(body["status"], 201)
+
+        status, restored = drbackup.restore(dst, "alice", pack)
+        self.assertEqual(status, 201)
+        svc = WalletService(WalletStore(dst))
+
+        # 恢复本身不新增审计事件，seq 自 1 连续（在任何后续操作之前核对）
+        events_after = AuditStore(dst).list_events("alice")
+        self.assertEqual(
+            [e["seq"] for e in events_after],
+            list(range(1, len(events_after) + 1)),
+        )
+        self.assertEqual(
+            [(e["type"], e["request_id"], e.get("details"))
+             for e in events_after],
+            [(e["type"], e["request_id"], e.get("details"))
+             for e in events_before],
+        )
+
+        # 三个历史签名（创世/rot1/rot2 时刻公钥）恢复后均 200 重放
+        for rid, (message, sigs) in captured.items():
+            self.assertEqual(svc.sign("alice", rid, message, sigs)[0], 200)
+
+        # 当前在用份额是 rot2（旧份额文件已不存在）
+        wallet = WalletStore(dst).get_wallet("alice")
+        self.assertEqual(
+            sorted(s["share_id"] for s in wallet["shares"]),
+            ["rot2-share-1", "rot2-share-2"],
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(dst, "shares/alice/share-1.json"))
+        )
+
+        # 在途会话迁移到最新份额：用 rot2 份额补齐可聚合成功
+        view = svc.get_sign_session("alice", "ses1")
+        self.assertEqual(view["state"], "collecting")
+        self.assertEqual(
+            sorted(view["missing_shares"]),
+            ["rot2-share-1", "rot2-share-2"],
+        )
+        # 该消息需审批门控；先建审批单再投递
+        svc.create_sign_request("alice", "ses1", "ms")
+        svc.approve("alice", "ses1", "ops", None)
+        for sid in ("rot2-share-1", "rot2-share-2"):
+            svc.submit_sign_session_share(
+                "alice", "ses1", sid,
+                h.share_signature("alice", sid, "ses1", "ms"),
+            )
+        view = svc.get_sign_session("alice", "ses1")
+        self.assertEqual(view["state"], "signed")
+        self.assertEqual(len(view["aggregate_signature"]), 256)
+
+        # 账本余额/version 与源端一致
+        self.assertEqual(
+            svc.get_asset("alice", "BTC"),
+            {"asset_id": "BTC", "balance": 7, "version": 2},
+        )
+
+    def test_two_plus_rotations_with_prepared_third_restores_and_activates(self):
+        tmp = tempfile.mkdtemp()
+        src, dst = f"{tmp}/src", f"{tmp}/dst"
+        h, captured = self._build_wallet(src)
+        h.service.create_share_rotation("alice", "rot3")  # prepared 未激活
+        pack = f"{tmp}/b.tar"
+        self.assertEqual(drbackup.backup(src, "alice", "S1", pack)["status"], 201)
+        status, _ = drbackup.restore(dst, "alice", pack)
+        self.assertEqual(status, 201)
+        svc = WalletService(WalletStore(dst))
+        # 历史签名仍按各自时刻公钥验通
+        for rid, (message, sigs) in captured.items():
+            self.assertEqual(svc.sign("alice", rid, message, sigs)[0], 200)
+        # prepared 的第三次轮换在恢复后可以激活，激活后可首签
+        st, view = svc.activate_share_rotation("alice", "rot3")
+        self.assertEqual(st, 201)
+        self.assertEqual(view["state"], "active")
+
+    def test_two_plus_rotations_restore_replay_200_same_body(self):
+        tmp = tempfile.mkdtemp()
+        src, dst = f"{tmp}/src", f"{tmp}/dst"
+        self._build_wallet(src)
+        pack = f"{tmp}/b.tar"
+        drbackup.backup(src, "alice", "S1", pack)
+        s1, b1 = drbackup.restore(dst, "alice", pack)
+        s2, b2 = drbackup.restore(dst, "alice", pack)
+        self.assertEqual((s1, s2), (201, 200))
+        self.assertEqual(b1, b2 | {"status": 201})
 
 
 class RestoreRejectTest(unittest.TestCase):
