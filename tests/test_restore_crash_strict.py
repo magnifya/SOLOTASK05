@@ -545,5 +545,151 @@ class TxnDirClosedSetTest(_CrashScene):
         self._assert_scene_preserved()
 
 
+class HardTerminationConvergenceTest(_CrashScene):
+    """SIGKILL/断电（Python ``except`` 清理不执行）后只可能留下本事务自己的
+    确定性残留：标记的 ``.<name>.tmp`` 写中临时名与事务内 ``new/`` 暂存树。
+    恢复必须据 committed 是否落盘前滚/核验 old 后回滚，绝不永久 fail-closed，
+    也不把业务文件暴露成半状态；外部塞入的随机名临时文件仍须 fail-closed。"""
+
+    def _build_prepared(self):
+        """复制 old/ 并写 prepared 标记（不做 new/ 暂存与改名），返回 old_root。"""
+        old_root = drbackup._txn_old_dir(self.dst, "alice", "S1")
+        old_entries = []
+        for rel in drbackup._list_current_relpaths(self.dst, "alice"):
+            src = drbackup._safe_join(self.dst, rel)
+            dstp = drbackup._safe_join(old_root, rel)
+            os.makedirs(os.path.dirname(dstp), exist_ok=True)
+            shutil.copy2(src, dstp)
+            old_entries.append(drbackup._file_entry(old_root, rel))
+        prepared = {
+            "wallet_id": "alice",
+            "snapshot_id": "S1",
+            "manifest_sha256": self.mhash,
+            "old_files": old_entries,
+        }
+        drbackup._atomic_write_json(
+            os.path.join(self.txn, "prepared.json"), prepared
+        )
+        return old_root
+
+    def _stage_new(self, rels):
+        new_root = drbackup._txn_new_dir(self.dst, "alice", "S1")
+        for rel in rels:
+            p = drbackup._safe_join(new_root, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(self.files[rel])
+        return new_root
+
+    def test_kill_during_prepared_write_converges(self):
+        # 强杀于 prepared.json 原子改名前：old/ 已复制、仅留半截确定性临时名，
+        # 无任何标记，目标现场从未被触碰。
+        os.makedirs(self.txn, exist_ok=True)
+        self._build_prepared()
+        os.unlink(os.path.join(self.txn, "prepared.json"))
+        with open(os.path.join(self.txn, ".prepared.json.tmp"), "wb") as f:
+            f.write(b"{half")
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+        status, _ = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 201)
+
+    def test_kill_during_new_stage_with_partial_temp_rolls_back(self):
+        # 强杀于 new/ 暂存阶段：prepared 已在，部分暂存正式文件与一份半截
+        # 确定性写中临时名残留，业务目标尚未改名。
+        os.makedirs(self.txn, exist_ok=True)
+        self._build_prepared()
+        new_root = self._stage_new(["audit/alice.json"])
+        with open(os.path.join(new_root, "audit", ".alice.json.tmp"), "wb") as f:
+            f.write(b"{partial")
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+        status, _ = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 201)
+
+    def test_kill_mid_rename_partial_new_scene_rolls_back_fully(self):
+        # 强杀于改名落位中途：prepared 在、new/ 仍有未改名暂存，且一份业务
+        # 目标已被换成快照内容（policies 1/360）。无 committed，必须核验 old
+        # 后整体回滚为原现场（2/99）。
+        os.makedirs(self.txn, exist_ok=True)
+        self._build_prepared()
+        rels = sorted(self.files)
+        new_root = self._stage_new(rels)
+        # 改名一份 policies 到业务位，并从 new/ 删除其暂存，模拟中途现场
+        os.replace(
+            drbackup._safe_join(new_root, "policies/alice.json"),
+            drbackup._safe_join(self.dst, "policies/alice.json"),
+        )
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+        # 再留一份半截暂存写中临时名
+        with open(
+            drbackup._safe_join(new_root, "wallets/.alice.json.tmp"), "wb"
+        ) as f:
+            f.write(b"{half")
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+
+    def test_kill_before_committed_rename_rolls_back(self):
+        # 全部目标已改名落位（现场已是快照），但 committed.json 在原子改名前
+        # 被杀：committed 是唯一提交点，缺失即核验 old 后整体回滚。
+        os.makedirs(self.txn, exist_ok=True)
+        self._build_prepared()
+        new_root = self._stage_new(sorted(self.files))
+        for rel in sorted(self.files):
+            target = drbackup._safe_join(self.dst, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            os.replace(drbackup._safe_join(new_root, rel), target)
+        with open(os.path.join(self.txn, ".committed.json.tmp"), "wb") as f:
+            f.write(b"{half")
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+
+    def test_committed_with_empty_new_dir_rolls_forward(self):
+        # committed 在、目标齐备，仅残留一个空的 new/ 暂存目录：前滚成功并
+        # 补登 restore-records。
+        self._plant_committed()
+        os.makedirs(os.path.join(self.txn, "new"), exist_ok=True)
+        WalletService(WalletStore(self.dst))
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"]["S1"]["manifest_sha256"], self.mhash
+        )
+        self.assertFalse(os.path.exists(self.txn))
+
+    def test_random_named_stage_temp_still_blocks(self):
+        # 外部塞入的随机名 .tmp-* 不得借 new/ 通道被静默吞掉。
+        os.makedirs(self.txn, exist_ok=True)
+        self._build_prepared()
+        new_root = self._stage_new(["audit/alice.json"])
+        with open(os.path.join(new_root, ".tmp-abc.json"), "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+
+    def test_staged_file_without_prepared_blocks(self):
+        # 写顺序保证 new/ 暂存只可能在 prepared 落盘之后出现；有暂存正式文件
+        # 却无 prepared 是本事务不可能产生的矛盾现场，fail-closed 保留。
+        os.makedirs(self.txn, exist_ok=True)
+        self._stage_new(["audit/alice.json"])
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+
+
 if __name__ == "__main__":
     unittest.main()

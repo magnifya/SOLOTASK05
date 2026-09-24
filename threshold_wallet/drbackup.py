@@ -1309,6 +1309,11 @@ def _txn_old_dir(data_dir: str, wallet_id: str, snapshot_id: str) -> str:
     return os.path.join(_txn_dir(data_dir, wallet_id, snapshot_id), "old")
 
 
+def _txn_new_dir(data_dir: str, wallet_id: str, snapshot_id: str) -> str:
+    """新文件在事务目录内的暂存根（改名落位前），强杀残留也封闭于此。"""
+    return os.path.join(_txn_dir(data_dir, wallet_id, snapshot_id), "new")
+
+
 def _records_path(data_dir: str, wallet_id: str) -> str:
     return os.path.join(
         data_dir, RESTORE_RECORDS_DIRNAME, wallet_id + ".json"
@@ -1316,9 +1321,24 @@ def _records_path(data_dir: str, wallet_id: str) -> str:
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """原子写整份字节：同目录确定性临时文件 + os.replace。
+
+    临时文件名固定为 ``.<basename>.tmp``（与目标同目录），而不是随机
+    mkstemp 名：本事务只有持钱包锁的唯一写者，确定性名使**强杀/断电**
+    （``SIGKILL``/``os._exit``，``except`` 清理不会执行）残留的半截临时
+    文件在崩溃恢复时可被明确识别为"本事务自己的写中残留"并安全收敛，
+    而不会与外部塞入的随机名 ``.tmp-*``/``*.bak.json``/未知文件相混
+    （后者仍一律 fail-closed）。重写前先解链旧残留，再以 O_EXCL 建立
+    0600 普通文件，绝不跟随既有符号链接。
+    """
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    tmp = os.path.join(directory, "." + os.path.basename(path) + ".tmp")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -1413,7 +1433,22 @@ def _commit_restore(
     manifest: dict,
     files: dict[str, bytes],
 ) -> None:
-    """prepared 标记之后执行替换：备份现状 → 写目标 → 删除多余文件。
+    """prepared 标记之后执行替换：备份现状 → 暂存新文件 → 逐份改名落位。
+
+    崩溃安全的关键在于：**未提交前任何写中残留都只落在本事务自有的
+    restore-txn/<W>/<S>/ 命名空间内**，绝不落进业务目录——
+
+    1. 现状逐份复制到 ``old/``，按落盘字节登记 prepared.old_files；
+    2. 原子写 prepared.json（确定性临时名 ``.prepared.json.tmp``）；
+    3. 快照新文件**先全部写入事务目录内的** ``new/<rel>`` 暂存；
+    4. 再用同文件系统上的 ``os.replace`` 把每份暂存文件**改名**到业务
+       目标位（改名是原子的，业务目录里永不会出现写中临时文件）；
+    5. 删除目标集合之外的旧文件、清空叶子目录。
+
+    这样即使在第 2~5 步任一处被 SIGKILL/断电强杀：业务目录要么仍是旧
+    文件、要么已整体换成新文件，绝不会残留半截 ``.tmp-*``；写中残留
+    只可能是事务目录内的 ``new/`` 暂存或确定性标记临时名，崩溃恢复据
+    committed 是否落盘决定前滚/整体回滚（见 _resume_pending_restore）。
 
     prepared.json 的 ``old_files`` 携带替换前每个白名单文件的
     ``{path, bytes, sha256}``，是崩溃后"整体回滚"唯一可信依据：回滚前会
@@ -1421,6 +1456,7 @@ def _commit_restore(
     """
     txn = _txn_dir(data_dir, wallet_id, snapshot_id)
     old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
+    new_root = _txn_new_dir(data_dir, wallet_id, snapshot_id)
     current = _list_current_relpaths(data_dir, wallet_id)
     old_entries: list[dict] = []
     for rel in current:
@@ -1438,9 +1474,19 @@ def _commit_restore(
     }
     _atomic_write_json(os.path.join(txn, MARKER_PREPARED), prepared)
 
+    # 新文件先全部暂存进事务自有的 new/：这里产生的任何（含强杀留下的）
+    # 半截文件都封闭在 restore-txn 内，恢复时随回滚/清理一并移除。
     for rel, data in files.items():
+        staged = _safe_join(new_root, rel)
+        _atomic_write_bytes(staged, data)
+
+    # 同文件系统原子改名落位：os.replace 要么未发生、要么目标已是完整新
+    # 文件，业务目录中不存在"写了一半的临时文件"窗口。
+    for rel in files:
+        staged = _safe_join(new_root, rel)
         target = _safe_join(data_dir, rel)
-        _atomic_write_bytes_target(target, data)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.replace(staged, target)
 
     target_set = set(files)
     for rel in current:
@@ -1450,22 +1496,6 @@ def _commit_restore(
             except FileNotFoundError:
                 pass
     _prune_empty_leaf_dirs(data_dir, wallet_id)
-
-
-def _atomic_write_bytes_target(target: str, data: bytes) -> None:
-    directory = os.path.dirname(target)
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp, target)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def _prune_empty_leaf_dirs(data_dir: str, wallet_id: str) -> None:
@@ -1565,18 +1595,31 @@ def _read_txn_marker(path: str, what: str) -> dict:
 
 #: restore-txn/<W>/<S>/ 目录直接成员的唯一闭集
 _TXN_OLD_DIRNAME = "old"
+_TXN_NEW_DIRNAME = "new"
+
+#: 两个标记确定性原子写临时名（与 _atomic_write_bytes 的命名一致）。
+#: 它们是本事务**自己**强杀/断电后可能残留的写中临时文件，与外部塞入的
+#: 随机名 ``.tmp-*`` 严格区分：只在对应最终标记尚未落盘时才可能出现。
+_PREPARED_MARKER_TMP = "." + MARKER_PREPARED + ".tmp"
+_COMMITTED_MARKER_TMP = "." + MARKER_COMMITTED + ".tmp"
 
 
 def _scan_txn_snapshot_dir(txn_dir: str) -> dict[str, bool]:
     """封闭枚举单个 restore-txn/<W>/<S>/ 目录的直接成员。
 
     契约闭集：该目录**只**能含 ``prepared.json``、``committed.json``（普通
-    文件）与 ``old/``（目录）。任何符号链接、非常规文件、原子写临时文件
-    （``.tmp-*``）、激活备份（``*.bak.json``）或其余未知文件/目录都意味着
-    事务现场被动过，统一抛 RecoveryError（保留现场、fail-closed）。
+    文件）、``old/``、``new/``（目录）以及两个标记各自的**确定性**写中
+    临时文件 ``.prepared.json.tmp`` / ``.committed.json.tmp``。
 
-    返回 ``{"prepared": bool, "committed": bool, "old": bool}`` 供调用方决定
-    前滚/回滚/空目录清理。
+    任何符号链接、非常规文件、随机名原子临时文件（``.tmp-*.json``）、
+    激活备份（``*.bak.json``）或其余未知文件/目录都意味着事务现场被动过，
+    统一抛 RecoveryError（保留现场、fail-closed）。
+
+    两个确定性临时名只在其最终标记**尚未**落盘时才可能残留（原子改名一旦
+    完成临时名即消失）；若临时名与同名最终标记同时在场，属矛盾现场，同样
+    fail-closed。
+
+    返回各成员是否在场的标志，供调用方决定前滚/回滚/空目录清理。
     """
     if os.path.islink(txn_dir) or not os.path.isdir(txn_dir):
         raise RecoveryError("restore transaction entry is not a directory")
@@ -1589,6 +1632,9 @@ def _scan_txn_snapshot_dir(txn_dir: str) -> dict[str, bool]:
         MARKER_PREPARED: False,
         MARKER_COMMITTED: False,
         _TXN_OLD_DIRNAME: False,
+        _TXN_NEW_DIRNAME: False,
+        _PREPARED_MARKER_TMP: False,
+        _COMMITTED_MARKER_TMP: False,
     }
     for entry in entries:
         name = entry.name
@@ -1600,16 +1646,97 @@ def _scan_txn_snapshot_dir(txn_dir: str) -> dict[str, bool]:
             if not entry.is_file(follow_symlinks=False):
                 raise RecoveryError(f"restore marker {name!r} is not a regular file")
             flags[name] = True
-        elif name == _TXN_OLD_DIRNAME:
+        elif name == _TXN_OLD_DIRNAME or name == _TXN_NEW_DIRNAME:
             if not entry.is_dir(follow_symlinks=False):
-                raise RecoveryError("restore backup 'old' is not a directory")
+                raise RecoveryError(f"restore stage {name!r} is not a directory")
+            flags[name] = True
+        elif name == _PREPARED_MARKER_TMP or name == _COMMITTED_MARKER_TMP:
+            if not entry.is_file(follow_symlinks=False):
+                raise RecoveryError(f"restore temp {name!r} is not a regular file")
             flags[name] = True
         else:
-            # .tmp-*、*.bak.json、未知文件、额外目录一律拒绝
+            # 随机 .tmp-*、*.bak.json、未知文件、额外目录一律拒绝
             raise RecoveryError(
                 f"unexpected entry in restore transaction directory: {name!r}"
             )
+    # 原子改名完成后临时名必已消失：最终标记与其写中临时名同时在场只能是
+    # 篡改/矛盾现场，绝不基于它做任何收敛。
+    if flags[MARKER_PREPARED] and flags[_PREPARED_MARKER_TMP]:
+        raise RecoveryError(
+            "prepared marker and its write temp coexist in restore transaction"
+        )
+    if flags[MARKER_COMMITTED] and flags[_COMMITTED_MARKER_TMP]:
+        raise RecoveryError(
+            "committed marker and its write temp coexist in restore transaction"
+        )
     return flags
+
+
+def _scan_new_stage_tree(new_root: str, wallet_id: str) -> set[str]:
+    """递归封闭枚举事务内 ``new/`` 暂存树，返回其中正式暂存文件相对路径集。
+
+    ``new/`` 是**未提交前**的自有暂存命名空间（改名落位的源），任何收敛
+    路径都不会信任或还原因其中内容：committed 未落盘时随整体回滚连同事务
+    目录一并删除，committed 已落盘时只可能剩下空目录。这里仍做闭集结构
+    校验，防止符号链接/越界/非常规条目混入：
+
+    - 任何层级符号链接、套接字/FIFO/设备等非常规条目一律拒绝；
+    - 每个路径段合法（拒绝 ``..``/绝对/反斜杠）；
+    - 普通文件要么是该钱包白名单内相对路径的暂存正式文件，要么是其同目录
+      确定性写中临时名 ``.<leaf>.tmp``，其余一律拒绝。
+    """
+    if not os.path.exists(new_root) and not os.path.islink(new_root):
+        return set()
+    if os.path.islink(new_root) or not os.path.isdir(new_root):
+        raise RecoveryError("restore stage 'new' is not a directory")
+    staged: set[str] = set()
+
+    def walk(abs_dir: str, rel_dir: str) -> None:
+        try:
+            with os.scandir(abs_dir) as it:
+                entries = list(it)
+        except OSError as exc:
+            raise RecoveryError("restore stage directory is unreadable") from exc
+        for entry in entries:
+            rel = entry.name if not rel_dir else f"{rel_dir}/{entry.name}"
+            if entry.is_symlink():
+                raise RecoveryError("refusing symbolic link in restore stage")
+            if entry.is_dir(follow_symlinks=False):
+                try:
+                    _validate_member_name(rel)
+                except BackupError as exc:
+                    raise RecoveryError(
+                        "restore stage contains an illegal directory"
+                    ) from exc
+                walk(entry.path, rel)
+            elif entry.is_file(follow_symlinks=False):
+                try:
+                    _validate_member_name(rel)
+                except BackupError as exc:
+                    raise RecoveryError(
+                        "restore stage contains an illegal path"
+                    ) from exc
+                if _is_whitelisted(wallet_id, rel):
+                    staged.add(rel)
+                    continue
+                # 确定性写中临时名：".<leaf>.tmp"，其去掉前缀/后缀后的
+                # 同目录目标必须是白名单暂存文件。
+                dname, leaf = rel.rsplit("/", 1) if "/" in rel else ("", rel)
+                if leaf.startswith(".") and leaf.endswith(".tmp"):
+                    target_leaf = leaf[1:-len(".tmp")]
+                    target_rel = (
+                        target_leaf if not dname else f"{dname}/{target_leaf}"
+                    )
+                    if _is_whitelisted(wallet_id, target_rel):
+                        continue
+                raise RecoveryError(
+                    "restore stage contains an unexpected file"
+                )
+            else:
+                raise RecoveryError("non-regular entry in restore stage")
+
+    walk(new_root, "")
+    return staged
 
 
 def _expected_backup_dirs(file_set: set[str]) -> set[str]:
@@ -1744,15 +1871,20 @@ def _rollback_restore(
     """
     txn = _txn_dir(data_dir, wallet_id, snapshot_id)
     old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
-    # 事务目录闭集先行：回滚路径只允许 prepared.json 与 old/，绝不能已有
-    # committed.json；任何未知文件/.tmp/*.bak.json/额外目录/符号链接都
-    # fail-closed 保持现场。
+    # 事务目录闭集先行：回滚路径只允许 prepared.json、old/、未提交的 new/
+    # 暂存与确定性标记写中临时名，绝不能已有 committed.json；任何随机名
+    # .tmp-*/*.bak.json/未知文件/额外目录/符号链接都 fail-closed 保持现场。
     flags = _scan_txn_snapshot_dir(txn)
     if flags.get(MARKER_COMMITTED):
         raise RecoveryError(
             f"restore-txn for {wallet_id!r}/{snapshot_id!r} unexpectedly carries "
             "a committed marker during rollback"
         )
+    if flags.get(_COMMITTED_MARKER_TMP):
+        # committed.json 尚未原子落盘，但出现了它的写中临时名且 prepared 仍在
+        # ——属未提交窗口，按回滚处理；结构上仍要求闭集合法（上方扫描已确保
+        # 临时名不与同名最终标记共存）。这里无需额外动作，临时名随事务目录删除。
+        pass
     if (
         set(prepared) != _PREPARED_MARKER_KEYS
         or prepared.get("wallet_id") != wallet_id
@@ -1782,6 +1914,15 @@ def _rollback_restore(
         txn, wallet_id, snapshot_id, prepared
     )
     old_set = {entry["path"] for entry in old_entries}
+
+    # new/ 是未提交暂存（强杀可能留下部分暂存文件与其确定性写中临时名）：
+    # 回滚绝不读取或还原其中任何内容，只做闭集结构校验——符号链接/越界/
+    # 非常规/白名单外条目意味着现场被篡改，fail-closed；合法暂存随后随事务
+    # 目录整体删除。
+    if flags.get(_TXN_NEW_DIRNAME):
+        _scan_new_stage_tree(
+            _txn_new_dir(data_dir, wallet_id, snapshot_id), wallet_id
+        )
 
     target_paths = _list_current_relpaths(data_dir, wallet_id)
     # 删除回滚后不应存在的文件（含本次新写入的目标）。
@@ -1918,6 +2059,18 @@ def _rollforward_restore(
     _verify_committed_residual(
         txn, flags, wallet_id, snapshot_id, manifest_sha
     )
+    # committed 落盘意味着 new/ 暂存已全部改名落位：若 new/ 里仍留有暂存
+    # 正式文件，则替换并未真正完成却存在 committed，属矛盾现场，fail-closed
+    # （空目录残留无害，随事务目录清理）。
+    if flags.get(_TXN_NEW_DIRNAME):
+        leftover = _scan_new_stage_tree(
+            _txn_new_dir(data_dir, wallet_id, snapshot_id), wallet_id
+        )
+        if leftover:
+            raise RecoveryError(
+                f"committed restore for {wallet_id!r}/{snapshot_id!r} still "
+                "holds uncommitted staged files"
+            )
     _prune_empty_leaf_dirs(data_dir, wallet_id)
     return manifest_sha
 
@@ -2003,10 +2156,30 @@ def _resume_pending_restore(
             prepared = _read_txn_marker(prepared_path, "prepared restore")
             _rollback_restore(data_dir, wallet_id, snapshot_id, prepared)
             continue
-        # 无 prepared 也无 committed：prepared 标记只在 old/ 备份完整复制后才
-        # 原子落盘，故此刻替换尚未开始、目标现场从未被触碰；空目录或仅有部分
-        # old/ 都属备份中途被杀的无害残留，直接清掉，绝不猜写目标。
+        # 无 prepared 也无 committed：
+        # - 写顺序保证 new/ 暂存只可能在 prepared 原子落盘**之后**才出现，故
+        #   此刻若 new/ 里有暂存正式文件而 prepared 缺失，是不可能由本事务产生
+        #   的矛盾/篡改现场，fail-closed 保留，绝不静默删除。
+        # - 否则替换从未开始、目标现场从未被触碰：空目录、备份中途的部分
+        #   old/、prepared/committed 的确定性写中临时名都属无害残留，清掉整个
+        #   事务目录，绝不猜写目标。
+        if flags.get(_TXN_NEW_DIRNAME) and _scan_new_stage_tree(
+            os.path.join(txn, _TXN_NEW_DIRNAME), wallet_id
+        ):
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} holds staged "
+                "files without a prepared marker"
+            )
+        if flags.get(_COMMITTED_MARKER_TMP):
+            # committed 的写中临时名按写顺序只能在 prepared 已落盘之后出现；
+            # 既无 committed 也无 prepared 却有它，是本事务不可能产生的矛盾
+            # 现场（目标可能已被动过），fail-closed，绝不静默删除。
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} holds a "
+                "committed write temp without a prepared marker"
+            )
         shutil.rmtree(txn, ignore_errors=True)
+        _prune_empty_txn_parents(data_dir, wallet_id)
     try:
         if os.path.isdir(wallet_txn_root) and not os.listdir(wallet_txn_root):
             os.rmdir(wallet_txn_root)
