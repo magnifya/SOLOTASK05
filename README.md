@@ -287,6 +287,21 @@ python -m threshold_wallet.cli restore --data-dir ./data2 \
 一次。提交完成后在 `restore-records/W.json` 记录 S 与 manifest_sha256。
 恢复本身**不新增审计事件、不改余额/version、不破坏幂等与历史签名**。
 
+跨目录登记目录 `restore-records/` 是多钱包共享的扁平闭集：仅许各钱包
+正式记录 `<id>.json` 与其确定性原子写临时名 `.<id>.json.tmp`；强杀于
+登记期间残留的半截 `.<id>.json.tmp` 由该钱包下一次登记原子续作（先解链
+再 O_EXCL），缺记录只登记一次。符号链接、子目录、激活备份
+（`*.bak.json`）、随机临时名（`.tmp-*`、裸 `*.tmp`）或任何非法命名一律
+不可对账：常驻请求 `503`、`serve` 拒绝就绪，**保留现场**、不猜写、不
+删除。记录文件恰含 `wallet_id`、`snapshots` 两键，`snapshots` 为
+`S -> {"manifest_sha256"}`，以 UTF-8、`sort_keys`、2 空格缩进、末尾换行
+原子落盘；本钱包记录 JSON/形状/哈希损坏同样 `503` 留现场。
+
+参数 `data_dir`/`wallet_id`/`input` 类型错或空值、ID 不匹配
+`[A-Za-z0-9_-]{1,128}` 一律 `400`；快照 `wallet_id` 与命令行 W 不一致为
+归属冲突 `409`；缺输入文件、JSON/哈希/形状错、不可对账或 OSError 一律
+`503` 且现场不变。
+
 结果语义：首次恢复 `status=201`；同 S 且同 manifest 重放 `status=200`
 且返回体逐字节相同（同体）；同 S 但内容不同 `409`（不覆盖既有恢复
 点）；快照损坏或不可对账 `503` 且现场不变。成功 stdout 单行

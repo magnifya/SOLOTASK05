@@ -146,6 +146,7 @@ class WalletService:
             | set(self._store.list_sign_session_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
             | set(self._list_restore_txn_wallet_ids())
+            | set(self._list_restore_records_wallet_ids())
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
@@ -156,6 +157,21 @@ class WalletService:
         from . import drbackup
 
         return drbackup.list_txn_wallet_ids(self._store.data_dir)
+
+    def _list_restore_records_wallet_ids(self) -> list[str]:
+        """存有跨目录恢复登记（restore-records）的钱包（延迟导入避免环）。
+
+        目录闭集损坏（符号链接/目录/备份/随机临时名等）与其他启动恢复失败
+        一样 fail-closed：统一转成 RecoveryError，绝不静默跳过。
+        """
+        from . import drbackup
+
+        try:
+            return drbackup.list_records_wallet_ids(self._store.data_dir)
+        except drbackup.BackupError as exc:
+            raise RecoveryError(
+                f"restore-records cannot be reconciled: {exc.message}"
+            ) from exc
 
     def _activated_rotations(self, wallet_id: str) -> dict[str, dict]:
         """该钱包已落盘的 share_rotation_activated 事件映射。"""
@@ -190,6 +206,18 @@ class WalletService:
                 # RecoveryError，由上层 fail-closed（阻止就绪/503）。
                 raise RecoveryError(
                     f"wallet {wallet_id!r} restore transaction cannot be "
+                    f"reconciled: {exc.message}"
+                ) from exc
+            try:
+                # 跨目录恢复登记（restore-records/）闭集与本钱包记录形状：
+                # 崩溃可能发生在提交后的登记/清理阶段，闭集外条目（链接、
+                # 目录、备份、随机临时名）或损坏记录同样不可对账，fail-closed。
+                drbackup.reconcile_restore_records(
+                    self._store.data_dir, wallet_id
+                )
+            except drbackup.BackupError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} restore records cannot be "
                     f"reconciled: {exc.message}"
                 ) from exc
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
@@ -250,6 +278,19 @@ class WalletService:
             if _os.path.lexists(_txn_root):
                 self._recover_wallet(wallet_id)
                 return
+            # 即便没有 restore-txn（提交后的清理已完成，或强杀发生在登记
+            # 阶段），跨目录登记根 restore-records/ 仍须闭集可信：链接、目录、
+            # 备份、随机临时名或损坏的本钱包记录都 fail-closed，绝不让持锁
+            # 访问绕过不可对账的登记现场。
+            try:
+                drbackup.reconcile_restore_records(
+                    self._store.data_dir, wallet_id
+                )
+            except drbackup.BackupError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} restore records cannot be "
+                    f"reconciled: {exc.message}"
+                ) from exc
             # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义
             # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
             # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。

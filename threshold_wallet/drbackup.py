@@ -1359,8 +1359,95 @@ def _atomic_write_json(path: str, value: dict) -> None:
     )
 
 
+def _scan_restore_records_dir(data_dir: str) -> None:
+    """封闭枚举跨目录登记根 ``restore-records/``（仅扫描，不读内容）。
+
+    与 restore-txn 根同为**跨钱包共享**的扁平目录，其闭集成员恰为：
+
+    - 任意安全标识钱包的正式记录 ``<id>.json``（普通文件）——目标钱包 W 的
+      ``W.json`` 是本钱包登记，其他钱包的正式记录允许并存（restore 绝不
+      解析或触碰其他钱包的文件）；
+    - 任意安全标识钱包的确定性原子写临时名 ``.<id>.json.tmp``——这是
+      ``_atomic_write_json`` 写 ``<id>.json`` 时的同目录临时文件：持对应钱包
+      锁的写者强杀/断电，或他钱包此刻正持其自己的锁原子登记时，都可能合法
+      在场。下一次该钱包登记由原子写先解链再 O_EXCL 续作，故允许在场、绝不
+      据此猜写或恢复（只可能是半截内容）。
+
+    除此之外的一切——符号链接（含指向目录/文件）、子目录、套接字/FIFO 等
+    非常规条目、激活备份（``*.bak.json``）、随机原子临时名（``.tmp-*``、
+    裸 ``*.tmp`` 等）、非法/越界命名——都意味着登记现场被动过，统一抛
+    BackupError(503)，保留现场、fail-closed。
+
+    根不存在视为空（首次恢复前）；根本身是符号链接或非目录同样拒绝。
+    """
+    root = os.path.join(data_dir, RESTORE_RECORDS_DIRNAME)
+    if not os.path.exists(root) and not os.path.islink(root):
+        return
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise BackupError(503, "restore-records root is not a directory")
+    try:
+        with os.scandir(root) as it:
+            entries = list(it)
+    except OSError as exc:
+        raise BackupError(503, "restore-records directory is unreadable") from exc
+    for entry in entries:
+        name = entry.name
+        if entry.is_symlink():
+            raise BackupError(
+                503, f"refusing symbolic link in restore-records: {name!r}"
+            )
+        if not entry.is_file(follow_symlinks=False):
+            # 子目录、套接字/FIFO/设备等非常规条目一律拒绝
+            raise BackupError(
+                503, f"unexpected non-file in restore-records: {name!r}"
+            )
+        # 正式记录：<safe-id>.json
+        if name.endswith(".json") and bool(
+            _SAFE_ID.match(name[: -len(".json")])
+        ):
+            continue
+        # 确定性原子写临时名：.<safe-id>.json.tmp（含本钱包的 .W.json.tmp）
+        if (
+            name.startswith(".")
+            and name.endswith(".json.tmp")
+            and bool(_SAFE_ID.match(name[1: -len(".json.tmp")]))
+        ):
+            continue
+        # 其余：*.bak.json 激活备份、.tmp-* 等随机临时名、裸 *.tmp、非法命名
+        raise BackupError(
+            503, f"unexpected entry in restore-records: {name!r}"
+        )
+
+
+def list_records_wallet_ids(data_dir: str) -> list[str]:
+    """启动恢复扫描：restore-records/ 内存有正式记录的全部 wallet_id（升序）。
+
+    根目录闭集由 :func:`_scan_restore_records_dir` 强制；任何非闭集条目都抛
+    BackupError，由启动恢复 fail-closed（阻止就绪），绝不静默跳过。
+    """
+    root = os.path.join(data_dir, RESTORE_RECORDS_DIRNAME)
+    if not os.path.exists(root) and not os.path.islink(root):
+        return []
+    _scan_restore_records_dir(data_dir)
+    wallet_ids: list[str] = []
+    with os.scandir(root) as it:
+        for entry in it:
+            name = entry.name
+            if name.endswith(".json") and bool(
+                _SAFE_ID.match(name[: -len(".json")])
+            ):
+                wallet_ids.append(name[: -len(".json")])
+    return sorted(wallet_ids)
+
+
 def _read_restore_records(data_dir: str, wallet_id: str) -> dict:
-    """读取 restore-records/<W>.json；不存在返回空结构，损坏抛 BackupError。"""
+    """读取 restore-records/<W>.json；不存在返回空结构，损坏抛 BackupError。
+
+    读取前先对共享的 ``restore-records/`` 目录做封闭扫描：只许各钱包正式
+    ``<id>.json`` 与其确定性 ``.<id>.json.tmp``；符号链接、目录、备份、任何
+    随机临时/非法条目一律 503、保留现场。随后严格校验本钱包记录形状。
+    """
+    _scan_restore_records_dir(data_dir)
     path = _records_path(data_dir, wallet_id)
     try:
         with open(path, "rb") as f:
@@ -2241,6 +2328,25 @@ def list_txn_wallet_ids(data_dir: str) -> list[str]:
     return _scan_txn_root(data_dir)
 
 
+def reconcile_restore_records(data_dir: str, wallet_id: str) -> None:
+    """持锁/启动时对 ``restore-records/`` 闭集与本钱包记录形状做对账。
+
+    崩溃可能发生在登记（``restore-records/W.json`` 原子写）阶段：此时
+    restore-txn 可能已清理，但登记目录仍可能留有非闭集条目或损坏的本钱包
+    记录。任何持钱包锁的访问与启动恢复都必须先校验：
+
+    - 目录闭集：只许 ``<id>.json`` 正式记录与确定性 ``.<id>.json.tmp``；
+      符号链接/目录/备份/随机临时/非法命名一律 BackupError(503)；
+    - 本钱包记录形状（若在）：恰含 wallet_id/snapshots，逐项 S 为安全标识、
+      ``{manifest_sha256}`` 为 64 位小写 hex。
+
+    合法的确定性写中临时名（强杀于登记期间）不在此处理——它由该钱包下一次
+    登记的原子写（先解链再 O_EXCL）续作；本函数只确保闭集与既有正式记录
+    可信，绝不猜写或删除临时文件。
+    """
+    _read_restore_records(data_dir, wallet_id)
+
+
 def _restore_body(
     status: int,
     wallet_id: str,
@@ -2258,10 +2364,17 @@ def _restore_body(
 
 
 def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
-    """执行一次对账恢复，返回 (201|200, 响应体)；失败抛 BackupError。"""
+    """执行一次对账恢复，返回 (201|200, 响应体)；失败抛 BackupError。
+
+    参数类型错误/空值/ID 非法一律 BackupError(400)（确定性的调用方错误，
+    发生在读包与任何磁盘对账之前）；归属冲突 409；缺文件、JSON/哈希/形状错、
+    不可对账或 OSError 一律 BackupError(503) 且保留现场。
+    """
+    if not isinstance(data_dir, str) or not data_dir:
+        raise BackupError(400, "--data-dir must be a non-empty path")
     if not isinstance(input_path, str) or not input_path:
         raise BackupError(400, "--input must be a non-empty path")
-    if not is_safe_id(wallet_id):
+    if not isinstance(wallet_id, str) or not is_safe_id(wallet_id):
         raise BackupError(400, "invalid wallet_id")
 
     # 读包与 manifest 形状/哈希绑定校验不依赖锁，先做快速失败。
