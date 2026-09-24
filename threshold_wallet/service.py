@@ -237,17 +237,17 @@ class WalletService:
         try:
             # 灾备恢复事务的崩溃残留优先收敛（committed 前滚/否则整体回滚），
             # 再进入账本/会话/轮换的静止快路径：替换窗口内现场可能新旧混杂。
+            # restore-txn 根一出现（哪怕不属于本钱包、或根自身/根下有任何
+            # 非安全项）就进入完整恢复：根目录闭集校验在恢复路径内统一
+            # fail-closed，绝不让持锁访问绕过不可对账的灾备现场。
             import os as _os
 
             from . import drbackup
 
-            if _os.path.isdir(
-                _os.path.join(
-                    self._store.data_dir,
-                    drbackup.RESTORE_TXN_DIRNAME,
-                    wallet_id,
-                )
-            ):
+            _txn_root = _os.path.join(
+                self._store.data_dir, drbackup.RESTORE_TXN_DIRNAME
+            )
+            if _os.path.lexists(_txn_root):
                 self._recover_wallet(wallet_id)
                 return
             # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义

@@ -1967,6 +1967,9 @@ def _resume_pending_restore(
     无残留返回 None。无法安全对账抛 RecoveryError（fail-closed）。
     """
     data_dir = service._store.data_dir
+    # 根目录闭集先行：restore-txn/ 下只许安全 ID 普通目录；任何非安全项
+    # （文件、符号链接、非法命名）都意味着事务现场不可信，fail-closed。
+    _scan_txn_root(data_dir)
     wallet_txn_root = os.path.join(data_dir, RESTORE_TXN_DIRNAME, wallet_id)
     if not os.path.isdir(wallet_txn_root):
         return None
@@ -2023,18 +2026,46 @@ def _read_marker(path: str) -> dict:
     return value
 
 
-def list_txn_wallet_ids(data_dir: str) -> list[str]:
-    """启动恢复扫描：存在 restore-txn 钱包目录的全部 wallet_id。"""
+def _scan_txn_root(data_dir: str) -> list[str]:
+    """封闭枚举 restore-txn/ 根目录，返回有未完成事务的 wallet_id（升序）。
+
+    根目录只许**安全 ID 的普通目录**（每个对应一个钱包的事务命名空间）：
+    符号链接、普通文件、非法命名、隐藏临时文件或任何非常规条目都意味着
+    灾备事务现场被动过，无法安全对账——统一抛 RecoveryError（启动/持锁
+    fail-closed；backup/restore 由调用方转成 BackupError(503)），绝不
+    静默跳过。根目录不存在返回空列表；根自身是符号链接/非目录同样拒绝。
+    """
     root = os.path.join(data_dir, RESTORE_TXN_DIRNAME)
-    try:
-        names = os.listdir(root)
-    except FileNotFoundError:
+    if not os.path.exists(root) and not os.path.islink(root):
         return []
-    return sorted(
-        name
-        for name in names
-        if _SAFE_ID.match(name) and os.path.isdir(os.path.join(root, name))
-    )
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise RecoveryError("restore-txn root is not a directory")
+    try:
+        with os.scandir(root) as it:
+            entries = list(it)
+    except OSError as exc:
+        raise RecoveryError("restore-txn root is unreadable") from exc
+    wallet_ids: list[str] = []
+    for entry in entries:
+        if (
+            entry.is_symlink()
+            or not _SAFE_ID.match(entry.name)
+            or not entry.is_dir(follow_symlinks=False)
+        ):
+            raise RecoveryError(
+                f"unexpected entry in restore-txn root: {entry.name!r}"
+            )
+        wallet_ids.append(entry.name)
+    return sorted(wallet_ids)
+
+
+def list_txn_wallet_ids(data_dir: str) -> list[str]:
+    """启动恢复扫描：存在 restore-txn 钱包目录的全部 wallet_id。
+
+    根目录闭集由 _scan_txn_root 强制：任何非安全项都抛 RecoveryError，
+    由启动恢复 fail-closed（阻止就绪），绝不静默忽略。
+    """
+    return _scan_txn_root(data_dir)
 
 
 def _restore_body(
