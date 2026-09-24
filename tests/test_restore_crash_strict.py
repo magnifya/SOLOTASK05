@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.helpers import http_server, make_harness
 from threshold_wallet import drbackup
@@ -689,6 +690,281 @@ class HardTerminationConvergenceTest(_CrashScene):
         with self.assertRaises(RecoveryError):
             WalletService(WalletStore(self.dst))
         self.assertTrue(os.path.isdir(self.txn))
+
+
+class CleanupKillConvergenceTest(_CrashScene):
+    """清理阶段强杀也必须按提交点收敛：提交后清理 committed 最后删，
+    回滚后清理 prepared 先于 old/ 删——任何中途残留都不得误判为
+    "prepared 无 committed"（回滚已提交现场）或"备份残缺"（永久
+    fail-closed）。"""
+
+    def test_kill_during_finalize_cleanup_converges(self):
+        # 提交完成、记录已登记；清理已删掉 prepared.json 与部分 old/，
+        # committed.json 仍在：按 committed 前滚收敛，现场为快照内容。
+        self._plant_committed()
+        os.unlink(os.path.join(self.txn, "prepared.json"))
+        old_root = drbackup._txn_old_dir(self.dst, "alice", "S1")
+        victim = os.path.join(old_root, "wallets", "alice.json")
+        self.assertTrue(os.path.isfile(victim))
+        os.unlink(victim)
+        drbackup._write_restore_records(
+            self.dst,
+            "alice",
+            {
+                "wallet_id": "alice",
+                "snapshots": {"S1": {"manifest_sha256": self.mhash}},
+            },
+        )
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"], {"S1": {"manifest_sha256": self.mhash}}
+        )
+
+    def test_kill_after_committed_delete_leaves_only_empty_dirs(self):
+        # 清理最后一步删掉 committed 后被杀：只剩空目录/空 new/ 树，
+        # 按无标记残留清理收敛，记录保持已登记。
+        self._plant_committed()
+        drbackup._write_restore_records(
+            self.dst,
+            "alice",
+            {
+                "wallet_id": "alice",
+                "snapshots": {"S1": {"manifest_sha256": self.mhash}},
+            },
+        )
+        os.unlink(os.path.join(self.txn, "prepared.json"))
+        shutil.rmtree(os.path.join(self.txn, "old"))
+        os.unlink(os.path.join(self.txn, "committed.json"))
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"], {"S1": {"manifest_sha256": self.mhash}}
+        )
+
+    def test_kill_during_rollback_cleanup_converges(self):
+        # 回滚完成后清理被杀：prepared 已删、old/ 部分残留——无标记残留
+        # 按空事务目录清理收敛，绝不误判为备份残缺而永久 fail-closed。
+        self._plant_prepared()
+        WalletService(WalletStore(self.dst))  # 第一次回滚收敛
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+        old_root = drbackup._txn_old_dir(self.dst, "alice", "S1")
+        os.makedirs(os.path.join(old_root, "wallets"), exist_ok=True)
+        shutil.copy2(
+            os.path.join(self.dst, "wallets", "alice.json"),
+            os.path.join(old_root, "wallets", "alice.json"),
+        )
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_committed_cleanup_deletes_commit_point_last(self):
+        # 有序清理的不变量：committed.json（唯一提交点）必须最后删除，
+        # 且 prepared.json 先于 old/ 备份树删除——否则强杀中途残留会被
+        # 误判为"prepared 无 committed"而回滚已提交现场。
+        self._plant_committed()
+        events = []
+        real_unlink = os.unlink
+        real_rmtree = shutil.rmtree
+
+        def spy_unlink(path, *args, **kwargs):
+            events.append(("unlink", path))
+            return real_unlink(path, *args, **kwargs)
+
+        def spy_rmtree(path, **kwargs):
+            events.append(("rmtree", path))
+            return real_rmtree(path, **kwargs)
+
+        with mock.patch.object(drbackup.os, "unlink", spy_unlink), (
+            mock.patch.object(drbackup.shutil, "rmtree", spy_rmtree)
+        ):
+            drbackup._cleanup_committed_txn_dir(self.dst, "alice", "S1")
+        txn_events = [
+            (kind, p) for kind, p in events
+            if isinstance(p, str) and p.startswith(self.txn)
+        ]
+        idx_committed = next(
+            i for i, (kind, p) in enumerate(txn_events)
+            if kind == "unlink" and p.endswith("committed.json")
+        )
+        idx_prepared = next(
+            i for i, (kind, p) in enumerate(txn_events)
+            if kind == "unlink" and p.endswith("prepared.json")
+        )
+        idx_old = next(
+            i for i, (kind, p) in enumerate(txn_events)
+            if kind == "rmtree" and p.endswith(os.sep + "old")
+        )
+        self.assertLess(idx_prepared, idx_old)
+        self.assertLess(idx_old, idx_committed)
+        self.assertFalse(os.path.exists(self.txn))
+
+    def test_rollback_cleanup_deletes_prepared_before_old_backup(self):
+        # 有序清理的不变量：prepared.json 删除之前 old/ 备份必须保持完整
+        # （prepared 在时重启会凭 old/ 重新回滚，备份残缺会永久 fail-closed）。
+        self._plant_prepared()
+        events = []
+        real_unlink = os.unlink
+        real_rmtree = shutil.rmtree
+
+        def spy_unlink(path, *args, **kwargs):
+            events.append(("unlink", path))
+            return real_unlink(path, *args, **kwargs)
+
+        def spy_rmtree(path, **kwargs):
+            events.append(("rmtree", path))
+            return real_rmtree(path, **kwargs)
+
+        with mock.patch.object(drbackup.os, "unlink", spy_unlink), (
+            mock.patch.object(drbackup.shutil, "rmtree", spy_rmtree)
+        ):
+            drbackup._cleanup_rolled_back_txn_dir(self.dst, "alice", "S1")
+        idx_prepared = next(
+            i for i, (kind, p) in enumerate(events)
+            if kind == "unlink" and p.endswith("prepared.json")
+        )
+        idx_old = next(
+            i for i, (kind, p) in enumerate(events)
+            if kind == "rmtree" and p.endswith(os.sep + "old")
+        )
+        self.assertLess(idx_prepared, idx_old)
+        self.assertFalse(os.path.exists(self.txn))
+
+    def test_kill_inside_finalize_cleanup_still_converges(self):
+        # 提交后清理被杀于 old/ 删除中途：prepared 已先删、committed 仍在，
+        # 重启按 committed 前滚收敛，记录保持已登记一次。
+        self._plant_committed()
+        real_rmtree = shutil.rmtree
+
+        def killing_rmtree(path, **kwargs):
+            if path.endswith(os.sep + "old"):
+                victim = os.path.join(path, "wallets", "alice.json")
+                if os.path.exists(victim):
+                    os.unlink(victim)
+                raise KeyboardInterrupt  # 模拟强杀：except 清理不执行
+            return real_rmtree(path, **kwargs)
+
+        with mock.patch.object(drbackup.shutil, "rmtree", killing_rmtree):
+            with self.assertRaises(KeyboardInterrupt):
+                drbackup._finalize_committed_restore(
+                    self.dst, "alice", "S1", self.mhash
+                )
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"], {"S1": {"manifest_sha256": self.mhash}}
+        )
+
+    def test_kill_inside_rollback_cleanup_still_converges(self):
+        # 回滚后清理被杀于 old/ 删除中途：prepared 已先删，残留属无标记
+        # 现场，重启按空事务目录清理收敛，绝不永久 fail-closed。
+        self._plant_prepared()
+        prepared = drbackup._read_txn_marker(
+            os.path.join(self.txn, "prepared.json"), "prepared restore"
+        )
+        real_rmtree = shutil.rmtree
+
+        def killing_rmtree(path, **kwargs):
+            if path.endswith(os.sep + "old"):
+                victim = os.path.join(path, "wallets", "alice.json")
+                if os.path.exists(victim):
+                    os.unlink(victim)
+                raise KeyboardInterrupt  # 模拟强杀：except 清理不执行
+            return real_rmtree(path, **kwargs)
+
+        with mock.patch.object(drbackup.shutil, "rmtree", killing_rmtree):
+            with self.assertRaises(KeyboardInterrupt):
+                drbackup._rollback_restore(self.dst, "alice", "S1", prepared)
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "restore-txn")))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+        self.assertFalse(os.path.exists(self.records_path))
+
+    def test_unsorted_committed_entries_block(self):
+        # 规范形要求条目按 path 升序：乱序 committed 清单不可对账。
+        files = [
+            {"path": e["path"], "bytes": e["bytes"], "sha256": e["sha256"]}
+            for e in self.manifest["files"]
+        ]
+        self.assertGreater(len(files), 1)
+        self._plant_committed(
+            marker_overrides={"files": list(reversed(files))}
+        )
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_unsorted_prepared_old_files_block(self):
+        # prepared 的 old_files 乱序同样不可对账，保留现场。
+        self._plant_prepared()
+        prepared_path = os.path.join(self.txn, "prepared.json")
+        with open(prepared_path, "rb") as f:
+            prepared = json.loads(f.read().decode("utf-8"))
+        prepared["old_files"] = list(reversed(prepared["old_files"]))
+        drbackup._atomic_write_json(prepared_path, prepared)
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+
+    def test_restore_writes_sorted_committed_marker(self):
+        # 快照 manifest 的 files 项乱序（绑定哈希相应重算）时恢复仍成功，
+        # 且落盘的 committed 标记条目按 path 升序（规范形）。
+        manifest, files = drbackup._read_snapshot(self.pack)
+        reversed_files = list(reversed(manifest["files"]))
+        manifest2 = {
+            "version": manifest["version"],
+            "wallet_id": manifest["wallet_id"],
+            "snapshot_id": "S2",
+            "files": reversed_files,
+        }
+        manifest2["manifest_sha256"] = drbackup.sha256_hex(
+            drbackup._canonical_manifest_body(manifest2)
+        )
+        pack2 = f"{self.tmp}/b2.tar"
+        drbackup._write_snapshot(
+            pack2,
+            manifest2,
+            [(e["path"], files[e["path"]]) for e in reversed_files],
+        )
+        captured = {}
+        original = drbackup._rollforward_restore
+
+        def spy(data_dir, wallet_id, snapshot_id):
+            marker_path = os.path.join(
+                drbackup._txn_dir(data_dir, wallet_id, snapshot_id),
+                "committed.json",
+            )
+            with open(marker_path, "rb") as f:
+                captured["marker"] = json.loads(f.read().decode("utf-8"))
+            return original(data_dir, wallet_id, snapshot_id)
+
+        drbackup._rollforward_restore = spy
+        try:
+            status, _ = drbackup.restore(self.dst, "alice", pack2)
+        finally:
+            drbackup._rollforward_restore = original
+        self.assertEqual(status, 201)
+        paths = [e["path"] for e in captured["marker"]["files"]]
+        self.assertEqual(paths, sorted(paths))
 
 
 if __name__ == "__main__":

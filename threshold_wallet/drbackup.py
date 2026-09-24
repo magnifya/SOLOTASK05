@@ -1657,6 +1657,7 @@ def _validate_marker_entries(
         raise RecoveryError(f"{what} marker file list is malformed")
     normalized: list[dict] = []
     seen: set[str] = set()
+    previous_path: Optional[str] = None
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != _MARKER_ENTRY_KEYS:
             raise RecoveryError(f"{what} marker entry is malformed")
@@ -1665,6 +1666,11 @@ def _validate_marker_entries(
         digest = entry.get("sha256")
         if not isinstance(rel, str) or rel in seen:
             raise RecoveryError(f"{what} marker has a missing or duplicate path")
+        # 规范形要求条目按 path 升序：乱序清单不是本事务写出的规范标记，
+        # 与重复/越界一样不可对账。
+        if previous_path is not None and rel <= previous_path:
+            raise RecoveryError(f"{what} marker entries are not sorted by path")
+        previous_path = rel
         seen.add(rel)
         try:
             _validate_member_name(rel)
@@ -2046,7 +2052,7 @@ def _rollback_restore(
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
     _prune_empty_leaf_dirs(data_dir, wallet_id)
-    shutil.rmtree(txn, ignore_errors=True)
+    _cleanup_rolled_back_txn_dir(data_dir, wallet_id, snapshot_id)
     _prune_empty_txn_parents(data_dir, wallet_id)
 
 
@@ -2182,6 +2188,62 @@ def _rollforward_restore(
     return manifest_sha
 
 
+def _unlink_if_exists(path: str) -> None:
+    """删除单个文件；不存在则忽略（绝不跟随符号链接，unlink 不解引用）。"""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _cleanup_committed_txn_dir(
+    data_dir: str, wallet_id: str, snapshot_id: str
+) -> None:
+    """committed 前滚成功后的**有序**事务目录清理（清理本身也要崩溃收敛）。
+
+    committed.json 是唯一提交点，必须**最后**删除。无序 rmtree 可能先删掉
+    committed 而留下 prepared/old：重启会把已提交的恢复误判成"prepared 无
+    committed"而整体回滚，与已登记的 restore-records 永久矛盾。顺序：
+
+    1. prepared.json（它在时 old/ 残留会被严格核验，必须先消失）；
+    2. old/ 备份树、new/ 空暂存树与标记写中临时名；
+    3. committed.json——此前任何强杀，重启仍见 committed，按前滚收敛；
+       它删除后只剩空目录，按"无标记残留"清理收敛。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    _unlink_if_exists(os.path.join(txn, MARKER_PREPARED))
+    _unlink_if_exists(os.path.join(txn, _PREPARED_MARKER_TMP))
+    shutil.rmtree(os.path.join(txn, _TXN_OLD_DIRNAME), ignore_errors=True)
+    shutil.rmtree(os.path.join(txn, _TXN_NEW_DIRNAME), ignore_errors=True)
+    _unlink_if_exists(os.path.join(txn, _COMMITTED_MARKER_TMP))
+    _unlink_if_exists(os.path.join(txn, MARKER_COMMITTED))
+    shutil.rmtree(txn, ignore_errors=True)
+
+
+def _cleanup_rolled_back_txn_dir(
+    data_dir: str, wallet_id: str, snapshot_id: str
+) -> None:
+    """整体回滚完成后的**有序**事务目录清理（清理本身也要崩溃收敛）。
+
+    prepared.json 是回滚的唯一依据：只要它还在，old/ 备份就必须保持完整
+    可核验（重启会凭它重新回滚）。无序 rmtree 可能先删掉 old/ 的部分文件
+    而留下 prepared：重启重新回滚时备份核验失败，被误判为不可对账而永久
+    fail-closed——尽管回滚其实早已完成。顺序：
+
+    1. new/ 暂存树与 committed 写中临时名（prepared 消失后不得留存，否则
+       会被"无标记"路径判为矛盾现场）；
+    2. prepared.json——此后任何强杀都只剩"无标记残留"，按空事务目录清理；
+    3. old/ 备份树最后删：prepared 在时它始终完整可核验。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    shutil.rmtree(os.path.join(txn, _TXN_NEW_DIRNAME), ignore_errors=True)
+    _unlink_if_exists(os.path.join(txn, _COMMITTED_MARKER_TMP))
+    _unlink_if_exists(os.path.join(txn, _PREPARED_MARKER_TMP))
+    _unlink_if_exists(os.path.join(txn, MARKER_PREPARED))
+    shutil.rmtree(os.path.join(txn, _TXN_OLD_DIRNAME), ignore_errors=True)
+    shutil.rmtree(txn, ignore_errors=True)
+
+
 def _finalize_committed_restore(
     data_dir: str, wallet_id: str, snapshot_id: str, manifest_sha256: str
 ) -> None:
@@ -2197,9 +2259,7 @@ def _finalize_committed_restore(
         raise RecoveryError(
             f"restore record for {snapshot_id!r} disagrees with committed marker"
         )
-    shutil.rmtree(
-        _txn_dir(data_dir, wallet_id, snapshot_id), ignore_errors=True
-    )
+    _cleanup_committed_txn_dir(data_dir, wallet_id, snapshot_id)
     _prune_empty_txn_parents(data_dir, wallet_id)
 
 
@@ -2453,8 +2513,8 @@ def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
                     data_dir, wallet_id, snapshot_id, manifest, files
                 )
                 # committed 标记记录与 manifest 同形的完整 files 项
-                # （path/bytes/sha256）：前滚据此对目标现场做封闭校验，
-                # 而不是只记路径名。
+                # （path/bytes/sha256），按 path 升序（规范形）：前滚据此对
+                # 目标现场做封闭校验，而不是只记路径名。
                 committed = {
                     "wallet_id": wallet_id,
                     "snapshot_id": snapshot_id,
@@ -2465,7 +2525,9 @@ def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
                             "bytes": entry["bytes"],
                             "sha256": entry["sha256"],
                         }
-                        for entry in manifest["files"]
+                        for entry in sorted(
+                            manifest["files"], key=lambda e: e["path"]
+                        )
                     ],
                 }
                 _atomic_write_json(committed_path, committed)
