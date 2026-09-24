@@ -1320,6 +1320,13 @@ def _records_path(data_dir: str, wallet_id: str) -> str:
     )
 
 
+def _records_tmp_path(data_dir: str, wallet_id: str) -> str:
+    """``_atomic_write_bytes`` 写 ``W.json`` 时的确定性同目录临时名。"""
+    return os.path.join(
+        data_dir, RESTORE_RECORDS_DIRNAME, "." + wallet_id + ".json.tmp"
+    )
+
+
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     """原子写整份字节：同目录确定性临时文件 + os.replace。
 
@@ -1370,8 +1377,9 @@ def _scan_restore_records_dir(data_dir: str) -> None:
     - 任意安全标识钱包的确定性原子写临时名 ``.<id>.json.tmp``——这是
       ``_atomic_write_json`` 写 ``<id>.json`` 时的同目录临时文件：持对应钱包
       锁的写者强杀/断电，或他钱包此刻正持其自己的锁原子登记时，都可能合法
-      在场。下一次该钱包登记由原子写先解链再 O_EXCL 续作，故允许在场、绝不
-      据此猜写或恢复（只可能是半截内容）。
+      在场。其收敛由该钱包锁域负责（正式记录已在时持锁对账清理，否则下一
+      次登记原子写先解链再 O_EXCL 续作），此处只校验闭集、绝不据此猜写
+      或恢复（只可能是半截内容）。
 
     除此之外的一切——符号链接（含指向目录/文件）、子目录、套接字/FIFO 等
     非常规条目、激活备份（``*.bak.json``）、随机原子临时名（``.tmp-*``、
@@ -2340,11 +2348,33 @@ def reconcile_restore_records(data_dir: str, wallet_id: str) -> None:
     - 本钱包记录形状（若在）：恰含 wallet_id/snapshots，逐项 S 为安全标识、
       ``{manifest_sha256}`` 为 64 位小写 hex。
 
-    合法的确定性写中临时名（强杀于登记期间）不在此处理——它由该钱包下一次
-    登记的原子写（先解链再 O_EXCL）续作；本函数只确保闭集与既有正式记录
-    可信，绝不猜写或删除临时文件。
+    登记残留收敛（本函数在钱包锁内被调用，写者必持同锁，故看到的残留只
+    可能来自崩溃进程）：
+
+    - 正式记录 ``W.json`` **已在**而 ``.W.json.tmp`` 仍残留：该临时名只
+      可能是某次登记写在原子替换前被强杀留下的半截写中文件，正式记录
+      可信且以其为准——闭集校验（确定性命名、普通文件、非符号链接）
+      通过后于锁内清理，绝不据此猜写或改写正式记录；
+    - 正式记录**缺失**：临时名保留，由该钱包下一次登记的原子写
+      （先解链再 O_EXCL，见 _atomic_write_bytes）续作，中断可重试且
+      不改业务。
     """
     _read_restore_records(data_dir, wallet_id)
+    record_path = _records_path(data_dir, wallet_id)
+    if not os.path.isfile(record_path):
+        # 无正式记录：半截临时名留给下一次登记写续作，此处绝不清理/猜写。
+        return
+    tmp_path = _records_tmp_path(data_dir, wallet_id)
+    if not os.path.lexists(tmp_path):
+        return
+    # 清理前再核验一次（闭集扫描已保证，这里防扫描与清理之间的现场变化）：
+    # 只解链确定性临时名的普通文件；符号链接/非常规项一律 fail-closed 留现场。
+    if os.path.islink(tmp_path) or not os.path.isfile(tmp_path):
+        raise BackupError(503, "restore-records temp is not a regular file")
+    try:
+        os.unlink(tmp_path)
+    except FileNotFoundError:
+        pass
 
 
 def _restore_body(

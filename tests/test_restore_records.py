@@ -232,6 +232,49 @@ class RestoreRecordsDeterministicTempTest(_Scene):
         status, _ = self._restore_ok()
         self.assertEqual(status, 200)
 
+    def test_own_half_temp_with_formal_record_is_cleaned_under_lock(self):
+        # 正式记录已在，残留确定性临时名（登记写 replace 前被强杀）：
+        # 重放仍 200 同体，持锁对账校验后清理残留，正式记录逐字节不动。
+        status, _ = self._restore_ok()
+        self.assertEqual(status, 201)
+        with open(self.records_path, "rb") as f:
+            before = f.read()
+        tmp_path = os.path.join(self.records_dir, ".alice.json.tmp")
+        with open(tmp_path, "wb") as f:
+            f.write(b"{half")
+        status2, _ = self._restore_ok()
+        self.assertEqual(status2, 200)
+        self.assertFalse(os.path.lexists(tmp_path))
+        with open(self.records_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_startup_cleans_own_half_temp_when_record_exists(self):
+        # 启动恢复同样在锁内收敛残留：不抛错、清临时名、不改正式记录。
+        self._restore_ok()
+        with open(self.records_path, "rb") as f:
+            before = f.read()
+        tmp_path = os.path.join(self.records_dir, ".alice.json.tmp")
+        with open(tmp_path, "wb") as f:
+            f.write(b"{half")
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.lexists(tmp_path))
+        with open(self.records_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_neighbor_temp_is_never_touched_by_cleanup(self):
+        # alice 锁域的残留收敛绝不触碰邻居钱包的确定性临时名
+        self._restore_ok()
+        self._plant(".alice.json.tmp", content=b"{half")
+        self._plant(".bob.json.tmp", content=b"{half")
+        status, _ = self._restore_ok()
+        self.assertEqual(status, 200)
+        self.assertFalse(
+            os.path.lexists(os.path.join(self.records_dir, ".alice.json.tmp"))
+        )
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.records_dir, ".bob.json.tmp"))
+        )
+
 
 class RestoreRecordsCorruptionTest(_Scene):
     def _rewrite_own(self, content: bytes):
