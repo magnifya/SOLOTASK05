@@ -691,5 +691,147 @@ class HardTerminationConvergenceTest(_CrashScene):
         self.assertTrue(os.path.isdir(self.txn))
 
 
+class PostCommitCleanupWindowTest(_CrashScene):
+    """committed 是提交点；补登 restore-records 后的**清理窗口**（有序删除
+    new → old → prepared → committed）被强杀时的收敛契约：
+
+    - committed 在 ⇒ 提交必已发生：业务目标严格等于 committed.files，残留
+      old/prepared 即使被清理删掉一半（现存项为清单子集且逐项哈希自洽）也
+      正常前滚、补登幂等一次、清掉事务目录，绝不永久 fail-closed；
+    - committed 缺失却已登记 S（旧的乱序 rmtree / 篡改才可能产生）：缺
+      committed.files 无法重验目标闭集，fail-closed 保留现场，**绝不把已提交
+      快照整体回滚成恢复前现场**而与登记发散。
+    """
+
+    def _register(self):
+        drbackup._write_restore_records(
+            self.dst,
+            "alice",
+            {"wallet_id": "alice",
+             "snapshots": {"S1": {"manifest_sha256": self.mhash}}},
+        )
+
+    def _one_old_file(self):
+        old = os.path.join(self.txn, "old")
+        for dp, _, fns in os.walk(old):
+            for fn in fns:
+                return os.path.join(dp, fn)
+        raise AssertionError("expected at least one file under old/")
+
+    def _assert_converged_to_snapshot(self):
+        # 事务清空、登记恰好一次、现场是快照（policy 1/3600），重放 200
+        self.assertFalse(os.path.exists(self.txn))
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"], {"S1": {"manifest_sha256": self.mhash}}
+        )
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+        status, _ = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 200)
+
+    def test_partial_old_deleted_with_committed_rolls_forward(self):
+        # committed+prepared 在（提交已完成、已登记），有序清理删 old/ 中途
+        # 被杀：一份备份已删。现存 old 是清单子集，前滚必须容忍而非拒服。
+        self._plant_committed()
+        self._register()
+        os.unlink(self._one_old_file())
+        WalletService(WalletStore(self.dst))
+        self._assert_converged_to_snapshot()
+
+    def test_old_fully_deleted_committed_present_rolls_forward(self):
+        self._plant_committed()
+        self._register()
+        shutil.rmtree(os.path.join(self.txn, "old"), ignore_errors=True)
+        WalletService(WalletStore(self.dst))
+        self._assert_converged_to_snapshot()
+
+    def test_prepared_and_old_gone_committed_present_rolls_forward(self):
+        # 清理已删完 old/ 与 prepared.json，只差 committed.json：前滚照常。
+        self._plant_committed()
+        self._register()
+        shutil.rmtree(os.path.join(self.txn, "old"), ignore_errors=True)
+        os.unlink(os.path.join(self.txn, "prepared.json"))
+        WalletService(WalletStore(self.dst))
+        self._assert_converged_to_snapshot()
+
+    def test_tampered_residual_old_file_blocks(self):
+        # old/ 残留文件被改成与 prepared 哈希不符（非清理删除，而是篡改）：
+        # 子集容忍也必须 fail-closed，不得前滚。
+        self._plant_committed()
+        self._register()
+        target = self._one_old_file()
+        with open(target, "wb") as f:
+            f.write(b"not the backup bytes")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertTrue(os.path.isfile(os.path.join(self.txn, "committed.json")))
+
+    def test_extra_residual_old_file_blocks(self):
+        # old/ 多出 prepared.old_files 之外的文件：清理不可能"删出"额外项，
+        # 属篡改，fail-closed。
+        self._plant_committed()
+        self._register()
+        extra = os.path.join(self.txn, "old", "sign-sessions", "alice.json")
+        os.makedirs(os.path.dirname(extra), exist_ok=True)
+        with open(extra, "wb") as f:
+            f.write(b"{}")
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+
+    def test_committed_gone_but_registered_does_not_roll_back(self):
+        # 旧乱序清理（committed 先于 prepared/old 被删）且 restore-records 已
+        # 登记 S：业务目标此刻是已提交快照（policy 1）。绝不能回滚成恢复前
+        # 现场（policy 2）与登记发散——fail-closed 保留现场，不猜写不回滚。
+        self._plant_committed()
+        self._register()
+        os.unlink(os.path.join(self.txn, "committed.json"))
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        # serve 必须拒绝就绪（非零退出）
+        from threshold_wallet import cli
+
+        code = cli.main(
+            ["serve", "--host", "127.0.0.1", "--port", "0",
+             "--data-dir", self.dst]
+        )
+        self.assertNotEqual(code, 0)
+        # 现场保留：txn 仍在、记录未改、业务目标仍是快照（未被回滚）
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.txn, "prepared.json"))
+        )
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"]["S1"]["manifest_sha256"], self.mhash
+        )
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+
+    def test_committed_gone_registered_http_503_and_preserved(self):
+        # 先干净恢复一次（现场即快照、records 已登记 S1、无 txn）使服务健康
+        # 就绪，再于常驻期间摆出 committed 丢失而 prepared/old 残留的提交后
+        # 清理现场：持锁访问 fail-closed（HTTP 503），不回滚、不泄露私钥。
+        # serve 启动拒绝就绪由 test_committed_gone_but_registered_does_not_
+        # roll_back 的 WalletService RecoveryError 覆盖。
+        status, _ = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 201)
+        with http_server(self.dst) as srv:
+            self._plant_committed()
+            os.unlink(os.path.join(self.txn, "committed.json"))
+            status, body = srv.request("GET", "/v1/wallets/alice")
+            self.assertEqual(status, 503, body)
+            self.assertNotIn("private", json.dumps(body))
+        # 现场保留且业务未被回滚
+        self.assertTrue(os.path.isdir(self.txn))
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

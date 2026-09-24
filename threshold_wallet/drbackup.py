@@ -1972,6 +1972,84 @@ def _verify_old_backup(
     return old_entries
 
 
+def _verify_old_backup_residual(
+    txn: str, wallet_id: str, snapshot_id: str, prepared: dict
+) -> None:
+    """committed 已落盘（提交点）后，校验仍残留的 old/ 备份（子集容忍）。
+
+    与 :func:`_verify_old_backup` 的严格闭集不同，committed 在意味着替换已
+    提交，old/ 只是提交后**清理尾部**的垃圾：强杀于有序清理（new → old →
+    prepared → committed）删 old/ 的中途时，部分备份文件/空目录可能已被
+    删。故现存文件/目录只需是 prepared.old_files 清单与其祖先闭包的**子
+    集**，缺失一律容忍；但下列情形仍 fail-closed（说明残留被篡改，而非清理
+    中途）：符号链接/非常规文件、清单外的额外文件、额外目录、任一现存文件
+    字节数或 sha256 与 prepared 不符。
+    """
+    old_root = os.path.join(txn, _TXN_OLD_DIRNAME)
+    old_entries = _validate_marker_entries(
+        wallet_id, prepared.get("old_files"), "prepared"
+    )
+    old_by_path = {entry["path"]: entry for entry in old_entries}
+    old_set = set(old_by_path)
+    backup_files, backup_dirs = _scan_old_backup_tree(old_root, wallet_id)
+    if not backup_files <= old_set:
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} residual backup "
+            "carries a file absent from its prepared marker"
+        )
+    if not backup_dirs <= _expected_backup_dirs(old_set):
+        raise RecoveryError(
+            f"restore-txn for {wallet_id!r}/{snapshot_id!r} residual backup "
+            "carries an unexpected directory"
+        )
+    # 仅核对仍残留的文件（已被有序清理删掉的不要求在）。
+    for rel in backup_files:
+        entry = old_by_path[rel]
+        try:
+            data = _read_regular_file(_safe_join(old_root, rel))
+        except BackupError as exc:
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} residual backup "
+                "file cannot be safely read"
+            ) from exc
+        if len(data) != entry["bytes"] or sha256_hex(data) != entry["sha256"]:
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} residual backup "
+                "file fails its recorded hash"
+            )
+
+
+def _ordered_cleanup_committed_txn(
+    data_dir: str, wallet_id: str, snapshot_id: str
+) -> None:
+    """提交点（committed.json）落盘后的**有序**事务清理。
+
+    清理顺序固定为 ``new/`` → ``old/`` → ``prepared.json`` →
+    ``committed.json``（最后删除各自的空父目录）。关键不变量：
+    **committed.json 永远是事务目录里最后消失的条目**。于是强杀/断电于清理
+    任意位置后，恢复都能无歧义分类：
+
+    - committed.json 仍在 ⇒ 提交必已发生（前滚收敛，old/new/prepared 缺失
+      容忍）；
+    - committed.json 不在 ⇒ 提交从未发生（prepared 在则凭 old/ 回滚）。
+
+    若用单个 ``shutil.rmtree``，readdir 顺序不保证，committed.json 可能先于
+    prepared/old 被删，崩溃恢复会把**已提交**现场误判为未提交而整体回滚，
+    与已登记的 restore-records 发散。所有删除均 best-effort：残留交由下一
+    次持锁/启动恢复按上述不变量收敛。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    for dirname in (_TXN_NEW_DIRNAME, _TXN_OLD_DIRNAME):
+        shutil.rmtree(os.path.join(txn, dirname), ignore_errors=True)
+    for marker in (MARKER_PREPARED, MARKER_COMMITTED):
+        try:
+            os.unlink(os.path.join(txn, marker))
+        except FileNotFoundError:
+            pass
+    shutil.rmtree(txn, ignore_errors=True)
+    _prune_empty_txn_parents(data_dir, wallet_id)
+
+
 def _rollback_restore(
     data_dir: str, wallet_id: str, snapshot_id: str, prepared: dict
 ) -> None:
@@ -2077,8 +2155,11 @@ def _verify_committed_residual(
 
     - prepared.json 在：必须恰为契约四键、身份一致、manifest_sha256 与
       committed 相同，old_files 清单形状合法；
-    - old/ 也在：其文件闭集/目录闭包/逐项字节 sha256 必须与 prepared 一致
-      （old/ 在而 prepared 已被清掉时无可比对清单，属无害残留，随目录清理）。
+    - old/ 也在：其**现存**文件须是 prepared.old_files 的子集、祖先目录为
+      子集闭包、逐项字节 sha256 一致。提交后有序清理（new → old → prepared
+      → committed）可能已删掉部分 old/，故缺失容忍（不再要求闭集严格相
+      等）；但清单外的额外文件/目录、链接、哈希不符仍 fail-closed。old/ 在
+      而 prepared 已被清掉时无可比对清单，属无害残留，随目录清理。
     """
     if not flags.get(MARKER_PREPARED):
         return
@@ -2096,7 +2177,7 @@ def _verify_committed_residual(
             "with its prepared marker"
         )
     if flags.get(_TXN_OLD_DIRNAME):
-        _verify_old_backup(txn, wallet_id, snapshot_id, prepared)
+        _verify_old_backup_residual(txn, wallet_id, snapshot_id, prepared)
 
 
 def _rollforward_restore(
@@ -2197,7 +2278,13 @@ def _rollforward_restore(
 def _finalize_committed_restore(
     data_dir: str, wallet_id: str, snapshot_id: str, manifest_sha256: str
 ) -> None:
-    """committed 前滚成功后：补登 restore-records（幂等）并清理事务目录。"""
+    """committed 前滚成功后：补登 restore-records（幂等）并有序清理事务目录。
+
+    先补登再清理；清理用固定顺序（new → old → prepared → committed），保证
+    committed.json 是事务目录最后消失的条目——强杀于清理任意位置后，重启都
+    能据 committed 是否在无歧义前滚/回滚（见
+    :func:`_ordered_cleanup_committed_txn`）。
+    """
     records = _read_restore_records(data_dir, wallet_id)
     existing = records["snapshots"].get(snapshot_id)
     if existing is None:
@@ -2209,10 +2296,7 @@ def _finalize_committed_restore(
         raise RecoveryError(
             f"restore record for {snapshot_id!r} disagrees with committed marker"
         )
-    shutil.rmtree(
-        _txn_dir(data_dir, wallet_id, snapshot_id), ignore_errors=True
-    )
-    _prune_empty_txn_parents(data_dir, wallet_id)
+    _ordered_cleanup_committed_txn(data_dir, wallet_id, snapshot_id)
 
 
 def _prune_empty_txn_parents(data_dir: str, wallet_id: str) -> None:
@@ -2273,6 +2357,27 @@ def _resume_pending_restore(
             continue
         if flags[MARKER_PREPARED]:
             prepared = _read_txn_marker(prepared_path, "prepared restore")
+            # 纵深防御：restore-records 登记 S 只可能发生在 committed 前滚成功
+            # 之后，而有序清理保证 committed.json 最后被删——故"committed 缺失
+            # 却已登记 S"不是本事务可能产生的现场（旧的乱序 rmtree 或外部篡改
+            # 才会如此）。绝不能据此把**已提交**快照整体回滚成恢复前现场、与
+            # 登记发散；无法在缺 committed.files 的情况下重验目标，统一
+            # fail-closed 保留现场，绝不猜写、绝不回滚。
+            try:
+                registered = _read_restore_records(
+                    data_dir, wallet_id
+                )["snapshots"].get(snapshot_id)
+            except BackupError as exc:
+                raise RecoveryError(
+                    f"restore-txn for {wallet_id!r}/{snapshot_id!r} prepared "
+                    f"marker survives but restore records cannot be reconciled: "
+                    f"{exc.message}"
+                ) from exc
+            if registered is not None:
+                raise RecoveryError(
+                    f"restore-txn for {wallet_id!r}/{snapshot_id!r} lost its "
+                    "committed marker after the snapshot was registered"
+                )
             _rollback_restore(data_dir, wallet_id, snapshot_id, prepared)
             continue
         # 无 prepared 也无 committed：
