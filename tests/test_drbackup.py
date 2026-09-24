@@ -1094,6 +1094,56 @@ class BackupRestoreCliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["status"], 200)
 
+    def test_cli_restore_stdout_contract_key_order_and_identical_replay(self):
+        # backup 先出包（其成功体顶层键序固定为 status,snapshot_id,manifest）
+        code, out, err = self._cli(
+            "backup", "--data-dir", self.data, "--wallet-id", "alice",
+            "--snapshot-id", "S1", "--output", self.out)
+        self.assertEqual(code, 0)
+
+        def root_keys(text):
+            # object_pairs_hook 自内向外调用，最后一次即根对象，保留其插入序
+            calls = []
+            json.loads(
+                text,
+                object_pairs_hook=lambda pairs: (
+                    calls.append([k for k, _ in pairs]), dict(pairs)
+                )[1],
+            )
+            return calls[-1]
+
+        self.assertEqual(
+            root_keys(out), ["status", "snapshot_id", "manifest"]
+        )
+
+        dst = f"{self.tmp}/dst"
+        code, out1, err = self._cli(
+            "restore", "--data-dir", dst, "--wallet-id", "alice",
+            "--input", self.out)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        # restore 成功体顶层键序固定（不得被字母序重排）
+        self.assertEqual(
+            root_keys(out1),
+            ["status", "wallet_id", "snapshot_id",
+             "manifest_sha256", "manifest"],
+        )
+        self.assertTrue(out1.startswith('{"status": 201, "wallet_id": "alice"'))
+
+        # 同 S 同哈希重放 200，且与首调逐字节同体（仅 status 值不同）
+        code, out2, err = self._cli(
+            "restore", "--data-dir", dst, "--wallet-id", "alice",
+            "--input", self.out)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            root_keys(out2),
+            ["status", "wallet_id", "snapshot_id",
+             "manifest_sha256", "manifest"],
+        )
+        self.assertEqual(
+            out1.replace('"status": 201', '"status": 200'), out2
+        )
+
     def test_cli_backup_bad_snapshot_id_exit1_stderr_json(self):
         code, out, err = self._cli(
             "backup", "--data-dir", self.data, "--wallet-id", "alice",

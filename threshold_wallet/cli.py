@@ -30,7 +30,10 @@ DEFAULT_PORT = 8080
 
 
 def _print_json(obj: dict) -> None:
-    print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+    # 保留 dict 插入序：离线 backup/restore 的成功体有契约固定的顶层键序
+    # （restore: status,wallet_id,snapshot_id,manifest_sha256,manifest；
+    # backup: status,snapshot_id,manifest），sort_keys 会把它重排成字母序。
+    print(json.dumps(obj, ensure_ascii=False))
 
 
 def _fail(message: str) -> int:
