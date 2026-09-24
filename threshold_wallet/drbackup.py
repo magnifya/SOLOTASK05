@@ -704,6 +704,7 @@ def _validate_manifest_shape(
     normalized = json.loads(_canonical_manifest_body(manifest))
     normalized["manifest_sha256"] = bound
     seen: set[str] = set()
+    prev_path: Optional[str] = None
     for entry in entries:
         if not isinstance(entry, dict):
             raise BackupError(503, "manifest entry is not an object")
@@ -714,6 +715,11 @@ def _validate_manifest_shape(
         digest = entry.get("sha256")
         if not isinstance(path, str) or path in seen:
             raise BackupError(503, "manifest has a missing or duplicate path")
+        # 契约要求 files 项严格按 path 升序：即使绑定哈希自洽（包可被整体
+        # 重造），乱序清单也不是合法快照形状，绝不据其恢复或落 committed。
+        if prev_path is not None and path <= prev_path:
+            raise BackupError(503, "manifest files are not sorted by path")
+        prev_path = path
         seen.add(path)
         if not _is_whitelisted(wallet_id, path):
             raise BackupError(503, "manifest lists a non-whitelisted path")
@@ -1657,6 +1663,7 @@ def _validate_marker_entries(
         raise RecoveryError(f"{what} marker file list is malformed")
     normalized: list[dict] = []
     seen: set[str] = set()
+    prev_path: Optional[str] = None
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != _MARKER_ENTRY_KEYS:
             raise RecoveryError(f"{what} marker entry is malformed")
@@ -1665,6 +1672,11 @@ def _validate_marker_entries(
         digest = entry.get("sha256")
         if not isinstance(rel, str) or rel in seen:
             raise RecoveryError(f"{what} marker has a missing or duplicate path")
+        # 契约要求清单项严格按 path 升序：乱序标记即形状损坏，绝不据其
+        # 前滚/回滚（fail-closed 保留现场）。
+        if prev_path is not None and rel <= prev_path:
+            raise RecoveryError(f"{what} marker file list is not sorted by path")
+        prev_path = rel
         seen.add(rel)
         try:
             _validate_member_name(rel)
