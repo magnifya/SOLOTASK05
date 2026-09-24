@@ -1422,6 +1422,9 @@ def _commit_restore(
     txn = _txn_dir(data_dir, wallet_id, snapshot_id)
     old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
     current = _list_current_relpaths(data_dir, wallet_id)
+    # 即使现状为空（恢复到全新 data-dir）也先建 old/：保证"prepared.json 在
+    # ⟹ old/ 在"的不变量，崩溃回滚的闭集校验据此区分"空备份"与"备份被删"。
+    os.makedirs(old_root, exist_ok=True)
     old_entries: list[dict] = []
     for rel in current:
         src = _safe_join(data_dir, rel)
@@ -1769,15 +1772,20 @@ def _rollback_restore(
             "has a bad manifest hash"
         )
 
-    # 闭集校验：old/ 必须存在，且其内文件集合、目录闭包、逐项字节/sha256
-    # 全部与 prepared.old_files 一致。任何符号链接、非常规文件/套接字、额外
-    # 文件或额外（含空）子目录都意味着备份现场被动过，绝不基于不可信备份
-    # 整体回滚。
+    # 闭集校验：old/ 必须存在（空备份的唯一例外见下），且其内文件集合、
+    # 目录闭包、逐项字节/sha256 全部与 prepared.old_files 一致。任何符号
+    # 链接、非常规文件/套接字、额外文件或额外（含空）子目录都意味着备份
+    # 现场被动过，绝不基于不可信备份整体回滚。
     if not flags.get(_TXN_OLD_DIRNAME):
-        raise RecoveryError(
-            f"restore-txn for {wallet_id!r}/{snapshot_id!r} prepared marker "
-            "has no backup directory"
-        )
+        # 恢复到全新 data-dir 时现状为空，old_files 合法地为空清单且 old/
+        # 可能从未被创建：空备份回滚即"删除全部已写入目标"，仍可安全收敛。
+        # old_files 非空而 old/ 缺失则是备份被删，fail-closed 保持现场。
+        old_files_raw = prepared.get("old_files")
+        if not isinstance(old_files_raw, list) or old_files_raw:
+            raise RecoveryError(
+                f"restore-txn for {wallet_id!r}/{snapshot_id!r} prepared marker "
+                "has no backup directory"
+            )
     old_entries = _verify_old_backup(
         txn, wallet_id, snapshot_id, prepared
     )
