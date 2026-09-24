@@ -146,6 +146,7 @@ class WalletService:
             | set(self._store.list_sign_session_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
             | set(self._list_restore_txn_wallet_ids())
+            | set(self._list_restore_records_wallet_ids())
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
@@ -156,6 +157,12 @@ class WalletService:
         from . import drbackup
 
         return drbackup.list_txn_wallet_ids(self._store.data_dir)
+
+    def _list_restore_records_wallet_ids(self) -> list[str]:
+        """拥有 restore-records 登记（或其闭集需校验）的钱包（延迟导入避免环）。"""
+        from . import drbackup
+
+        return drbackup.list_records_wallet_ids(self._store.data_dir)
 
     def _activated_rotations(self, wallet_id: str) -> dict[str, dict]:
         """该钱包已落盘的 share_rotation_activated 事件映射。"""
@@ -192,6 +199,10 @@ class WalletService:
                     f"wallet {wallet_id!r} restore transaction cannot be "
                     f"reconciled: {exc.message}"
                 ) from exc
+            # 灾备恢复登记（restore-records）闭集与形状同样必须可对账：链接、
+            # 目录、备份、临时/杂项条目或损坏登记在此 fail-closed（阻止就绪/
+            # 503），保留现场，绝不静默忽略后继续服务。
+            drbackup.check_restore_records(self._store.data_dir, wallet_id)
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
@@ -250,6 +261,18 @@ class WalletService:
             if _os.path.lexists(_txn_root):
                 self._recover_wallet(wallet_id)
                 return
+            # restore-txn 已无残留时，仍须封闭校验 restore-records 登记现场：
+            # 他进程/外部在恢复完成后塞入链接、目录、备份、临时/杂项条目或
+            # 损坏登记时 fail-closed（503），绝不带不可对账登记继续服务。
+            # 目录不存在时零开销；该校验只 scandir + 读本钱包登记，仍走快速
+            # 自愈路径，不强制整套轮换/会话恢复。
+            _records_root = _os.path.join(
+                self._store.data_dir, drbackup.RESTORE_RECORDS_DIRNAME
+            )
+            if _os.path.lexists(_records_root):
+                drbackup.check_restore_records(
+                    self._store.data_dir, wallet_id
+                )
             # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义
             # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
             # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
