@@ -1520,6 +1520,7 @@ def _validate_marker_entries(
         raise RecoveryError(f"{what} marker file list is malformed")
     normalized: list[dict] = []
     seen: set[str] = set()
+    prev_path: Optional[str] = None
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != _MARKER_ENTRY_KEYS:
             raise RecoveryError(f"{what} marker entry is malformed")
@@ -1528,6 +1529,11 @@ def _validate_marker_entries(
         digest = entry.get("sha256")
         if not isinstance(rel, str) or rel in seen:
             raise RecoveryError(f"{what} marker has a missing or duplicate path")
+        # 契约要求 files/old_files 列表严格按 path 升序：任何乱序都视为标记
+        # 形状损坏 fail-closed，绝不静默重排后采信。
+        if prev_path is not None and rel <= prev_path:
+            raise RecoveryError(f"{what} marker file list is not path-sorted")
+        prev_path = rel
         seen.add(rel)
         try:
             _validate_member_name(rel)
@@ -1798,6 +1804,12 @@ def _rollback_restore(
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
     _prune_empty_leaf_dirs(data_dir, wallet_id)
+    # 现场已整体还原。拆除顺序固定为**先删 prepared.json（回滚决策标记）**
+    # 再清 old/ 与目录骨架：若恰在删除中途被杀，残留的只有无 prepared/
+    # committed 的 old/ 骨架，恢复器按无害残留清掉即可。绝不能先删 old/ 再
+    # 删 prepared——否则重启会看到一个 old/ 已残缺的 prepared 标记，封闭
+    # 校验失败而对其实已正确回滚的现场 fail-closed。
+    _unlink_if_exists(os.path.join(txn, MARKER_PREPARED))
     shutil.rmtree(txn, ignore_errors=True)
     _prune_empty_txn_parents(data_dir, wallet_id)
 
@@ -1922,10 +1934,55 @@ def _rollforward_restore(
     return manifest_sha
 
 
+def _teardown_committed_txn(
+    data_dir: str, wallet_id: str, snapshot_id: str
+) -> None:
+    """前滚补登成功后**有序**拆除事务目录，保证任何时刻被杀都仍能收敛。
+
+    committed.json 是唯一提交点：只要它还在，重启/持锁访问就一定走前滚而
+    非回滚。故拆除顺序固定为 ``old/``（提交后不再需要的回滚备份）→
+    ``prepared.json`` → **最后**删 ``committed.json`` → 清空目录骨架：
+
+    - old/ 已删而 prepared+committed 仍在：committed 权威前滚，残留校验对
+      缺失的 old/ 本就容忍（``_verify_committed_residual``）；
+    - prepared 已删而 committed 仍在：纯 committed 前滚；
+    - committed 被删（最后一步）时记录已补登，仅剩空骨架目录，恢复器按
+      "无 prepared 无 committed 的无害残留"清掉。
+
+    绝不能用一把无序 rmtree：若 scandir 先删 committed 再删 prepared，
+    恰在中间被杀会留下"有 prepared 无 committed"现场，重启会把**已提交且
+    已登记**的快照错误回滚。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    old_root = _txn_old_dir(data_dir, wallet_id, snapshot_id)
+    shutil.rmtree(old_root, ignore_errors=True)
+    _unlink_if_exists(os.path.join(txn, MARKER_PREPARED))
+    # committed 必须最后删除：它在即前滚，绝不允许 prepared 比它活得久。
+    _unlink_if_exists(os.path.join(txn, MARKER_COMMITTED))
+    shutil.rmtree(txn, ignore_errors=True)
+    _prune_empty_txn_parents(data_dir, wallet_id)
+
+
+def _unlink_if_exists(path: str) -> None:
+    """删除一个普通文件；符号链接或非常规条目保留并抛 RecoveryError。"""
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise RecoveryError("refusing to remove a non-regular transaction file")
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def _finalize_committed_restore(
     data_dir: str, wallet_id: str, snapshot_id: str, manifest_sha256: str
 ) -> None:
-    """committed 前滚成功后：补登 restore-records（幂等）并清理事务目录。"""
+    """committed 前滚成功后：补登 restore-records（幂等）并清理事务目录。
+
+    先补登记录，再有序拆除事务目录（committed.json 最后删）。记录补登本身
+    原子失败时事务目录原样保留（committed 仍在），下一次重启/持锁访问封闭
+    前滚后会再次走到这里补登——绝不出现"已回滚现场却已登记"或反之。"""
     records = _read_restore_records(data_dir, wallet_id)
     existing = records["snapshots"].get(snapshot_id)
     if existing is None:
@@ -1937,10 +1994,7 @@ def _finalize_committed_restore(
         raise RecoveryError(
             f"restore record for {snapshot_id!r} disagrees with committed marker"
         )
-    shutil.rmtree(
-        _txn_dir(data_dir, wallet_id, snapshot_id), ignore_errors=True
-    )
-    _prune_empty_txn_parents(data_dir, wallet_id)
+    _teardown_committed_txn(data_dir, wallet_id, snapshot_id)
 
 
 def _prune_empty_txn_parents(data_dir: str, wallet_id: str) -> None:
@@ -2007,11 +2061,9 @@ def _resume_pending_restore(
         # 原子落盘，故此刻替换尚未开始、目标现场从未被触碰；空目录或仅有部分
         # old/ 都属备份中途被杀的无害残留，直接清掉，绝不猜写目标。
         shutil.rmtree(txn, ignore_errors=True)
-    try:
-        if os.path.isdir(wallet_txn_root) and not os.listdir(wallet_txn_root):
-            os.rmdir(wallet_txn_root)
-    except OSError:
-        pass
+    # 统一收掉变空的 restore-txn/<W>/ 与 restore-txn/ 顶层骨架：顶层空目录
+    # 若残留，会让之后每次持锁访问都误判"存在灾备现场"而走完整恢复路径。
+    _prune_empty_txn_parents(data_dir, wallet_id)
     return result
 
 
@@ -2146,7 +2198,11 @@ def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
                             "bytes": entry["bytes"],
                             "sha256": entry["sha256"],
                         }
-                        for entry in manifest["files"]
+                        # 契约要求 committed.json 的 files 列表按 path 升序；
+                        # 不依赖快照内 manifest 的成员顺序。
+                        for entry in sorted(
+                            manifest["files"], key=lambda e: e["path"]
+                        )
                     ],
                 }
                 _atomic_write_json(committed_path, committed)

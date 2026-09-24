@@ -545,5 +545,157 @@ class TxnDirClosedSetTest(_CrashScene):
         self._assert_scene_preserved()
 
 
+class TeardownKillWindowTest(_CrashScene):
+    """补登成功后的事务目录拆除是有序的：committed.json（唯一提交点）最后删。
+    拆除 old/ → prepared.json 的任何中间状态被杀，重启都必须仍走前滚、保持
+    快照现场，绝不因"先删了 committed、prepared 还在"而错误整体回滚。"""
+
+    def _assert_snapshot_committed(self):
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"]["S1"]["manifest_sha256"], self.mhash
+        )
+        self.assertFalse(os.path.exists(self.txn))
+        # 快照现场（1/3600）保留，未被回滚成恢复前的 2/99
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"],
+            1,
+        )
+
+    def test_old_removed_markers_intact_still_rolls_forward(self):
+        # old/ 已删，prepared.json+committed.json 仍在：committed 权威前滚，
+        # 残留 old/ 缺失本就被容忍。
+        self._plant_committed()
+        shutil.rmtree(os.path.join(self.txn, "old"), ignore_errors=True)
+        WalletService(WalletStore(self.dst))
+        self._assert_snapshot_committed()
+
+    def test_only_committed_left_still_rolls_forward(self):
+        # old/ 与 prepared.json 已删，仅 committed.json 残留：纯 committed 前滚。
+        self._plant_committed()
+        shutil.rmtree(os.path.join(self.txn, "old"), ignore_errors=True)
+        os.unlink(os.path.join(self.txn, "prepared.json"))
+        WalletService(WalletStore(self.dst))
+        self._assert_snapshot_committed()
+
+    def test_empty_skeleton_after_recording_is_cleaned(self):
+        # committed 最后删完后仅剩空目录骨架（记录已补登）：重启按无害残留
+        # 清掉整个 restore-txn 顶层，现场保持快照结果、不回滚。
+        self._plant_committed()
+        records = drbackup._read_restore_records(self.dst, "alice")
+        records["snapshots"]["S1"] = {"manifest_sha256": self.mhash}
+        drbackup._write_restore_records(self.dst, "alice", records)
+        shutil.rmtree(os.path.join(self.txn, "old"), ignore_errors=True)
+        for m in ("prepared.json", "committed.json"):
+            os.unlink(os.path.join(self.txn, m))
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.dst, "restore-txn"))
+        )
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"],
+            1,
+        )
+
+    def test_rollback_removes_prepared_before_old(self):
+        # 回滚拆除在 prepared.json 已删、old/ 骨架仍残留时被杀：数据已整体
+        # 还原，重启把无标记残留当无害残留清掉，绝不 fail-closed。
+        self._plant_prepared()
+        real_unlink = drbackup._unlink_if_exists
+
+        class _Kill(Exception):
+            pass
+
+        def kill_after_prepared(path):
+            real_unlink(path)
+            if path.endswith("prepared.json"):
+                raise _Kill()
+
+        drbackup._unlink_if_exists = kill_after_prepared
+        svc = WalletService(WalletStore(self.dst), recover=False)
+        try:
+            with svc._wallet_lock("alice"):
+                drbackup._resume_pending_restore(svc, "alice")
+            self.fail("expected injected kill")
+        except _Kill:
+            pass
+        finally:
+            drbackup._unlink_if_exists = real_unlink
+        # 数据已回滚（2/99），prepared 已无、old/ 骨架仍在
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"],
+            2,
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.txn, "prepared.json"))
+        )
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.dst, "restore-txn"))
+        )
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"],
+            2,
+        )
+
+
+class MarkerPathOrderingTest(_CrashScene):
+    """prepared/committed 标记的 files/old_files 列表契约要求按 path 升序：
+    写出恒为升序；乱序标记一律视为形状损坏 fail-closed。"""
+
+    def test_committed_marker_files_written_path_sorted(self):
+        # 在真实 restore 写完 committed.json、即将前滚时拦截，直接核对生产
+        # 路径落盘的 committed 标记（而非测试手动摆出的标记）。
+        real_rollforward = drbackup._rollforward_restore
+
+        def capture(data_dir, wallet_id, snapshot_id):
+            raise OSError("stop after committed marker landed")
+
+        drbackup._rollforward_restore = capture
+        try:
+            with self.assertRaises(drbackup.BackupError) as ctx:
+                drbackup.restore(self.dst, "alice", self.pack)
+            self.assertEqual(ctx.exception.status, 503)
+        finally:
+            drbackup._rollforward_restore = real_rollforward
+        with open(
+            os.path.join(self.txn, "committed.json"), "rb"
+        ) as f:
+            marker = json.loads(f.read().decode("utf-8"))
+        paths = [e["path"] for e in marker["files"]]
+        self.assertEqual(paths, sorted(paths))
+        # 键集恰为契约四键，UTF-8/sort_keys/2 空格/末尾换行由读盘成功保证
+        self.assertEqual(
+            set(marker),
+            {"wallet_id", "snapshot_id", "manifest_sha256", "files"},
+        )
+
+    def test_unsorted_committed_files_blocks(self):
+        entries = [
+            {"path": e["path"], "bytes": e["bytes"], "sha256": e["sha256"]}
+            for e in self.manifest["files"]
+        ]
+        if len(entries) < 2:
+            self.skipTest("need at least two files to reorder")
+        entries[0], entries[1] = entries[1], entries[0]
+        self._plant_committed(marker_overrides={"files": entries})
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self._assert_scene_preserved()
+
+    def test_unsorted_prepared_old_files_blocks(self):
+        self._plant_prepared()
+        p = os.path.join(self.txn, "prepared.json")
+        marker = drbackup._read_marker(p)
+        old = marker["old_files"]
+        if len(old) < 2:
+            self.skipTest("need at least two files to reorder")
+        old[0], old[1] = old[1], old[0]
+        drbackup._atomic_write_json(p, marker)
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.dst))
+        self.assertTrue(os.path.isdir(self.txn))
+
+
 if __name__ == "__main__":
     unittest.main()
