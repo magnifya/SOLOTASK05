@@ -17,6 +17,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.helpers import http_server, make_harness
 from threshold_wallet import drbackup
@@ -689,6 +690,201 @@ class HardTerminationConvergenceTest(_CrashScene):
         with self.assertRaises(RecoveryError):
             WalletService(WalletStore(self.dst))
         self.assertTrue(os.path.isdir(self.txn))
+
+
+class _SimulatedHardKill(BaseException):
+    """模拟 SIGKILL/断电：注入点之后的清理步骤一律不执行。"""
+
+
+class CleanupWindowCrashConvergenceTest(_CrashScene):
+    """提交后（committed）与回滚后（prepared）的**清理窗口**强杀收敛。
+
+    清理是有序的：committed 场景 committed.json 最后删（prepared/old 先于
+    它消失），rollback 场景 old/ 最后删（prepared 先于它消失）。逐一切点
+    注入"强杀"，重启/持锁自愈都必须收敛到唯一正确现场：
+
+    - committed 切点：现场即快照、记录恰一次、restore-txn/tmp 清尽、重放 200；
+    - rollback 切点：现场整体回滚、无记录、重新 restore 201。
+    """
+
+    #: _ordered_cleanup_committed / _ordered_cleanup_rollback 的事务内删除步数
+    # （new 树、.prepared.tmp、.committed.tmp、prepared 标记、old 树、
+    # committed 标记、事务目录本身）
+    CLEANUP_STEPS = 7
+
+    def _kill_during_cleanup(self, kill_at: int) -> None:
+        """启动恢复，在清理的第 kill_at 个删除步骤前强杀。"""
+        real_file = drbackup._remove_file_best_effort
+        real_tree = drbackup._remove_tree_best_effort
+        calls = {"n": 0}
+
+        def kill_file(path):
+            calls["n"] += 1
+            if calls["n"] == kill_at:
+                raise _SimulatedHardKill
+            return real_file(path)
+
+        def kill_tree(path):
+            calls["n"] += 1
+            if calls["n"] == kill_at:
+                raise _SimulatedHardKill
+            return real_tree(path)
+
+        with mock.patch.object(drbackup, "_remove_file_best_effort", kill_file), \
+                mock.patch.object(drbackup, "_remove_tree_best_effort", kill_tree):
+            with self.assertRaises(_SimulatedHardKill):
+                WalletService(WalletStore(self.dst))
+
+    def _assert_no_orphan_temps(self):
+        for root_name in ("restore-txn", "restore-records"):
+            root = os.path.join(self.dst, root_name)
+            if not os.path.isdir(root):
+                continue
+            for dp, _, fns in os.walk(root):
+                for fn in fns:
+                    self.assertFalse(
+                        fn.startswith(".") or fn.endswith(".tmp"),
+                        f"orphan temp survives: {os.path.join(dp, fn)}",
+                    )
+
+    def _assert_committed_scene_converged(self):
+        # 再次启动：无异常、无重复登记
+        WalletService(WalletStore(self.dst))
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"],
+            {"S1": {"manifest_sha256": self.mhash}},
+        )
+        # restore-txn 与任何半截临时名清尽
+        self.assertFalse(
+            os.path.exists(os.path.join(self.dst, "restore-txn"))
+        )
+        self._assert_no_orphan_temps()
+        # 现场即快照（审批策略 1/3600），审计不新增
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 1
+        )
+        from threshold_wallet.audit import AuditStore
+
+        self.assertEqual(
+            len(AuditStore(self.dst).list_events("alice")),
+            len(AuditStore(self.src).list_events("alice")),
+        )
+        # 重放 200 同体
+        status, body = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["manifest"], self.backup_body["manifest"])
+        # 再重启仍只登记一次
+        WalletService(WalletStore(self.dst))
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(len(records["snapshots"]), 1)
+
+    def _assert_rolled_back_scene_converged(self):
+        # 再次启动：无异常
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.dst, "restore-txn"))
+        )
+        self.assertFalse(os.path.exists(self.records_path))
+        self._assert_no_orphan_temps()
+        # 现场整体回滚为恢复前（审批策略 2/99）
+        self.assertEqual(
+            WalletStore(self.dst).get_policy("alice")["required_approvals"], 2
+        )
+        # 回滚等于未提交：重新 restore 首调 201，随后重放 200
+        status, _ = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 201)
+        status, _ = drbackup.restore(self.dst, "alice", self.pack)
+        self.assertEqual(status, 200)
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(len(records["snapshots"]), 1)
+
+    def test_committed_cleanup_kill_at_every_cut_converges(self):
+        for cut in range(1, self.CLEANUP_STEPS + 1):
+            with self.subTest(cut=cut):
+                self._plant_committed()
+                self._kill_during_cleanup(cut)
+                self._assert_committed_scene_converged()
+                # 重建场景供下一切点
+                self.setUp()
+
+    def test_rollback_cleanup_kill_at_every_cut_converges(self):
+        for cut in range(1, self.CLEANUP_STEPS + 1):
+            with self.subTest(cut=cut):
+                self._plant_prepared()
+                self._kill_during_cleanup(cut)
+                self._assert_rolled_back_scene_converged()
+                self.setUp()
+
+    def test_committed_old_partial_after_prepared_removed_converges(self):
+        # 有序清理：prepared.json 先删、old/ 后删。强杀于 old/ 删除中途时
+        # committed.json 仍在、prepared 已不在——残缺 old/ 是无害残留，
+        # 前滚不得要求其与 prepared 闭集一致。
+        self._plant_committed()
+        os.unlink(os.path.join(self.txn, "prepared.json"))
+        old_victim = os.path.join(self.txn, "old", "wallets", "alice.json")
+        os.unlink(old_victim)
+        WalletService(WalletStore(self.dst))
+        self._assert_committed_scene_converged()
+
+    def test_rollback_old_partial_after_prepared_removed_converges(self):
+        # 回滚清理：prepared 先删、old 后删。强杀于 old/ 删除中途（业务已还原，
+        # prepared 已不在）时重启按无标记垃圾清掉，绝不因备份残缺永久 503。
+        self._plant_prepared()
+        real_tree = drbackup._remove_tree_best_effort
+        old_root = drbackup._txn_old_dir(self.dst, "alice", "S1")
+
+        def partial_old_then_kill(path):
+            if os.path.normpath(path) == os.path.normpath(old_root):
+                victim = os.path.join(old_root, "wallets", "alice.json")
+                os.unlink(victim)
+                raise _SimulatedHardKill
+            return real_tree(path)
+
+        with mock.patch.object(
+            drbackup, "_remove_tree_best_effort", partial_old_then_kill
+        ):
+            with self.assertRaises(_SimulatedHardKill):
+                WalletService(WalletStore(self.dst))
+        # 业务已还原（2/99），prepared 已删、old/ 残缺
+        self.assertFalse(
+            os.path.exists(os.path.join(self.txn, "prepared.json"))
+        )
+        self._assert_rolled_back_scene_converged()
+
+    def test_committed_cleanup_cut_then_locked_http_serves_200(self):
+        # 清理窗口被杀后，不经过重启、直接由常驻进程的下一次持锁访问收敛
+        self._plant_committed()
+        self._kill_during_cleanup(self.CLEANUP_STEPS - 1)
+        from tests.helpers import http_server
+
+        with http_server(self.dst) as srv:
+            status, body = srv.request("GET", "/v1/wallets/alice")
+        self.assertEqual(status, 200, body)
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(len(records["snapshots"]), 1)
+
+    def test_committed_present_with_half_record_temp_registers_once(self):
+        # 强杀于登记原子改名之前：committed 在、正式记录缺失、仅余半截
+        # .alice.json.tmp。启动前滚须原子续作（先解链再 O_EXCL），登记一次。
+        self._plant_committed()
+        os.makedirs(os.path.join(self.dst, "restore-records"), exist_ok=True)
+        tmp = drbackup._records_tmp_path(self.dst, "alice")
+        with open(tmp, "wb") as f:
+            f.write(b"{half")
+        self.assertFalse(os.path.exists(self.records_path))
+        WalletService(WalletStore(self.dst))
+        self.assertFalse(os.path.exists(tmp))
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(
+            records["snapshots"],
+            {"S1": {"manifest_sha256": self.mhash}},
+        )
+        self.assertFalse(os.path.exists(self.txn))
+        # 再重启不重复登记
+        WalletService(WalletStore(self.dst))
+        records = drbackup._read_restore_records(self.dst, "alice")
+        self.assertEqual(len(records["snapshots"]), 1)
 
 
 if __name__ == "__main__":

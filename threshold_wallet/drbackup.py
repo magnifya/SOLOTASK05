@@ -2058,8 +2058,10 @@ def _rollback_restore(
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
     _prune_empty_leaf_dirs(data_dir, wallet_id)
-    shutil.rmtree(txn, ignore_errors=True)
-    _prune_empty_txn_parents(data_dir, wallet_id)
+    # 有序清理：备份（old/）最后删。强杀于清理窗口时，prepared+完整 old 仍在
+    # 则幂等重做回滚；prepared 已删而 old 残缺则按无标记垃圾清掉，绝不因备份
+    # 残缺永久 fail-closed（业务现场此刻已整体还原）。
+    _ordered_cleanup_rollback(data_dir, wallet_id, snapshot_id)
 
 
 def _verify_committed_residual(
@@ -2197,7 +2199,14 @@ def _rollforward_restore(
 def _finalize_committed_restore(
     data_dir: str, wallet_id: str, snapshot_id: str, manifest_sha256: str
 ) -> None:
-    """committed 前滚成功后：补登 restore-records（幂等）并清理事务目录。"""
+    """committed 前滚成功后：补登 restore-records（幂等）并有序清理事务目录。
+
+    先补登、后清理：登记原子写本身崩溃（留半截 ``.W.json.tmp``）时事务目录
+    仍在，下一次持锁/启动经前滚路径再次进入本函数——记录已在则不重写、缺失
+    则原子续作（先解链再 O_EXCL），保证至多登记一次。随后的事务目录清理是
+    **有序**的（committed 标记最后删），强杀于清理窗口也只会再次前滚或被当作
+    无标记空事务清掉，绝不会把已提交恢复误回滚。
+    """
     records = _read_restore_records(data_dir, wallet_id)
     existing = records["snapshots"].get(snapshot_id)
     if existing is None:
@@ -2209,9 +2218,89 @@ def _finalize_committed_restore(
         raise RecoveryError(
             f"restore record for {snapshot_id!r} disagrees with committed marker"
         )
-    shutil.rmtree(
-        _txn_dir(data_dir, wallet_id, snapshot_id), ignore_errors=True
-    )
+    _ordered_cleanup_committed(data_dir, wallet_id, snapshot_id)
+
+
+def _remove_tree_best_effort(path: str) -> None:
+    """递归删除一个目录（含其全部内容），OSError 静默（best-effort）。
+
+    仅用于有序清理中删除已被权威标记（committed）或已核验备份（prepared）
+    **逻辑覆盖**的暂存/备份目录：删除在每个提交/回滚路径上都会幂等重做，
+    单次删除中断留下的任何残留只可能在下一次持锁收敛时再被删除，绝不影响
+    业务现场。
+    """
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _remove_file_best_effort(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _ordered_cleanup_committed(data_dir: str, wallet_id: str, snapshot_id: str) -> None:
+    """committed 前滚成功后的**有序**事务清理（强杀于清理窗口也可收敛）。
+
+    清理顺序刻意保证任一切点残留都能被重启/下一次持锁自愈正确判定——
+
+    1. ``new/``（提交后必为空目录，残留暂存属垃圾）；
+    2. ``prepared.json`` 标记；
+    3. ``old/`` 备份目录；
+    4. ``committed.json``——**唯一提交点标记最后删除**；
+    5. ``restore-txn/<W>/<S>``、``restore-txn/<W>``、``restore-txn/`` 空目录。
+
+    强杀于第 1~3 步：committed.json 仍在，重启走前滚（封闭校验通过，因业务
+    现场未在清理中被触碰），重做本清理；强杀于第 4 步（committed.json 已删）：
+    此时 prepared.json 与 old/ 已不在，只剩空目录/空 new，重启进入无标记空
+    事务分支，整体删除即可——**绝不可能把已提交恢复误判成 prepared 回滚**
+    （prepared 与 old 必先于 committed 删除）。restore-records 已在调用本函数
+    前补登，故收敛幂等、至多登记一次。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    _remove_tree_best_effort(_txn_new_dir(data_dir, wallet_id, snapshot_id))
+    # 标记写中临时名先于其最终标记删除：原子改名完成后它们本不存在，此处
+    # 仅防御性清理。若反过来（先删 committed 后删其 tmp），清理窗口被杀会
+    # 留下孤立的 .committed.json.tmp，被无标记分支误判为矛盾现场而永久
+    # fail-closed。
+    _remove_file_best_effort(os.path.join(txn, _PREPARED_MARKER_TMP))
+    _remove_file_best_effort(os.path.join(txn, _COMMITTED_MARKER_TMP))
+    _remove_file_best_effort(os.path.join(txn, MARKER_PREPARED))
+    _remove_tree_best_effort(_txn_old_dir(data_dir, wallet_id, snapshot_id))
+    _remove_file_best_effort(os.path.join(txn, MARKER_COMMITTED))
+    _remove_tree_best_effort(txn)
+    _prune_empty_txn_parents(data_dir, wallet_id)
+
+
+def _ordered_cleanup_rollback(data_dir: str, wallet_id: str, snapshot_id: str) -> None:
+    """prepared 回滚成功后的**有序**事务清理（强杀于清理窗口也可收敛）。
+
+    调用前业务文件已整体还原为 old/ 备份现场。清理顺序——
+
+    1. ``new/`` 未提交暂存（绝不信任其中内容）；
+    2. ``committed.json`` 的写中临时名（若在，属未提交窗口残留）；
+    3. ``prepared.json`` 标记；
+    4. ``old/`` 备份目录——**备份最后删除**；
+    5. 事务目录与空父目录。
+
+    强杀于第 1~3 步：prepared.json 与完整 old/ 仍在，重启重做回滚（备份闭集
+    与逐项哈希仍可核验，业务现场已还原，重做为幂等 no-op）；强杀于第 4 步
+    （prepared 已删、old/ 残缺）：无 committed、无 prepared，重启进入空事务
+    分支删除垃圾——**绝不会因备份残缺而永久 fail-closed**（备份已无用，业务
+    现场已还原）。
+    """
+    txn = _txn_dir(data_dir, wallet_id, snapshot_id)
+    _remove_tree_best_effort(_txn_new_dir(data_dir, wallet_id, snapshot_id))
+    # 写中临时名先于其最终标记删除（与 committed 有序清理同理）：避免清理
+    # 窗口被杀后留下孤立标记临时名，被无标记分支按矛盾现场 fail-closed。
+    _remove_file_best_effort(os.path.join(txn, _COMMITTED_MARKER_TMP))
+    _remove_file_best_effort(os.path.join(txn, _PREPARED_MARKER_TMP))
+    _remove_file_best_effort(os.path.join(txn, MARKER_PREPARED))
+    _remove_tree_best_effort(_txn_old_dir(data_dir, wallet_id, snapshot_id))
+    _remove_file_best_effort(os.path.join(txn, MARKER_COMMITTED))
+    _remove_tree_best_effort(txn)
     _prune_empty_txn_parents(data_dir, wallet_id)
 
 
