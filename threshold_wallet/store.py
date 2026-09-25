@@ -1083,8 +1083,8 @@ class WalletStore:
 
         正常提交写入的意图含 operation_id/asset_id/delta、提交前资产
         快照 old_asset（None 或 {balance,version}）、pending 操作记录、
-        提交结果 new_balance/new_version；报告触发的提交另带可选键
-        report（达门槛报告 B）。任一字段缺失、类型错误、布尔
+        提交结果 new_balance/new_version；链上确认报告触发的提交另带
+        可选键 report（达门槛报告 B）。任一字段缺失、类型错误、布尔
         冒整、标识不匹配或前后账目不守恒都判定为无效：调用方必须
         fail-closed（保留意图现场，不回滚/前滚/清理），绝不把损坏意图
         当成空意图继续。
@@ -1119,8 +1119,9 @@ class WalletStore:
             return False
         if pending["delta"] != delta:
             return False
-        # 报告触发的提交在意图中随附达门槛报告 B（可选键）：崩溃恢复据此
-        # 判定"报告事件 + 提交事件"两事件提交点是否完整。存在即须形状
+        # 链上确认报告触发的提交在意图中随附达门槛报告 B（可选键）：
+        # 存在即按"报告事件 + 紧邻提交事件"的链报告提交点严格对账
+        # （合法前缀回滚 / 紧邻同体前滚 / 无法判定保留现场），形状必须
         # 合法，否则无法安全对账。
         report = intent.get("report")
         if report is not None and not chain_report_shape_ok(report):

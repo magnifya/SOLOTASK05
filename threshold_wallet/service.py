@@ -208,7 +208,7 @@ class WalletService:
         取最后一条）。"""
         return self._audit.prepared_rotation_events(wallet_id)
 
-    def _recover_wallet(self, wallet_id: str) -> None:
+    def _recover_wallet(self, wallet_id: str, *, strict: bool = False) -> None:
         """在已持有该钱包事务锁的前提下，恢复轮换现场与未完成的资产提交。
 
         两者以同一把钱包锁串行，任何一个失败都向上抛出（RecoveryError/
@@ -216,7 +216,13 @@ class WalletService:
 
         损坏 JSON / 形状异常在存储层表现为 ValueError：恢复无法对账时同样
         fail-closed，统一转成 RecoveryError，绝不把 ValueError 漏给调用方
-        当成普通参数错误。"""
+        当成普通参数错误。
+
+        strict=True（链报告直接调用的错误边界）时不做统一包装：
+        CorruptDataError（损坏的审计/账本 JSON）与 OSError（I/O 失败）
+        原样上抛，由调用方按类型区分；其余无法对账现场仍为
+        RecoveryError。启动恢复与灾备沿用非 strict 的既有行为。
+        """
         try:
             # 灾备恢复事务的崩溃残留最先对账：committed 在则前滚到快照现场、
             # 否则按 old/ 备份整体回滚到恢复前现场。必须先于审计/账本/轮换
@@ -275,12 +281,20 @@ class WalletService:
             self._dkg_failover_policy_enabled(wallet_id)
         except RecoveryError:
             raise
-        except (OSError, ValueError) as exc:
+        except (CorruptDataError, OSError) as exc:
+            # 链报告直接调用的错误边界：损坏 JSON 与 I/O 失败须按类型
+            # 原样上抛（HTTP 统一 503），不统一包装成 RecoveryError。
+            if strict:
+                raise
+            raise RecoveryError(
+                f"wallet {wallet_id!r} cannot be reconciled: {exc}"
+            ) from exc
+        except ValueError as exc:
             raise RecoveryError(
                 f"wallet {wallet_id!r} cannot be reconciled: {exc}"
             ) from exc
 
-    def _heal_wallet(self, wallet_id: str) -> None:
+    def _heal_wallet(self, wallet_id: str, *, strict: bool = False) -> None:
         """持锁后自愈他进程崩溃遗留的现场（懒恢复，fail-closed）。
 
         常驻进程不会重跑启动恢复；为使任何查询/重放永远读不到他进程
@@ -298,6 +312,9 @@ class WalletService:
         RecoveryError/OSError，绝不静默继续。检测读取本身遇到损坏 JSON/
         形状异常（ValueError）时无法判断现场是否静止，按不可对账处理，
         交由 _recover_wallet fail-closed。
+
+        strict=True（链报告直接调用的错误边界）时透传 CorruptDataError
+        与 OSError，不统一包装成 RecoveryError；其余调用沿用既有行为。
         """
         try:
             # 灾备恢复事务的崩溃残留优先收敛（committed 前滚/否则整体回滚），
@@ -313,7 +330,7 @@ class WalletService:
                 self._store.data_dir, drbackup.RESTORE_TXN_DIRNAME
             )
             if _os.path.lexists(_txn_root):
-                self._recover_wallet(wallet_id)
+                self._recover_wallet(wallet_id, strict=strict)
                 return
             # 即便没有 restore-txn（提交后的清理已完成，或强杀发生在登记
             # 阶段），跨目录登记根 restore-records/ 仍须闭集可信：链接、目录、
@@ -339,7 +356,7 @@ class WalletService:
             # 再对账会话，避免把会话迁移到未提交轮换的份额上。
             self._store.check_sign_sessions(wallet_id)
             if self._store.list_asset_intents(wallet_id):
-                self._recover_wallet(wallet_id)
+                self._recover_wallet(wallet_id, strict=strict)
                 return
             rotations = self._store.list_rotations(wallet_id)
             staging_ids = set(self._store.list_staging_rotation_ids(wallet_id))
@@ -387,7 +404,7 @@ class WalletService:
                 needs_recovery = True
             if needs_recovery:
                 # 内含轮换 -> 资产提交 -> 会话的完整有序恢复
-                self._recover_wallet(wallet_id)
+                self._recover_wallet(wallet_id, strict=strict)
                 return
             # 轮换现场静止后，再对他进程崩溃遗留的半完成会话对账（无会话
             # 文件时立即返回，零开销；此时读取审计不影响审计无关路由）。
@@ -402,7 +419,15 @@ class WalletService:
             self._recover_sign_sessions(wallet_id)
         except RecoveryError:
             raise
-        except (OSError, ValueError) as exc:
+        except (CorruptDataError, OSError) as exc:
+            # strict 直接调用边界：损坏 JSON 与 I/O 失败按类型原样上抛；
+            # 其余调用统一包装为 RecoveryError（既有行为）。
+            if strict:
+                raise
+            raise RecoveryError(
+                f"wallet {wallet_id!r} cannot be reconciled: {exc}"
+            ) from exc
+        except ValueError as exc:
             # 检测/对账阶段读到无法解析的现场：不能假定静止，fail-closed
             raise RecoveryError(
                 f"wallet {wallet_id!r} cannot be reconciled: {exc}"
@@ -1550,11 +1575,181 @@ class WalletService:
         - 事件不在：提交未生效，按意图记录的提交前快照把操作恢复为
           pending、资产恢复提交前 balance/version（提交前不存在则删除
           资产条目），再删意图。事件从未分配 seq，故无 seq 缺口。
+
+        链上确认报告触发的提交（意图随附达门槛报告 B）单独对账：见
+        _resolve_chain_report_intent——提交事件在时必须紧邻同操作同体
+        chain_report 方前滚；提交事件不在时只在既有报告历史是合法前缀
+        且意图报告是唯一合法下一报时回滚删意图（保留前序报告），同体
+        已在或无法判定均 fail-closed 保留现场。
+
         恢复本身不记任何审计事件。任一条意图无法对账到一致状态都抛
         RecoveryError，由调用方阻止就绪/返回 503，绝不静默跳过。
         """
         for operation_id, intent in self._store.list_asset_intents(wallet_id):
-            self._resolve_asset_commit_intent(wallet_id, operation_id, intent)
+            # 随附达门槛报告 B（report 键）的意图即链上确认报告触发的
+            # 提交：按链报告提交点严格对账（合法前缀回滚 / 紧邻同体
+            # 前滚 / 无法判定保留现场）；普通人工提交意图走既有恢复。
+            if isinstance(intent, dict) and intent.get("report") is not None:
+                self._resolve_chain_report_intent(
+                    wallet_id, operation_id, intent
+                )
+            else:
+                self._resolve_asset_commit_intent(wallet_id, operation_id, intent)
+
+    def _chain_report_events(
+        self, wallet_id: str, operation_id: str
+    ) -> list[dict]:
+        """返回某操作全部 chain_report 事件（按 seq 升序）。"""
+        return [
+            event
+            for event in self._audit.events_by_type(
+                wallet_id, audit.TYPE_CHAIN_REPORT
+            )
+            if event.get("request_id") == operation_id
+        ]
+
+    def _chain_report_history_ok(
+        self, wallet_id: str, operation_id: str, policy: dict
+    ) -> tuple[bool, dict | None]:
+        """校验某操作既有 chain_report 事件是否为在线状态机的合法前缀。
+
+        纯只读，按 seq 逐事件重放在线规则（tx/链绑定、同块确认数不降、
+        换块回退不超窗、低于门槛不产生同体事件）。返回
+        (是否合法, 最后一条报告 B)；无报告时合法且 last 为 None。
+        事件形状损坏由 _chain_report_shape 抛 RecoveryError。"""
+        last: dict | None = None
+        for event in self._chain_report_events(wallet_id, operation_id):
+            _, report = self._chain_report_shape(wallet_id, event)
+            if report["chain_id"] != policy["chain_id"]:
+                return False, last
+            if self._report_transition_error(policy, last, report) is not None:
+                return False, last
+            last = report
+        return True, last
+
+    def _rollback_chain_report_intent(
+        self, wallet_id: str, operation_id: str, intent: dict
+    ) -> None:
+        """链报告意图无提交事件时的安全回滚：账本恢复提交前 pending 与
+        提交前余额/version，删除意图；既有 chain_report 历史事件全部
+        保留（仅追加，绝不抹除审计），不新增事件、不留 seq 缺口。"""
+        pending = intent["pending"]
+        asset_id = intent["asset_id"]
+        old_asset = intent["old_asset"]
+        self._store.restore_asset_operation(
+            wallet_id,
+            operation_id,
+            pending,
+            asset_id,
+            old_asset if isinstance(old_asset, dict) else None,
+        )
+        self._store.delete_asset_commit_intent(wallet_id, operation_id)
+
+    def _resolve_chain_report_intent(
+        self, wallet_id: str, operation_id: str, intent: object
+    ) -> None:
+        """对账单条链报告提交意图（意图随附达门槛报告 B，调用方持锁）。
+
+        损坏/非对象/缺少恢复所需标识与整数的意图无法安全对账：直接
+        RecoveryError 并保留意图现场原样，绝不删除或继续提交/回滚。
+
+        - 提交事件已落盘：仅当其紧邻前项是同操作、details 与意图报告
+          逐字段相等的 chain_report 时前滚补齐账本并删意图；否则是
+          无法判定的矛盾现场，RecoveryError 保留现场。
+        - 提交事件未落盘：按意图恢复提交前快照只做判定、绝不先写账本。
+          既有 chain_report 历史须为在线状态机的合法前缀，且意图报告 B
+          是该前缀的**唯一合法下一报**（逐字段相等续接）：满足则回滚
+          账本、删意图并保留全部前序报告事件；若历史中已含同体报告，
+          或历史非法/不是前缀/B 无法唯一续接，一律 RecoveryError
+          保留现场，绝不静默回滚抹除证据或猜写。
+        """
+        if not self._store.valid_asset_commit_intent(operation_id, intent):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset operation {operation_id!r} "
+                "chain report commit intent is missing or malformed and "
+                "cannot be reconciled"
+            )
+        report = intent["report"]
+        event = self._audit.find_event_by_request(
+            wallet_id,
+            audit.TYPE_ASSET_OPERATION_COMMITTED,
+            operation_id,
+        )
+        if event is not None:
+            # 提交事件在：仅紧邻前项为同操作同体 chain_report 方可前滚。
+            self._check_report_commit_pair(wallet_id, operation_id, event, report)
+            details = event.get("details")
+            asset_id = details.get("asset_id") if isinstance(details, dict) else None
+            balance = details.get("balance") if isinstance(details, dict) else None
+            version = details.get("version") if isinstance(details, dict) else None
+            delta = details.get("delta") if isinstance(details, dict) else None
+            if (
+                not isinstance(details, dict)
+                or not isinstance(asset_id, str)
+                or not isinstance(delta, int)
+                or isinstance(delta, bool)
+                or not isinstance(balance, int)
+                or isinstance(balance, bool)
+                or not isinstance(version, int)
+                or isinstance(version, bool)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset operation "
+                    f"{operation_id!r} committed event is malformed"
+                )
+            committed_record = {
+                "operation_id": operation_id,
+                "asset_id": asset_id,
+                "state": "committed",
+                "delta": delta,
+                "balance": balance,
+                "version": version,
+            }
+            asset_record = {"balance": balance, "version": version}
+            self._store.commit_asset_operation(
+                wallet_id,
+                operation_id,
+                committed_record,
+                asset_id,
+                asset_record,
+            )
+            self._store.delete_asset_commit_intent(wallet_id, operation_id)
+            return
+
+        # 提交事件未落盘：按"既有报告历史 + 意图报告"重放在线状态机，
+        # 判定既有历史是否为合法前缀、B 是否唯一合法下一报。
+        asset_id = intent["asset_id"]
+        policy = self._chain_policies(wallet_id).get(asset_id)
+        if policy is None:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} chain report intent for "
+                f"{operation_id!r} has no chain policy to reconcile against"
+            )
+        history_ok, last = self._chain_report_history_ok(
+            wallet_id, operation_id, policy
+        )
+        if not history_ok:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} chain report history for "
+                f"{operation_id!r} is not a legal prefix"
+            )
+        if last is not None and report == last:
+            # 已含同体报告却无紧邻提交事件：无法判定（孤立达门槛报告），
+            # 保留现场，绝不静默回滚抹掉证据。
+            raise RecoveryError(
+                f"wallet {wallet_id!r} already has the same chain report "
+                f"for asset operation {operation_id!r} without its committed "
+                "event"
+            )
+        if self._report_transition_error(policy, last, report) is not None:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} chain report intent for "
+                f"{operation_id!r} is not the unique legal next report of "
+                "the existing history"
+            )
+        # 合法前缀 + B 是唯一合法下一报：回滚账本、删意图；既有前序
+        # chain_report 事件作为审计历史全部保留，不新增事件、无 seq 缺口。
+        self._rollback_chain_report_intent(wallet_id, operation_id, intent)
 
     def _reconcile_asset_committed_events(self, wallet_id: str) -> None:
         """账本 committed 操作与 asset_operation_committed 事件双向对账
@@ -1654,9 +1849,10 @@ class WalletService:
                 f"wallet {wallet_id!r} asset operation {operation_id!r} "
                 "commit intent is missing or malformed and cannot be reconciled"
             )
-        # 报告触发的提交在意图中随附达门槛报告 B：报告事件与提交事件同批
-        # 原子落盘，恢复据此核对两事件提交点完整且紧邻同体。
-        report = intent.get("report")
+        # 随附达门槛报告 B 的链报告意图已在
+        # _recover_wallet_asset_commits 分流到
+        # _resolve_chain_report_intent（紧邻同体前滚 / 合法前缀回滚 /
+        # 无法判定保留现场）；走到这里的都是普通人工提交意图。
         event = self._audit.find_event_by_request(
             wallet_id,
             audit.TYPE_ASSET_OPERATION_COMMITTED,
@@ -1684,10 +1880,6 @@ class WalletService:
                     f"wallet {wallet_id!r} asset operation "
                     f"{operation_id!r} committed event is malformed"
                 )
-            if report is not None:
-                self._check_report_commit_pair(
-                    wallet_id, operation_id, event, report
-                )
             committed_record = {
                 "operation_id": operation_id,
                 "asset_id": asset_id,
@@ -1713,23 +1905,6 @@ class WalletService:
         # pending、资产恢复提交前 balance/version（意图已在方法入口通过
         # 严格校验，标识/整数/守恒均可信）。提交前不存在该资产条目时
         # 直接删除；事件从未分配 seq，故无事件、无 seq 缺口、可重试。
-        if report is not None:
-            # 报告事件与提交事件同批原子落盘：提交事件缺失即该报告事件
-            # 也不可能落盘。此处仍发现同体报告事件＝崩溃窗口外的矛盾现场
-            # （外部篡改/半写），fail-closed 保留现场，绝不静默回滚抹掉
-            # 证据后继续服务。
-            for orphan in self._audit.events_by_type(
-                wallet_id, audit.TYPE_CHAIN_REPORT
-            ):
-                if (
-                    orphan.get("request_id") == operation_id
-                    and orphan.get("details") == report
-                ):
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} has a chain_report event for "
-                        f"asset operation {operation_id!r} without its "
-                        "committed event"
-                    )
         pending = intent["pending"]
         asset_id = intent["asset_id"]
         old_asset = intent["old_asset"]
@@ -1905,7 +2080,9 @@ class WalletService:
         }
         if report_details is not None:
             # 报告触发的提交：意图随附达门槛报告 B，崩溃恢复据此把
-            # 两事件提交点与孤立报告矛盾现场严格区分开
+            # 链报告意图与普通提交意图区分，走"报告事件 + 提交事件"
+            # 两事件提交点对账（紧邻同体前滚 / 合法前缀回滚 / 无法
+            # 判定保留现场）。
             intent["report"] = report_details
         try:
             self._store.write_asset_commit_intent(
@@ -2307,10 +2484,16 @@ class WalletService:
         required_confirmations 时按既有 commit 契约提交一次：报告事件
         与紧邻的唯一提交事件同批原子落盘构成提交点（seq 为 n、n+1），
         提交失败（如余额不足）报告不落盘。恢复检查、校验、状态判定与
-        事件追加全部在锁内完成。"""
+        事件追加全部在锁内完成。
+
+        直接调用（非 HTTP）的错误边界：损坏的审计/账本 JSON 抛
+        CorruptDataError，I/O 失败抛 OSError，无法对账现场抛
+        RecoveryError，三者均原样上抛（HTTP 边界统一转 JSON 503）。"""
         try:
             with self._wallet_lock(wallet_id):
-                self._heal_wallet(wallet_id)
+                # 链报告直接调用边界：损坏 JSON / I/O / 不可对账须按
+                # CorruptDataError / OSError / RecoveryError 原样上抛。
+                self._heal_wallet(wallet_id, strict=True)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
                 self._validate_operation_id(operation_id)

@@ -27,7 +27,11 @@ from unittest import mock
 from threshold_wallet import drbackup
 from threshold_wallet.audit import AuditStore
 from threshold_wallet.service import WalletService
-from threshold_wallet.store import RecoveryError, WalletStore
+from threshold_wallet.store import (
+    CorruptDataError,
+    RecoveryError,
+    WalletStore,
+)
 from tests.helpers import http_server, make_harness
 
 TX = "ab" * 32
@@ -981,9 +985,501 @@ class ChainCrashConvergenceTest(unittest.TestCase):
         self.assertIsNotNone(store.get_asset_commit_intent("w1", "op1"))
 
 
+class ChainReportIntentPrefixRollbackTest(unittest.TestCase):
+    """带 report 意图、无提交事件时的崩溃恢复新边界：
+
+    - 无任何提交事件：重放既有历史报告；其为合法前缀且意图报告是唯一
+      合法下一报时回滚账本并删意图，保留全部前序报告事件，不新增事件、
+      无 seq 缺口；
+    - 历史已含同体报告（孤立达门槛报告）或无法判定：RecoveryError
+      原样保留现场（账本、意图、事件都不动），重启阻止就绪、持锁 503；
+    - 直接调用三异常边界：损坏 JSON -> CorruptDataError，I/O -> OSError，
+      无法对账 -> RecoveryError；HTTP 三者统一 JSON 503。
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _service(self):
+        return make_harness(self.tmpdir).service
+
+    def _setup_wallet(self):
+        service = self._service()
+        service.create_wallet("w1", 2)
+        service.put_chain_policy("w1", "btc", "bitcoin", True, 3, 2)
+        service.create_asset_operation("w1", "op1", "btc", 100)
+        return service
+
+    def _write_report_intent(self, service, report):
+        intent = {
+            "operation_id": "op1",
+            "asset_id": "btc",
+            "delta": 100,
+            "old_asset": None,
+            "pending": {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "state": "pending",
+                "delta": 100,
+                "balance": 0,
+                "version": 0,
+            },
+            "new_balance": 100,
+            "new_version": 1,
+            "report": report,
+        }
+        service._store.write_asset_commit_intent("w1", "op1", intent)
+
+    def _commit_ledger_without_events(self, service):
+        """模拟账本已提交但两事件未落盘的崩溃窗口现场。"""
+        committed = {
+            "operation_id": "op1",
+            "asset_id": "btc",
+            "state": "committed",
+            "delta": 100,
+            "balance": 100,
+            "version": 1,
+        }
+        service._store.commit_asset_operation(
+            "w1", "op1", committed, "btc", {"balance": 100, "version": 1}
+        )
+
+    def test_no_history_threshold_intent_rolls_back(self):
+        """无前序报告：达门槛意图是首报（唯一合法下一报），回滚删意图，
+        无事件残留，重试完整提交一次。"""
+        service = self._setup_wallet()
+        report = _report(confirmations=3)
+        self._write_report_intent(service, report)
+        self._commit_ledger_without_events(service)
+        service = self._service()
+        self.assertEqual(
+            service._store.get_asset_operation("w1", "op1")["state"],
+            "pending",
+        )
+        self.assertIsNone(service._store.get_asset("w1", "btc"))
+        self.assertEqual(service._store.list_asset_intents("w1"), [])
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual([e["type"] for e in events], ["chain_policy"])
+        status, body = service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 3
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(body, report)
+
+    def test_legal_prefix_rolls_back_keeping_prior_reports(self):
+        """已有低于门槛的前序报告，意图报告是唯一合法下一报（达门槛）：
+        回滚账本、删意图，前序报告事件原样保留。"""
+        service = self._setup_wallet()
+        service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 1
+        )
+        service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+        )
+        report = _report(confirmations=3)
+        self._write_report_intent(service, report)
+        self._commit_ledger_without_events(service)
+        before = AuditStore(self.tmpdir).list_events("w1")
+        self.assertEqual(
+            [e["type"] for e in before],
+            ["chain_policy", "chain_report", "chain_report"],
+        )
+        service = self._service()
+        # 账本回滚、意图删除
+        self.assertEqual(
+            service._store.get_asset_operation("w1", "op1")["state"],
+            "pending",
+        )
+        self.assertEqual(service._store.list_asset_intents("w1"), [])
+        # 前序报告事件保留、不新增事件、seq 无缺口
+        after = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in after],
+            ["chain_policy", "chain_report", "chain_report"],
+        )
+        self.assertEqual([e["seq"] for e in after], [1, 2, 3])
+        self.assertEqual(
+            [e["details"]["confirmations"] for e in after if e["type"] == "chain_report"],
+            [1, 2],
+        )
+        # 达门槛重放：在保留的前序报告后续上，完整提交一次（201）
+        status, _ = service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 3
+        )
+        self.assertEqual(status, 201)
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events],
+            [
+                "chain_policy",
+                "chain_report",
+                "chain_report",
+                "chain_report",
+                "asset_operation_committed",
+            ],
+        )
+        self.assertEqual([e["seq"] for e in events], [1, 2, 3, 4, 5])
+
+    def test_same_body_already_in_history_is_preserved(self):
+        """历史已含同体报告却无提交事件（孤立达门槛报告）：无法判定，
+        RecoveryError，账本/意图/事件全部原样保留。"""
+        service = self._setup_wallet()
+        report = _report(confirmations=3)
+        self._write_report_intent(service, report)
+        service._emit(
+            "w1",
+            service._audit_event(
+                "chain_report", request_id="op1", details=report
+            ),
+        )
+        with self.assertRaises(RecoveryError):
+            self._service()
+        store = WalletStore(self.tmpdir)
+        self.assertIsNotNone(store.get_asset_commit_intent("w1", "op1"))
+        events = AuditStore(self.tmpdir).list_events("w1")
+        self.assertEqual(
+            [e["type"] for e in events], ["chain_policy", "chain_report"]
+        )
+
+    def test_non_prefix_history_is_preserved(self):
+        """既有报告历史本身不是合法前缀（同块确认数下降的矛盾序列）：
+        RecoveryError，现场原样保留。"""
+        service = self._setup_wallet()
+        service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+        )
+        service._emit(
+            "w1",
+            service._audit_event(
+                "chain_report",
+                request_id="op1",
+                details=_report(confirmations=1),
+            ),
+        )
+        report = _report(confirmations=3)
+        self._write_report_intent(service, report)
+        with self.assertRaises(RecoveryError):
+            self._service()
+        self.assertIsNotNone(
+            WalletStore(self.tmpdir).get_asset_commit_intent("w1", "op1")
+        )
+
+    def test_intent_report_not_unique_next_is_preserved(self):
+        """合法前缀但意图报告无法作为唯一下一报续接（换 tx）：
+        RecoveryError，现场原样保留。"""
+        service = self._setup_wallet()
+        service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 1
+        )
+        report = _report(tx_id=TX2, confirmations=3)
+        self._write_report_intent(service, report)
+        self._commit_ledger_without_events(service)
+        with self.assertRaises(RecoveryError):
+            self._service()
+        store = WalletStore(self.tmpdir)
+        self.assertIsNotNone(store.get_asset_commit_intent("w1", "op1"))
+        # 半提交账本未被回滚：现场原样保留，绝不猜写
+        self.assertEqual(
+            store.get_asset_operation("w1", "op1")["state"], "committed"
+        )
+
+    def test_malformed_intent_is_preserved(self):
+        """损坏/畸形的链报告意图：RecoveryError 保留现场。"""
+        service = self._setup_wallet()
+        intent = {
+            "operation_id": "op1",
+            "asset_id": "btc",
+            "report": _report(confirmations=3),
+        }
+        service._store.write_asset_commit_intent("w1", "op1", intent)
+        with self.assertRaises(RecoveryError):
+            self._service()
+        self.assertIsNotNone(
+            WalletStore(self.tmpdir).get_asset_commit_intent("w1", "op1")
+        )
+
+    def test_malformed_report_in_intent_is_preserved(self):
+        """随附报告 B 形状畸形的链报告意图：RecoveryError 保留现场。"""
+        service = self._setup_wallet()
+        intent = {
+            "operation_id": "op1",
+            "asset_id": "btc",
+            "delta": 100,
+            "old_asset": None,
+            "pending": {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "state": "pending",
+                "delta": 100,
+                "balance": 0,
+                "version": 0,
+            },
+            "new_balance": 100,
+            "new_version": 1,
+            "report": {"tx_id": "not-hex"},
+        }
+        service._store.write_asset_commit_intent("w1", "op1", intent)
+        with self.assertRaises(RecoveryError):
+            self._service()
+        self.assertIsNotNone(
+            WalletStore(self.tmpdir).get_asset_commit_intent("w1", "op1")
+        )
+
+
+class ChainReportDirectCallErrorBoundaryTest(unittest.TestCase):
+    """post_chain_report 直接调用：损坏 JSON -> CorruptDataError，
+    I/O -> OSError，无法对账 -> RecoveryError；HTTP 统一 JSON 503。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _setup(self):
+        service = make_harness(self.tmpdir).service
+        service.create_wallet("w1", 2)
+        service.put_chain_policy("w1", "btc", "bitcoin", True, 3, 2)
+        service.create_asset_operation("w1", "op1", "btc", 100)
+        return service
+
+    def _report_kwargs(self, confirmations=1):
+        return dict(
+            wallet_id="w1",
+            operation_id="op1",
+            chain_id="bitcoin",
+            tx_id=TX,
+            block_height=100,
+            block_hash=HASH1,
+            confirmations=confirmations,
+        )
+
+    def test_corrupt_audit_json_raises_corrupt_data_error(self):
+        self._setup()
+        os.makedirs(os.path.join(self.tmpdir, "audit"), exist_ok=True)
+        with open(
+            os.path.join(self.tmpdir, "audit", "w1.json"), "w"
+        ) as f:
+            f.write("{broken")
+        service = WalletService(WalletStore(self.tmpdir), recover=False)
+        with self.assertRaises(CorruptDataError):
+            service.post_chain_report(**self._report_kwargs())
+
+    def test_corrupt_ledger_json_raises_corrupt_data_error(self):
+        self._setup()
+        with open(
+            os.path.join(self.tmpdir, "assets", "w1.json"), "w"
+        ) as f:
+            f.write("{broken")
+        service = WalletService(WalletStore(self.tmpdir), recover=False)
+        with self.assertRaises(CorruptDataError):
+            service.post_chain_report(**self._report_kwargs())
+
+    def test_io_error_propagates(self):
+        service = self._setup()
+        with mock.patch(
+            "threshold_wallet.audit._atomic_write_log",
+            side_effect=OSError("disk full"),
+        ):
+            with self.assertRaises(OSError):
+                service.post_chain_report(**self._report_kwargs(3))
+
+    def test_unreconcilable_scene_raises_recovery_error(self):
+        service = self._setup()
+        # 孤立达门槛报告（无提交事件）：无法对账
+        service._emit(
+            "w1",
+            service._audit_event(
+                "chain_report",
+                request_id="op1",
+                details=_report(confirmations=3),
+            ),
+        )
+        with self.assertRaises(RecoveryError):
+            service.post_chain_report(**self._report_kwargs(3))
+
+    def test_corrupt_audit_json_is_503_then_recovers(self):
+        with http_server(self.tmpdir) as srv:
+            srv.request(
+                "POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2}
+            )
+            srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)
+            srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            os.makedirs(os.path.join(self.tmpdir, "audit"), exist_ok=True)
+            with open(
+                os.path.join(self.tmpdir, "audit", "w1.json"), "w"
+            ) as f:
+                f.write("{broken")
+            status, body = srv.request(
+                "POST", "/v1/wallets/w1/chain/op1/report", _report()
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(
+                body, {"error": "service temporarily unavailable"}
+            )
+            # 移除损坏日志后重新配置策略，现场恢复并可正常报告
+            os.unlink(os.path.join(self.tmpdir, "audit", "w1.json"))
+            self.assertEqual(
+                srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)[0],
+                200,
+            )
+            status, _ = srv.request(
+                "POST", "/v1/wallets/w1/chain/op1/report", _report()
+            )
+            self.assertEqual(status, 201)
+
+    def test_corrupt_ledger_json_is_503(self):
+        with http_server(self.tmpdir) as srv:
+            srv.request(
+                "POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2}
+            )
+            srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)
+            srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            with open(
+                os.path.join(self.tmpdir, "assets", "w1.json"), "w"
+            ) as f:
+                f.write("{broken")
+            status, body = srv.request(
+                "POST", "/v1/wallets/w1/chain/op1/report", _report()
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(
+                body, {"error": "service temporarily unavailable"}
+            )
+
+    def test_io_error_is_503_over_http(self):
+        with http_server(self.tmpdir) as srv:
+            srv.request(
+                "POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2}
+            )
+            srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)
+            srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            with mock.patch(
+                "threshold_wallet.audit._atomic_write_log",
+                side_effect=OSError("disk full"),
+            ):
+                status, body = srv.request(
+                    "POST",
+                    "/v1/wallets/w1/chain/op1/report",
+                    _report(confirmations=3),
+                )
+                self.assertEqual(status, 503)
+                self.assertEqual(
+                    body, {"error": "service temporarily unavailable"}
+                )
+
+    def test_restart_refuses_to_serve_on_preserved_scene(self):
+        service = self._setup()
+        report = _report(confirmations=3)
+        intent = {
+            "operation_id": "op1",
+            "asset_id": "btc",
+            "delta": 100,
+            "old_asset": None,
+            "pending": {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "state": "pending",
+                "delta": 100,
+                "balance": 0,
+                "version": 0,
+            },
+            "new_balance": 100,
+            "new_version": 1,
+            "report": report,
+        }
+        service._store.write_asset_commit_intent("w1", "op1", intent)
+        service._emit(
+            "w1",
+            service._audit_event(
+                "chain_report", request_id="op1", details=report
+            ),
+        )
+        before = AuditStore(self.tmpdir).list_events("w1")
+        # 重启阻止就绪
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.tmpdir))
+        # 现场原样保留：意图未删、事件不增不改、seq 无缺口
+        self.assertIsNotNone(
+            WalletStore(self.tmpdir).get_asset_commit_intent("w1", "op1")
+        )
+        after = AuditStore(self.tmpdir).list_events("w1")
+        self.assertEqual(
+            [e["seq"] for e in after], [e["seq"] for e in before]
+        )
+        self.assertEqual(len(after), len(before))
+
+    def test_live_locked_access_503_without_new_events(self):
+        """常驻服务运行中他进程摆出同体报告 + 链报告意图（无提交事件）：
+        持锁访问 503，不增事件、无 seq 缺口，现场保留。"""
+        with http_server(self.tmpdir) as srv:
+            srv.request(
+                "POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2}
+            )
+            srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)
+            srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            svc = srv.harness.service
+            report = _report(confirmations=3)
+            intent = {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "delta": 100,
+                "old_asset": None,
+                "pending": {
+                    "operation_id": "op1",
+                    "asset_id": "btc",
+                    "state": "pending",
+                    "delta": 100,
+                    "balance": 0,
+                    "version": 0,
+                },
+                "new_balance": 100,
+                "new_version": 1,
+                "report": report,
+            }
+            svc._store.write_asset_commit_intent("w1", "op1", intent)
+            svc._emit(
+                "w1",
+                svc._audit_event(
+                    "chain_report", request_id="op1", details=report
+                ),
+            )
+            status, body = srv.request(
+                "POST", "/v1/wallets/w1/chain/op1/report", report
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(
+                body, {"error": "service temporarily unavailable"}
+            )
+            # 意图与报告事件都原样保留，不新增事件、无 seq 缺口
+            self.assertIsNotNone(
+                svc._store.get_asset_commit_intent("w1", "op1")
+            )
+            events = AuditStore(self.tmpdir).list_events("w1")
+            self.assertEqual(
+                [e["type"] for e in events],
+                ["chain_policy", "chain_report"],
+            )
+            self.assertEqual([e["seq"] for e in events], [1, 2])
+
+
 class ChainDrBackupTest(unittest.TestCase):
     """灾备 backup/restore：策略、报告与提交现场收敛，不新增审计事件。"""
-
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
