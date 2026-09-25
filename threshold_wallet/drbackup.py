@@ -644,6 +644,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "asset_operation_committed",
         "transaction_policy_updated",
         "session_event",
+        "session_participant_replaced",
     )
 )
 
@@ -867,9 +868,75 @@ def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) 
             raise BackupError(503, "share public keys do not form wallet public_key")
         pubs.append(pub)
     if share_files != expected_share_files:
-        raise BackupError(503, "share directory does not match the in-use share set")
+        # 会话参与者替换份额（<replacement_id>-share）：必须被包内审计
+        # 中已提交的 session_participant_replaced 事件引用，且逐份密码学
+        # 自洽；每个已提交替换的新份额也必须在包内。否则 503。
+        replacement_ids = _committed_replacement_share_ids(files, wallet_id)
+        for rel in sorted(share_files - expected_share_files):
+            share_id = rel[len(share_dir_prefix):-len(".json")]
+            if share_id not in replacement_ids:
+                raise BackupError(
+                    503, "share directory does not match the in-use share set"
+                )
+            record = _load_json_object(files[rel], "share file")
+            priv_hex = record.get("private_key")
+            rec_pub_hex = record.get("public_key")
+            if set(record) != _SHARE_RECORD_KEYS or (
+                record.get("share_id") != share_id
+                or not isinstance(priv_hex, str)
+                or not isinstance(rec_pub_hex, str)
+            ):
+                raise BackupError(503, "replacement share record is malformed")
+            try:
+                priv = bytes.fromhex(priv_hex)
+                pub = bytes.fromhex(rec_pub_hex)
+            except ValueError:
+                raise BackupError(503, "replacement share key is not hex")
+            if len(priv) != 32 or len(pub) != 32:
+                raise BackupError(503, "replacement share key has a bad length")
+            try:
+                if crypto.public_key_from_private(priv) != pub:
+                    raise BackupError(
+                        503, "replacement share private/public key mismatch"
+                    )
+            except (ValueError, TypeError):
+                raise BackupError(503, "replacement share private key is invalid")
+        for share_id in replacement_ids:
+            if f"{share_dir_prefix}{share_id}.json" not in share_files:
+                raise BackupError(
+                    503, "snapshot is missing a committed replacement share"
+                )
     if b"".join(pubs) != wallet_pub:
         raise BackupError(503, "wallet public_key does not match its shares")
+
+
+def _committed_replacement_share_ids(
+    files: dict[str, bytes], wallet_id: str
+) -> set:
+    """从包内审计日志收集已提交 session_participant_replaced 事件的
+    new_share_id 集合（无审计文件/无事件为空集）。
+
+    事件形状本身由 _verify_audit_contract 与线上恢复器严格校验；这里
+    只做份额文件 ↔ 提交事件的集合对账。"""
+    rel = f"audit/{wallet_id}.json"
+    if rel not in files:
+        return set()
+    log = _load_json_object(files[rel], "audit file")
+    events = log.get("events")
+    if not isinstance(events, list):
+        return set()
+    result = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "session_participant_replaced":
+            continue
+        details = event.get("details")
+        if isinstance(details, dict) and isinstance(
+            details.get("new_share_id"), str
+        ):
+            result.add(details["new_share_id"])
+    return result
 
 
 def _verify_historical_signatures(

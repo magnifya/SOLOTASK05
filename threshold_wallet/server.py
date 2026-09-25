@@ -21,6 +21,7 @@
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
+- POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/replace  替换会话单个参与方份额
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -232,6 +233,22 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         rest[1],
                         body.get("share_id"),
                         body.get("signature"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 4
+                    and rest[0] == "sign-sessions"
+                    and rest[2] == "participants"
+                    and rest[3] == "replace"
+                ):
+                    body = self._read_json_body()
+                    status, result = service.replace_sign_session_participant(
+                        wallet_id,
+                        rest[1],
+                        body.get("replacement_id"),
+                        body.get("offline_share_id"),
                     )
                     self._send_json(status, result)
                     return

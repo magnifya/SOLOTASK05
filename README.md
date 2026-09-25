@@ -54,6 +54,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
+| POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/replace` | 替换会话单个参与方份额 `{"replacement_id","offline_share_id"}` |
 
 ID（wallet/rotation/operation/asset/session 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -127,6 +128,36 @@ JSON 对象。
   `expired`/`signed`；重放不产生事件，details 只含标识/状态/整数/原文，
   绝不含签名或私钥。
 
+### 会话单节点参与者替换
+
+`POST /v1/wallets/{id}/sign-sessions/{sid}/participants/replace`，请求体
+仅 `{"replacement_id","offline_share_id"}`：把会话 `sid` 的单个参与方
+份额（`offline_share_id`）下线，生成新份额 `<replacement_id>-share`
+顶替原槽位。既有接口与 CLI 不变。
+
+- 两个 ID 均须匹配安全标识，非法 `400`；钱包/会话未知 `404`；会话非
+  `collecting|ready`（含到点懒过期）、或 `offline_share_id` 不是该会话
+  当前在用份额，`409`。
+- 首次替换 `201`；同 `replacement_id` 同参重放 `200` 同体、异参
+  `409`；`replacement_id` 被其他会话占用 `409`；已提交的重放优先于
+  状态判定。响应为既有会话视图。
+- 迁移在每钱包跨进程事务锁内原子完成：新份额替换 `share_ids` 中的原
+  槽位、移除旧份额已投递的签名、保留另一份（份数不足两份回到
+  `collecting`）。此后旧份额投递 `400`，新份额沿用 Ed25519 校验与
+  既有审批/hot-cold 门控。
+- 新份额私钥只写 `shares/<id>/<replacement_id>-share.json`（恰含
+  `private_key`/`public_key`/`share_id` 三键，两个 hex 值均为 64 位
+  小写，UTF-8 无 BOM、`sort_keys`、2 空格缩进、末尾换行，临时文件 +
+  原子替换）；任何文件至多含一个份额私钥。
+- 审计事件 `session_participant_replaced`（`request_id` 为会话 id，
+  `actor_id`/`reason` 为 `null`，details 恰含
+  `session_id,old_share_id,new_share_id`）是唯一提交点：事件落盘前
+  崩溃回滚并删除新份额文件，落盘后前滚迁移会话记录；损坏/矛盾现场
+  保留并 `503`。跨进程并发只有一个 `201`，审计 seq 连续不重号；
+  响应、日志与非份额文件绝不泄露份额私钥。
+- 替换后该会话快照与钱包轮换解耦：其后的份额轮换不再迁移该会话；
+  未替换的会话行为不变。
+
 ### 份额轮换
 
 - `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
@@ -176,7 +207,8 @@ JSON 对象。
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
-`transaction_policy_updated`、`session_event`。
+`transaction_policy_updated`、`session_event`、
+`session_participant_replaced`。
 
 ## 多进程与故障恢复（保证）
 
@@ -314,7 +346,9 @@ python -m threshold_wallet.cli restore --data-dir ./data2 \
 - **响应**：建钱包只返回 `share_ids` 与公钥，任何接口都不返回私钥。
 - **磁盘**：钱包元数据与账本/策略/会话/审批单等业务文件不含任何私钥；
   两个份额私钥分文件存放（`shares/<id>/<share_id>.json`），轮换准备期
-  新份额私钥分文件暂存于 `rotation-staging/<id>/<rid>/`，任何文件至多
+  新份额私钥分文件暂存于 `rotation-staging/<id>/<rid>/`，会话参与者
+  替换的新份额私钥分文件存放于
+  `shares/<id>/<replacement_id>-share.json`，任何文件至多
   含一个份额私钥，从不存在两者拼接的完整私钥。写入一律临时文件 + 原子
   替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录

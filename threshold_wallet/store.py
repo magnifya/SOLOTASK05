@@ -71,6 +71,17 @@ def _check_share_id(value: str) -> None:
         raise ValueError(f"invalid share_id: {value!r}")
 
 
+def _is_replacement_share_id(value: object) -> bool:
+    """会话参与者替换份额的 id 形态：``<replacement_id>-share``。
+
+    钱包/轮换份额（share-1、share-2、<rotation_id>-share-N）从不以
+    ``-share`` 结尾，故 shares/<wallet_id>/ 下以 ``-share`` 结尾的正式
+    份额文件只会来自会话参与者替换；轮换现场对账对它们豁免（其有无与
+    自洽性由签名会话恢复按 session_participant_replaced 事件对账）。
+    """
+    return isinstance(value, str) and value.endswith("-share")
+
+
 def _is_plain_int(value: object) -> bool:
     """真·整数：bool 是 int 子类，必须排除（余额/版本/delta 均不接受布尔）。"""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -1877,12 +1888,15 @@ class WalletStore:
             self.save_wallet_meta(wallet_id, new_meta)
 
         # 链顶份额逐份落盘；shares/ 目录最终只能剩链顶两份（清掉创世及
-        # 历史各轮残留，也清掉崩溃窗口换入到一半的杂份）。
+        # 历史各轮残留，也清掉崩溃窗口换入到一半的杂份）。会话参与者替换
+        # 份额（*-share）不属于轮换现场，由签名会话恢复对账，这里豁免。
         for share_record in tail_share_records:
             self.save_share(wallet_id, share_record)
         tail_set = set(tail_share_ids)
         for share_id in self.list_share_files(wallet_id):
-            if share_id not in tail_set:
+            if share_id not in tail_set and not _is_replacement_share_id(
+                share_id
+            ):
                 self.delete_share(wallet_id, share_id)
 
         # 已提交各轮的暂存私钥/备份残留全部清干净（历史轮一般已无目录）。
@@ -1990,8 +2004,15 @@ class WalletStore:
             ]
             if ids != tail_ids:
                 return False
-            # shares/ 目录只能有链顶两份，且逐份与链顶公钥密码学一致
-            if set(self.list_share_files(wallet_id)) != set(tail_ids):
+            # shares/ 目录只能有链顶两份，且逐份与链顶公钥密码学一致；
+            # 会话参与者替换份额（*-share）由签名会话恢复对账，这里豁免。
+            on_disk_shares = set(self.list_share_files(wallet_id))
+            if not set(tail_ids) <= on_disk_shares:
+                return False
+            if any(
+                not _is_replacement_share_id(sid)
+                for sid in on_disk_shares - set(tail_ids)
+            ):
                 return False
             halves = (
                 bytes.fromhex(tail_pub)[:32],
