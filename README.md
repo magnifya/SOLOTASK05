@@ -41,6 +41,8 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
 | PUT  | `/v1/wallets/{id}/dkg-failover-policy` | DKG 故障审批开关 `{"enabled":bool}` |
 | GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批开关（缺省 `{"enabled":false}`） |
+| PUT  | `/v1/wallets/{id}/nodes` | 设置 DKG 节点健康表 `{"nodes":{...}}` |
+| GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
@@ -249,21 +251,67 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   hex（换入方公钥贡献），`node` 须为当前轮在用节点、`replacement`
   须空闲；新轮中 `replacement` 顶替 `node` 的槽位，`committed`/
   `shared` 两数组清空，回到 `commit` 阶段。非法 `400`、冲突 `409`。
+  另支持 `replacement`/`key` 双 `null` 的**自动替补**（见下文
+  「DKG 节点健康与自动替补」）；一项 `null` 另一项非 `null` 为 `400`。
 - 首提 `201`；已提交轮次的旧五键同参重放 `200`（**优先于状态与审批
   判定，不复查审批单**）；同 `round` 异参 `409`；`round` 不等于
-  当前轮 +1 `409`；钱包/会话未知 `404`。
+  当前轮 +1 `409`；钱包/会话未知 `404`。自动替补（双 `null`）的重放
+  规则见下文「DKG 节点健康与自动替补」。
 - 无任何故障轮次时，`/v1/dkg/{id}/{did}` 无需参照轮次（行为与旧版
   一致）；存在故障轮次后必须带 `?round=R` 当前轮：缺参 `409`、旧轮
   `409`、未知轮 `404`、非法 R `400`；GET 成功 `200`，POST 体仍为旧
   五键。`aborted` 轮一律 `409`；派生轮不接受 `register`（`409`），
   `commit`/`share` 沿用旧约。
 - 故障轮次仅由 `dkg_failover` 审计事件持久化（`request_id` 为
-  `<会话id>/<轮次>`，`actor_id`/`reason` 为 `null`，details 依次
-  `id,round,action,node,replacement,key,state`，**不含审批标识**）：
+  `<会话id>/<轮次>`，`actor_id`/`reason` 为 `null`，手工/旧事件
+  details 依次 `id,round,action,node,replacement,key,state`；自动替补
+  事件为既有七键加末键 `mode`（`mode=auto`），**不含审批标识**）：
   首提在每钱包跨进程事务锁内追加，事件为唯一提交点，跨进程并发只有
   一个 `201`，重放不记。矛盾/损坏现场 fail-closed（常驻 `503`、
   `serve` 拒绝就绪），重启/灾备恢复后轮次与 seq 不变。响应、日志、
   非份额文件绝不含私钥或份额正文。
+
+### DKG 节点健康与自动替补（可选）
+
+`PUT /v1/wallets/{id}/nodes` 设置 DKG 节点健康表，请求体与成功响应
+（`200`）同为 `Q={"nodes": {节点ID: {"key","state"}, ...}}`：
+
+- `nodes` 必须**非空**；键为安全标识，服务端归一为按节点 ID **升序**
+  返回/落盘；每个值恰含 `key`、`state` 两键且键序固定为
+  `key,state`：`key` 为 64 位小写 hex（该节点公钥贡献），`state` 为
+  `up|down|ban`。任何形状/取值非法一律 `400`。
+- `GET` 已配置 `200` 返回 Q，**从未配置 `404`**；钱包不存在时 GET/PUT
+  一律 `404`；`PUT` 可首建。健康表仅由 `node_state` 审计事件持久化
+  （`request_id`/`actor_id`/`reason` 为 `null`，details 即 Q，取最后
+  一条恢复），不写状态文件。**同值不记事件**；仅当与当前表不同才追加
+  一条 `node_state`。事件损坏/形状矛盾 fail-closed（常驻 `503`、
+  `serve` 拒绝就绪），重启/灾备恢复后健康表与 seq 不变。
+
+`POST /v1/dkg/{id}/{did}/failover` 的 `replace` 支持**自动替补**：
+
+- 请求里 `replacement` 与 `key` **双 `null`** 即请求自动选择（恰好
+  一项为 `null`、另一项非 `null` 一律 `400`）。
+- 首提前置：DKG 故障审批开关必须**关闭**（开启时 `409`，自动替补不
+  走审批单）；当前轮为两方已注册的 `commit|share`；`node` 为当前轮
+  在用节点且在当前健康表中为 `down|ban`。取健康表中**首个 `up` 的非
+  参与节点**（按节点 ID 升序）及其 `key` 实写换入；健康表缺失、
+  `node` 未故障或没有候选一律 `409`，不落事件、DKG 现场不变。
+- 首提 `201`，跨进程并发同一轮只有一个 `201`。该 `dkg_failover`
+  事件 details 为既有七键加末键 `mode`（`mode="auto"`），其中
+  `replacement`/`key` 写**实选值**而非 `null`；手工/旧事件保持旧七键，
+  恢复只对手工事件按手工语义核验。
+- **自动重放**：同 `round`/`action`/`node` 的双 `null` 请求优先返回
+  `200` 当前轮视图，**不复查**审批开关、审批单、健康表、候选与阶段
+  （审批事后开启、健康事后翻转都不影响幂等重放）；与已提交自动替补的
+  `node` 不符等其余情况一律 `409`。
+- 重启/灾备恢复时，每条自动替补事件都以其**提交之前最近的
+  `node_state` 快照**重新核验选择：`node` 当时 `down|ban`、被选替补
+  当时为首个 `up` 的非参与节点、记录的 `replacement`/`key` 与快照
+  一致。事前无快照、无候选或任何矛盾都 fail-closed（抛
+  `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件
+  I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。
+  恢复本身不新增审计事件，响应、日志、非份额文件绝不泄露份额私钥或
+  份额正文。
 
 ### DKG 故障审批（可选）
 
@@ -437,7 +485,7 @@ quorum 后按既有 commit 契约自动提交。
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
-`dkg_failover`、`dkg_failover_policy_updated`、`chain_policy`、
+`dkg_failover`、`dkg_failover_policy_updated`、`node_state`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`。
 
 ## 多进程与故障恢复（保证）

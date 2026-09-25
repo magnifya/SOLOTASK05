@@ -61,6 +61,8 @@ TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
 TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
+#: DKG 节点健康表整体快照（details 即 Q={节点: {key, state}}）
+TYPE_NODE_STATE = "node_state"
 TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
 TYPE_CHAIN_ARBITRATION = "chain_arbitration"
@@ -99,14 +101,34 @@ _DETAILS_KEY_ORDER = {
         "peer",
         "state",
     ),
+    # node_state 的 details 恰为 Q={"nodes": {...}}：顶层仅 nodes 一键，
+    # 嵌套的节点表由 service 统一归一（节点 ID 升序，每值键序 key,state），
+    # 故这里只固定顶层键序、保留构造好的嵌套顺序。
+    TYPE_NODE_STATE: (
+        "nodes",
+    ),
     TYPE_DKG_FAILOVER: (
-        "id",
-        "round",
-        "action",
-        "node",
-        "replacement",
-        "key",
-        "state",
+        # 手工/旧事件为既有七键；auto 替补事件为既有七键加末键 mode
+        # （mode="auto"），两种语义共用同一事件类型，按精确键集区分。
+        (
+            "id",
+            "round",
+            "action",
+            "node",
+            "replacement",
+            "key",
+            "state",
+        ),
+        (
+            "id",
+            "round",
+            "action",
+            "node",
+            "replacement",
+            "key",
+            "state",
+            "mode",
+        ),
     ),
     TYPE_CHAIN_POLICY: (
         "chain_id",
