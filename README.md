@@ -58,6 +58,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
 | POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
 | GET  | `/v1/dkg/{id}/{did}` | 查询两方 DKG 会话视图 |
+| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}` |
 
 ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -213,16 +214,44 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   （未齐两份注册即 commit、未齐两份承诺即 share）、第三节点一律
   `409`；钱包不存在 `404`，非 register 的未知会话 `404`。
 - GET/POST 响应体键序固定为
-  `{id,state,nodes,committed,shared,public_key}`，`state` 为
-  `register|commit|share|done`，`nodes`/`committed`/`shared` 三数组
-  均按注册序；完成（done）时 `public_key` 为两份注册 key 按注册序
-  拼接，否则为 `null`。
-- 状态仅由七字段 `dkg_stage` 审计事件持久化（`request_id` 为会话
-  id，`actor_id`/`reason` 为 `null`，details 依次
-  `id,op,node,key,hash,peer,state`，未用值 `null`）：首提在每钱包
-  跨进程事务锁内追加，事件为唯一提交点，重放不记。矛盾/损坏现场
-  fail-closed（常驻 `503`、`serve` 拒绝就绪），灾备恢复后视图与
-  seq 不变。响应、日志与非份额文件绝不含私钥或份额正文。
+  `{id,round,state,nodes,committed,shared,public_key}`，`round` 为当前
+  轮次（基线轮为 1），`state` 为 `register|commit|share|done|aborted`，
+  `nodes`/`committed`/`shared` 三数组均按注册序；完成（done）时
+  `public_key` 为两份注册 key 按注册序拼接，非 done 为 `null`。
+- 状态仅由七字段 `dkg_stage` 审计事件持久化（基线轮 `request_id` 为
+  会话 id，派生轮为 `<会话id>/<轮次>`；`actor_id`/`reason` 为 `null`，
+  details 依次 `id,op,node,key,hash,peer,state`，未用值 `null`）：
+  首提在每钱包跨进程事务锁内追加，事件为唯一提交点，重放不记。
+  矛盾/损坏现场 fail-closed（常驻 `503`、`serve` 拒绝就绪），灾备恢复
+  后视图与 seq 不变。响应、日志与非份额文件绝不含私钥或份额正文。
+
+### DKG 故障轮次
+
+`POST /v1/dkg/{id}/{did}/failover`（仅 POST），请求体恰含
+`{"round","action","node","replacement","key"}` 五键（含其他键或缺键
+一律 `400`）：当某方节点故障时，从当前轮派生下一轮（`round` 必须恰为
+当前轮 +1）——首轮故障基于基线轮（第 1 轮），后续故障基于当前轮。
+`node`/`replacement` 为安全标识。
+
+- `abort`：仅限非终态轮（非 `done`/`aborted`），`node`/`replacement`/
+  `key` 必须全为 `null`；派生轮 `state` 为 `aborted`，三数组为空。
+- `replace`：仅限两方已注册的 `commit|share` 轮；`key` 为 64 位小写
+  hex（换入方公钥贡献），`node` 须为当前轮在用节点、`replacement`
+  须空闲；新轮中 `replacement` 顶替 `node` 的槽位，`committed`/
+  `shared` 两数组清空，回到 `commit` 阶段。非法 `400`、冲突 `409`。
+- 首提 `201`；同参重放 `200`（优先于状态判定）；同 `round` 异参
+  `409`；`round` 不等于当前轮 +1 `409`；钱包/会话未知 `404`。
+- 无任何故障轮次时，`/v1/dkg/{id}/{did}` 无需参照轮次（行为与旧版
+  一致）；存在故障轮次后必须带 `?round=R` 当前轮：缺参 `409`、旧轮
+  `409`、未知轮 `404`、非法 R `400`；GET 成功 `200`，POST 体仍为旧
+  五键。`aborted` 轮一律 `409`；派生轮不接受 `register`（`409`），
+  `commit`/`share` 沿用旧约。
+- 故障轮次仅由 `dkg_failover` 审计事件持久化（`request_id` 为
+  `<会话id>/<轮次>`，`actor_id`/`reason` 为 `null`，details 依次
+  `id,round,action,node,replacement,key,state`）：首提在每钱包跨进程
+  事务锁内追加，事件为唯一提交点，跨进程并发只有一个 `201`，重放
+  不记。矛盾/损坏现场 fail-closed（常驻 `503`、`serve` 拒绝就绪），
+  重启/灾备恢复后轮次与 seq 不变。
 
 ### 份额轮换
 
@@ -274,7 +303,8 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
-`session_participant_replaced`、`session_takeover`、`dkg_stage`。
+`session_participant_replaced`、`session_takeover`、`dkg_stage`、
+`dkg_failover`。
 
 ## 多进程与故障恢复（保证）
 

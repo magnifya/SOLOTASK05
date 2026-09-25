@@ -59,6 +59,7 @@ TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
 TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
+TYPE_DKG_FAILOVER = "dkg_failover"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -91,6 +92,15 @@ _DETAILS_KEY_ORDER = {
         "key",
         "hash",
         "peer",
+        "state",
+    ),
+    TYPE_DKG_FAILOVER: (
+        "id",
+        "round",
+        "action",
+        "node",
+        "replacement",
+        "key",
         "state",
     ),
 }
@@ -423,6 +433,17 @@ class AuditStore:
         崩溃恢复据此重建各会话的 register/commit/share 推进序列。
         纯只读，不分配 seq。"""
         return self._events_grouped_by_request(wallet_id, TYPE_DKG_STAGE)
+
+    def dkg_failover_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 dkg_failover 事件，按 request_id（``<会话id>/<轮次>``）
+        分组，组内按 seq 升序。
+
+        DKG 故障轮次仅由这些事件持久化（事件是唯一提交点）：在线处理与
+        崩溃恢复据此重建各会话的轮次链（abort/replace 派生序列）。
+        纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(wallet_id, TYPE_DKG_FAILOVER)
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射

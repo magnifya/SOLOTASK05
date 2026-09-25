@@ -2,7 +2,7 @@
 
 覆盖：
 - 双方依序推进 register→commit→share→done，完成公钥为两 key 注册序拼接；
-- 视图键序 {id,state,nodes,committed,shared,public_key}，三数组按注册序；
+- 视图键序 {id,round,state,nodes,committed,shared,public_key}，三数组按注册序；
 - 首提 201、同值重放 200 优先、非法 400、异值/错阶段/第三节点 409、
   钱包或非 register 未知流程 404；
 - 状态仅由 dkg_stage 事件持久化：重启后续作、恢复不新增事件、矛盾
@@ -100,8 +100,10 @@ class DkgServiceTest(unittest.TestCase):
         view = self.svc.get_dkg_session("w1", "d1")
         self.assertEqual(
             list(view),
-            ["id", "state", "nodes", "committed", "shared", "public_key"],
+            ["id", "round", "state", "nodes", "committed", "shared",
+             "public_key"],
         )
+        self.assertEqual(view["round"], 1)
 
     def test_intermediate_states(self):
         code, view = self._post("d1", "register", "n1", key=KEY_A)
@@ -485,7 +487,7 @@ class DkgHttpTest(unittest.TestCase):
             self.assertEqual(view["public_key"], KEY_A + KEY_B)
             self.assertEqual(
                 list(view),
-                ["id", "state", "nodes", "committed", "shared",
+                ["id", "round", "state", "nodes", "committed", "shared",
                  "public_key"],
             )
             # 未知会话/钱包 404；未知路径 404

@@ -647,6 +647,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "session_participant_replaced",
         "session_takeover",
         "dkg_stage",
+        "dkg_failover",
     )
 )
 
