@@ -61,6 +61,8 @@ TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
 TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
+TYPE_CHAIN_POLICY = "chain_policy"
+TYPE_CHAIN_REPORT = "chain_report"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -103,6 +105,19 @@ _DETAILS_KEY_ORDER = {
         "replacement",
         "key",
         "state",
+    ),
+    TYPE_CHAIN_POLICY: (
+        "chain_id",
+        "enabled",
+        "required_confirmations",
+        "reorg_window",
+    ),
+    TYPE_CHAIN_REPORT: (
+        "chain_id",
+        "tx_id",
+        "block_height",
+        "block_hash",
+        "confirmations",
     ),
 }
 
@@ -322,6 +337,35 @@ class AuditStore:
             data["next_seq"] = next_seq + 1
             _atomic_write_log(path, data)
             return stamped
+
+    def append_events(self, wallet_id: str, events: list[dict]) -> list[dict]:
+        """原子追加**多条**事件，按列表顺序分配连续 seq，一次原子落盘。
+
+        跨链报告达确认门槛时，chain_report 与其触发的唯一
+        asset_operation_committed 必须是审计日志中紧邻、连续的两条事件：
+        本方法在同一把 AuditStore 锁内一次读取—追加—原子写，使两条事件
+        不可能被他者插队，崩溃恢复时要么两条都在、要么都不在，绝不留下
+        "报告在、提交不在"的半状态。返回含 seq/at 的记录列表。"""
+        if not events:
+            return []
+        path = self._path(wallet_id)
+        with self._lock:
+            data = self._read_strict(wallet_id)
+            if data is None:
+                data = {"wallet_id": wallet_id, "next_seq": 1, "events": []}
+            log_events = data["events"]
+            next_seq = len(log_events) + 1
+            stamped_all: list[dict] = []
+            for event in events:
+                stamped = dict(event)
+                stamped["seq"] = next_seq
+                _order_event_details(stamped)
+                log_events.append(stamped)
+                stamped_all.append(stamped)
+                next_seq += 1
+            data["next_seq"] = next_seq
+            _atomic_write_log(path, data)
+            return stamped_all
 
     def find_event_by_request(
         self,

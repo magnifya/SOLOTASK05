@@ -28,6 +28,9 @@
 - POST /v1/dkg/<wallet_id>/<dkg_id>                           推进两方 DKG 一个阶段
 - GET  /v1/dkg/<wallet_id>/<dkg_id>                           查询两方 DKG 会话视图
 - POST /v1/dkg/<wallet_id>/<dkg_id>/failover                  提交 DKG 故障轮次
+- PUT  /v1/wallets/<wallet_id>/chain/<chain_id>              设置跨链确认策略
+- GET  /v1/wallets/<wallet_id>/chain/<chain_id>              查询跨链确认策略
+- POST /v1/wallets/<wallet_id>/chain/<operation_id>/report   上报链上交易确认进度
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -158,6 +161,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if len(rest) == 2 and rest[0] == "sign-sessions":
                     self._send_json(
                         200, service.get_sign_session(wallet_id, rest[1])
+                    )
+                    return
+                if len(rest) == 2 and rest[0] == "chain":
+                    self._send_json(
+                        200, service.get_chain_policy(wallet_id, rest[1])
                     )
                     return
                 if rest == ["audit-events"]:
@@ -402,6 +410,37 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
                 if (
                     len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "report"
+                ):
+                    body = self._read_json_body()
+                    # 请求体恰含 B 五键（多/缺一律 400）
+                    if set(body) != {
+                        "chain_id",
+                        "tx_id",
+                        "block_height",
+                        "block_hash",
+                        "confirmations",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly chain_id, tx_id, "
+                            "block_height, block_hash and confirmations",
+                        )
+                    status, result = service.post_chain_report(
+                        wallet_id,
+                        rest[1],
+                        body.get("chain_id"),
+                        body.get("tx_id"),
+                        body.get("block_height"),
+                        body.get("block_hash"),
+                        body.get("confirmations"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
                     and rest[0] == "share-rotations"
                     and rest[2] == "activate"
                 ):
@@ -472,6 +511,30 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             )
                         result = service.put_dkg_failover_policy(
                             wallet_id, body.get("enabled")
+                        )
+                        self._send_json(200, result)
+                        return
+                    if len(rest) == 2 and rest[0] == "chain":
+                        body = self._read_json_body()
+                        # PUT 体恰含 Q 四键（多/缺一律 400）
+                        if set(body) != {
+                            "chain_id",
+                            "enabled",
+                            "required_confirmations",
+                            "reorg_window",
+                        }:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly chain_id, enabled, "
+                                "required_confirmations and reorg_window",
+                            )
+                        result = service.put_chain_policy(
+                            wallet_id,
+                            rest[1],
+                            body.get("chain_id"),
+                            body.get("enabled"),
+                            body.get("required_confirmations"),
+                            body.get("reorg_window"),
                         )
                         self._send_json(200, result)
                         return

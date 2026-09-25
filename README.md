@@ -61,6 +61,9 @@ python -m unittest discover -s tests -v
 | POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
 | GET  | `/v1/dkg/{id}/{did}` | 查询两方 DKG 会话视图 |
 | POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}`（启用故障审批时另加 `approval_request_id`） |
+| PUT  | `/v1/wallets/{id}/chain/{chain_id}` | 跨链确认策略 `{"chain_id","enabled","required_confirmations","reorg_window"}` |
+| GET  | `/v1/wallets/{id}/chain/{chain_id}` | 查询跨链确认策略（未配置 404） |
+| POST | `/v1/wallets/{id}/chain/{operation_id}/report` | 上报链上交易确认进度 `{"chain_id","tx_id","block_height","block_hash","confirmations"}` |
 
 ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -326,6 +329,55 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 - 审计事件 `asset_operation_committed`（details 即 committed 视图 R，
   仅首次提交记一次）与 `transaction_policy_updated`。
 
+### 跨链资产确认（可选）
+
+为某条链设置确认策略后，该链上的资产操作可按链上确认数自动提交。
+
+`PUT /v1/wallets/{id}/chain/{A}`，请求体/成功响应（`200`）同为
+`Q={"chain_id","enabled","required_confirmations","reorg_window"}`：
+路径 `{A}` 与体 `chain_id` 必须逐字一致（均为安全标识）；`enabled` 必须
+为布尔；`required_confirmations` 为非布尔正整数；`reorg_window` 为非布尔
+非负整数。`GET /v1/wallets/{id}/chain/{A}` 已配置 `200` 同体、**从未配置
+`404`**。策略仅由 `chain_policy` 审计事件持久化
+（`request_id=A`、`actor_id`/`reason` 为 `null`、details 恰为 Q），取最后
+一条恢复，**同值 PUT 也记事件**，不写策略状态文件。钱包不存在 `404`；
+键集不符（多/缺键）或值非法 `400`。
+
+`POST /v1/wallets/{id}/chain/{O}/report`，请求体恰含
+`B={"chain_id","tx_id","block_height","block_hash","confirmations"}`
+（多/缺键 `400`）：`chain_id` 为安全标识，`tx_id`/`block_hash` 为 64 位
+小写 hex，`block_height`/`confirmations` 为非布尔非负整数（布尔冒整
+`400`）。操作 `{O}` 必须是该钱包既有资产操作，否则 `404`；其 `chain_id`
+对应策略必须已配置且 `enabled=true`，否则 `409`。
+
+- 首条报告 `201`、响应同体 B；与最近一条**同体**重放 `200` 同体（重放
+  优先于策略/终态判定，不复查策略现状、不记事件）。同一操作的
+  `chain_id`/`tx_id` 一经首报即固定，链冲突或交易冲突 `409`。
+- **同一区块**（`block_hash` 相同）：`block_height` 必须一致，且
+  `confirmations` 不得下降，否则 `409`。
+- **换区块**（`block_hash` 变化）：仅当操作仍 `pending` 时允许；新区块
+  高度相对上一条的回退量 `(旧高度-新高度)` 必须 `≤ reorg_window`
+  （高度上升或持平也允许），此时确认数可下降；超出窗口、或操作已
+  `committed`，一律 `409`（终态冲突）。
+- **达门槛自动提交**：某次报告 `confirmations >= required_confirmations`
+  时，按既有资产 `commit` 契约提交该操作一次（余额不足先 `409` 且**不落
+  报告**）。提交在每钱包事务锁内完成：`chain_report` 事件之后**紧邻唯一**
+  一条 `asset_operation_committed` 事件（两事件一次原子追加、seq 连续，
+  他者无法插队），并沿用资产提交意图（`asset-intents/`）的崩溃前滚/回滚；
+  提交失败不落报告。达门槛后该操作即 committed，其最后一条报告必须是达
+  门槛报告；此后同体重放仍 `200`，任何异体报告 `409`。
+- 报告记 `chain_report` 事件（`request_id=O`、`actor_id`/`reason` 为
+  `null`、details 恰为 B，重放不记）。
+- **与原 commit 的关系**：策略启用期间，凡已被报告绑定（已有
+  `chain_report`）且仍 `pending` 的操作，原
+  `POST asset-operations/{oid}/commit` 一律 `409`（只能经报告达门槛
+  提交）；从未上报的操作不受影响；策略停用后原 `commit` 恢复（停用期间
+  直接提交的历史保持有效）。
+- 链策略/报告事件形状或历史自相矛盾（同块确认数下降、换块越窗、达门槛
+  报告无紧邻提交、启用期被直提等）fail-closed：常驻请求 `503`、`serve`
+  拒绝就绪，保留现场不归一；重启/灾备恢复后策略、报告进度与 seq 不变，
+  跨进程并发达门槛只有一次提交。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -339,7 +391,8 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
-`dkg_failover`、`dkg_failover_policy_updated`。
+`dkg_failover`、`dkg_failover_policy_updated`、`chain_policy`、
+`chain_report`。
 
 ## 多进程与故障恢复（保证）
 
