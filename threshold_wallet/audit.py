@@ -55,6 +55,7 @@ TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
+TYPE_SESSION_TAKEOVER = "session_takeover"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -259,6 +260,27 @@ class AuditStore:
                 result.setdefault(request_id, []).append(dict(event))
         return result
 
+    def _events_grouped_by_request(
+        self, wallet_id: str, event_type: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包指定类型的全部事件，按 request_id 分组，组内按 seq
+        升序。纯只读，不分配 seq。"""
+        data = self._read(wallet_id)
+        result: dict[str, list[dict]] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != event_type:
+                continue
+            request_id = event.get("request_id")
+            if isinstance(request_id, str):
+                result.setdefault(request_id, []).append(dict(event))
+        for events in result.values():
+            events.sort(key=lambda e: e.get("seq", 0))
+        return result
+
     def session_participant_replaced_events(
         self, wallet_id: str
     ) -> dict[str, list[dict]]:
@@ -267,21 +289,21 @@ class AuditStore:
 
         会话参与者替换的崩溃恢复与幂等重放据此判定哪些替换已经提交
         （事件在则替换不可撤回）。纯只读，不分配 seq。"""
-        data = self._read(wallet_id)
-        result: dict[str, list[dict]] = {}
-        if not data:
-            return result
-        for event in data.get("events", []):
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") != TYPE_SESSION_PARTICIPANT_REPLACED:
-                continue
-            request_id = event.get("request_id")
-            if isinstance(request_id, str):
-                result.setdefault(request_id, []).append(dict(event))
-        for events in result.values():
-            events.sort(key=lambda e: e.get("seq", 0))
-        return result
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_SESSION_PARTICIPANT_REPLACED
+        )
+
+    def session_takeover_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 session_takeover 事件，按 request_id（会话 id）
+        分组，组内按 seq 升序。
+
+        两阶段参与者接管的崩溃恢复与幂等重放据此判定各阶段是否已提交
+        （事件在则该阶段不可撤回）。纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_SESSION_TAKEOVER
+        )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射
