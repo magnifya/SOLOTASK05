@@ -61,6 +61,8 @@ TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
 TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
+TYPE_CHAIN_POLICY = "chain_policy"
+TYPE_CHAIN_REPORT = "chain_report"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -103,6 +105,19 @@ _DETAILS_KEY_ORDER = {
         "replacement",
         "key",
         "state",
+    ),
+    TYPE_CHAIN_POLICY: (
+        "chain_id",
+        "enabled",
+        "required_confirmations",
+        "reorg_window",
+    ),
+    TYPE_CHAIN_REPORT: (
+        "chain_id",
+        "tx_id",
+        "block_height",
+        "block_hash",
+        "confirmations",
     ),
 }
 
@@ -552,4 +567,17 @@ class AuditStore:
             dict(event)
             for event in sorted(data["events"], key=lambda e: e["seq"])
             if event.get("type") == event_type
+        ]
+
+    def all_events(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部事件（按 seq 升序，返回副本）。纯只读。
+
+        跨类型对账（如链确认报告与资产提交事件的紧邻关系）据此按 seq
+        顺序重放全部事件。日志损坏抛 CorruptDataError（fail-closed）。"""
+        data = self._read(wallet_id)
+        if not data:
+            return []
+        return [
+            dict(event)
+            for event in sorted(data["events"], key=lambda e: e["seq"])
         ]

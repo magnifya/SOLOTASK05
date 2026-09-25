@@ -261,6 +261,9 @@ class WalletService:
             # 意图清零后再做账本 ↔ asset_operation_committed 事件的双向
             # 对账：提交事件与 committed 操作必须一一对应、details 即 R。
             self._reconcile_asset_committed_events(wallet_id)
+            # 链确认事件（chain_policy/chain_report）与提交门控对账：
+            # 报告状态机逐事件重放，矛盾/损坏 fail-closed；纯只读。
+            self._reconcile_chain_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 会话仅由 dkg_stage 事件持久化：严格重建校验即对账，
             # 矛盾/损坏 fail-closed；对账不写任何状态、不记事件、不改 seq。
@@ -393,6 +396,9 @@ class WalletService:
             # 审计日志"的既有可用性边界。
             if self._store.asset_ledger_file_exists(wallet_id):
                 self._reconcile_asset_committed_events(wallet_id)
+                # 链确认报告/策略事件与账本提交门控同属账本一致性：
+                # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
+                self._reconcile_chain_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except RecoveryError:
             raise
@@ -1768,42 +1774,117 @@ class WalletService:
                     f"asset operation {operation_id!r} is "
                     f"{record['state']}, not pending",
                 )
-            asset_id = record["asset_id"]
-            asset = self._store.get_asset(wallet_id, asset_id)
-            old_balance = asset["balance"] if asset is not None else 0
-            old_version = asset["version"] if asset is not None else 0
-            new_balance = old_balance + record["delta"]
-            if new_balance < 0:
-                # 余额不足：状态不变（仍 pending），可重试，不记事件
+            # 资产已启用跨链确认策略时，pending 操作只能经链上确认报告
+            # 达门槛后提交，人工提交一律 409（committed 重放不受影响）
+            policy = self._chain_policies(wallet_id).get(record["asset_id"])
+            if policy is not None and policy["enabled"]:
                 raise ServiceError(
                     409,
-                    f"asset {asset_id!r} has insufficient balance "
-                    "for this operation",
+                    f"asset {record['asset_id']!r} requires chain "
+                    "confirmation reports to commit",
                 )
-            new_version = old_version + 1
-            committed_record = {
-                "operation_id": operation_id,
-                "asset_id": asset_id,
-                "state": "committed",
-                "delta": record["delta"],
-                "balance": new_balance,
-                "version": new_version,
-            }
-            asset_record = {"balance": new_balance, "version": new_version}
-            # 意图只含标识与整数，不含任何私钥材料
-            intent = {
-                "operation_id": operation_id,
-                "asset_id": asset_id,
-                "delta": record["delta"],
-                "old_asset": asset,
-                "pending": record,
-                "new_balance": new_balance,
-                "new_version": new_version,
-            }
-            try:
-                self._store.write_asset_commit_intent(
-                    wallet_id, operation_id, intent
+            committed_record = self._commit_asset_operation_locked(
+                wallet_id, operation_id, record
+            )
+        return 201, committed_record
+
+    def _commit_asset_operation_locked(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        record: dict,
+        report_details: dict | None = None,
+    ) -> dict:
+        """在每钱包事务锁内提交一条 pending 操作，返回 committed 视图 R。
+
+        调用方须已持锁、已 heal、已判定 record 为 pending。事务顺序：
+
+            1. 写提交意图（记录 committed 结果 R 与提交前资产快照）
+            2. 原子提交账本：操作转 committed、balance 改、version+1
+            3. （report_details 非 None 时）追加 chain_report 事件
+            4. 追加唯一的 asset_operation_committed 事件（details=R，
+               request_id=operation_id）
+            5. 删除提交意图
+
+        链上确认报告达门槛触发的提交传入 report_details：报告事件与提交
+        事件紧邻（报告在先），构成"报告事件后紧邻唯一提交事件"的提交点。
+        崩溃恢复以提交事件是否落盘为准：事件在则前滚补齐，事件不在则回滚
+        pending 与提交前余额/版本（此时可能留下孤立报告事件，由下一次
+        同体报告在重试提交时随新报告事件一并补齐，绝不重复提交）。
+        """
+        asset_id = record["asset_id"]
+        asset = self._store.get_asset(wallet_id, asset_id)
+        old_balance = asset["balance"] if asset is not None else 0
+        old_version = asset["version"] if asset is not None else 0
+        new_balance = old_balance + record["delta"]
+        if new_balance < 0:
+            # 余额不足：状态不变（仍 pending），可重试，不记事件；
+            # 报告触发的提交同样失败且报告不落盘
+            raise ServiceError(
+                409,
+                f"asset {asset_id!r} has insufficient balance "
+                "for this operation",
+            )
+        new_version = old_version + 1
+        committed_record = {
+            "operation_id": operation_id,
+            "asset_id": asset_id,
+            "state": "committed",
+            "delta": record["delta"],
+            "balance": new_balance,
+            "version": new_version,
+        }
+        asset_record = {"balance": new_balance, "version": new_version}
+        # 意图只含标识与整数，不含任何私钥材料
+        intent = {
+            "operation_id": operation_id,
+            "asset_id": asset_id,
+            "delta": record["delta"],
+            "old_asset": asset,
+            "pending": record,
+            "new_balance": new_balance,
+            "new_version": new_version,
+        }
+        try:
+            self._store.write_asset_commit_intent(
+                wallet_id, operation_id, intent
+            )
+            self._store.commit_asset_operation(
+                wallet_id,
+                operation_id,
+                committed_record,
+                asset_id,
+                asset_record,
+            )
+            if report_details is not None:
+                # 报告事件紧邻提交事件之前落盘
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_REPORT,
+                        request_id=operation_id,
+                        details=report_details,
+                    ),
                 )
+            self._emit(
+                wallet_id,
+                self._audit_event(
+                    audit.TYPE_ASSET_OPERATION_COMMITTED,
+                    request_id=operation_id,
+                    details=committed_record,
+                ),
+            )
+        except BaseException:
+            # 普通写入/事件追加失败：以事件是否真正落盘为准对账。
+            # 事件在（如落盘成功但返回阶段报错）则前滚为唯一 committed，
+            # 绝不重复记事件；事件不在则回滚 pending 与提交前余额/版本，
+            # 事件从未分配 seq，故无事件、无 seq 缺口，可重试。
+            landed = self._audit.find_event_by_request(
+                wallet_id,
+                audit.TYPE_ASSET_OPERATION_COMMITTED,
+                operation_id,
+            )
+            if landed is not None:
                 self._store.commit_asset_operation(
                     wallet_id,
                     operation_id,
@@ -1811,43 +1892,17 @@ class WalletService:
                     asset_id,
                     asset_record,
                 )
-                self._emit(
-                    wallet_id,
-                    self._audit_event(
-                        audit.TYPE_ASSET_OPERATION_COMMITTED,
-                        request_id=operation_id,
-                        details=committed_record,
-                    ),
+                self._store.delete_asset_commit_intent(
+                    wallet_id, operation_id
                 )
-            except BaseException:
-                # 普通写入/事件追加失败：以事件是否真正落盘为准对账。
-                # 事件在（如落盘成功但返回阶段报错）则前滚为唯一 committed，
-                # 绝不重复记事件；事件不在则回滚 pending 与提交前余额/版本，
-                # 事件从未分配 seq，故无事件、无 seq 缺口，可重试。
-                landed = self._audit.find_event_by_request(
-                    wallet_id,
-                    audit.TYPE_ASSET_OPERATION_COMMITTED,
-                    operation_id,
-                )
-                if landed is not None:
-                    self._store.commit_asset_operation(
-                        wallet_id,
-                        operation_id,
-                        committed_record,
-                        asset_id,
-                        asset_record,
-                    )
-                    self._store.delete_asset_commit_intent(
-                        wallet_id, operation_id
-                    )
-                    return 201, committed_record
-                self._store.restore_asset_operation(
-                    wallet_id, operation_id, record, asset_id, asset
-                )
-                self._store.delete_asset_commit_intent(wallet_id, operation_id)
-                raise
+                return committed_record
+            self._store.restore_asset_operation(
+                wallet_id, operation_id, record, asset_id, asset
+            )
             self._store.delete_asset_commit_intent(wallet_id, operation_id)
-        return 201, committed_record
+            raise
+        self._store.delete_asset_commit_intent(wallet_id, operation_id)
+        return committed_record
 
     def get_asset(self, wallet_id: str, asset_id: str) -> dict:
         """查询某资产的账本状态（balance/version）。
@@ -1877,6 +1932,494 @@ class WalletService:
             raise
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+
+    # ---- 跨链资产确认 -----------------------------------------------------
+
+    @staticmethod
+    def _validate_chain_id(chain_id: object) -> None:
+        if not isinstance(chain_id, str) or not ROTATION_ID_RE.match(
+            chain_id
+        ):
+            raise ServiceError(
+                400, "chain_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    @staticmethod
+    def _validate_hex_32(value: object, name: str) -> None:
+        if not _is_lower_hex_32(value):
+            raise ServiceError(
+                400, f"{name} must be 64 lowercase hex characters"
+            )
+
+    @staticmethod
+    def _validate_non_negative_int(value: object, name: str) -> None:
+        # bool 是 int 的子类，必须先排除
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ServiceError(
+                400, f"{name} must be a non-negative integer"
+            )
+
+    @staticmethod
+    def _chain_policy_shape(wallet_id: str, event: dict) -> tuple[str, dict]:
+        """严格校验一条 chain_policy 事件，返回 (资产标识, 策略 Q)。
+
+        request_id 为资产标识（安全 id），actor_id/reason 为 null，
+        details 恰含 {chain_id, enabled, required_confirmations,
+        reorg_window} 且值合法；任何畸形都是不可对账现场
+        （RecoveryError，fail-closed）。"""
+        if (
+            event.get("actor_id") is not None
+            or event.get("reason") is not None
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_policy event with "
+                "actor/reason set"
+            )
+        asset_id = event.get("request_id")
+        if not isinstance(asset_id, str) or not ROTATION_ID_RE.match(
+            asset_id
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_policy event without "
+                "an asset id"
+            )
+        details = event.get("details")
+        if not isinstance(details, dict) or set(details) != {
+            "chain_id",
+            "enabled",
+            "required_confirmations",
+            "reorg_window",
+        }:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_policy event"
+            )
+        chain_id = details["chain_id"]
+        enabled = details["enabled"]
+        required = details["required_confirmations"]
+        window = details["reorg_window"]
+        if (
+            not isinstance(chain_id, str)
+            or not ROTATION_ID_RE.match(chain_id)
+            or not isinstance(enabled, bool)
+            or not isinstance(required, int)
+            or isinstance(required, bool)
+            or required <= 0
+            or not isinstance(window, int)
+            or isinstance(window, bool)
+            or window < 0
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_policy event"
+            )
+        return asset_id, dict(details)
+
+    @staticmethod
+    def _chain_report_shape(wallet_id: str, event: dict) -> tuple[str, dict]:
+        """严格校验一条 chain_report 事件，返回 (操作 id, 报告 B)。
+
+        request_id 为资产操作 id，actor_id/reason 为 null，details 恰含
+        {chain_id, tx_id, block_height, block_hash, confirmations} 且值
+        合法；任何畸形都是不可对账现场（RecoveryError，fail-closed）。"""
+        if (
+            event.get("actor_id") is not None
+            or event.get("reason") is not None
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_report event with "
+                "actor/reason set"
+            )
+        operation_id = event.get("request_id")
+        if not isinstance(operation_id, str) or not ROTATION_ID_RE.match(
+            operation_id
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_report event without "
+                "an operation id"
+            )
+        details = event.get("details")
+        if not isinstance(details, dict) or set(details) != {
+            "chain_id",
+            "tx_id",
+            "block_height",
+            "block_hash",
+            "confirmations",
+        }:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_report event"
+            )
+        if (
+            not isinstance(details["chain_id"], str)
+            or not ROTATION_ID_RE.match(details["chain_id"])
+            or not _is_lower_hex_32(details["tx_id"])
+            or not _is_lower_hex_32(details["block_hash"])
+            or not isinstance(details["block_height"], int)
+            or isinstance(details["block_height"], bool)
+            or details["block_height"] < 0
+            or not isinstance(details["confirmations"], int)
+            or isinstance(details["confirmations"], bool)
+            or details["confirmations"] < 0
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_report event"
+            )
+        return operation_id, dict(details)
+
+    def _chain_policies(self, wallet_id: str) -> dict[str, dict]:
+        """从 chain_policy 事件序列恢复各资产的链确认策略（每资产取最后一条）。
+
+        策略只由审计事件持久化（事件之外不写任何状态文件）；畸形事件
+        fail-closed（RecoveryError），绝不静默按缺省处理。纯只读，
+        不分配 seq。"""
+        policies: dict[str, dict] = {}
+        for event in self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_POLICY
+        ):
+            asset_id, policy = self._chain_policy_shape(wallet_id, event)
+            policies[asset_id] = policy
+        return policies
+
+    def _chain_reports(self, wallet_id: str) -> dict[str, dict]:
+        """从 chain_report 事件序列恢复各操作的最后一条报告。
+
+        报告状态只由审计事件持久化；畸形事件 fail-closed
+        （RecoveryError）。纯只读，不分配 seq。"""
+        reports: dict[str, dict] = {}
+        for event in self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_REPORT
+        ):
+            operation_id, report = self._chain_report_shape(wallet_id, event)
+            reports[operation_id] = report
+        return reports
+
+    @staticmethod
+    def _report_transition_error(
+        policy: dict, last: dict | None, report: dict
+    ) -> str | None:
+        """新报告相对上一条报告的状态机校验；合法返回 None，否则返回错误信息。
+
+        首报绑定 tx_id 与 chain_id：后续报告换 tx/换链一律冲突；同块
+        （高度与哈希均同）确认数只增不减，且低于门槛的同体重放不应产生
+        事件（对账时据此识别篡改）；换块的高度回退不得超过策略
+        reorg_window，换块后确认数可降。"""
+        if last is None:
+            return None
+        if report["tx_id"] != last["tx_id"]:
+            return "tx_id conflicts with the reported transaction"
+        if report["chain_id"] != last["chain_id"]:
+            return "chain_id conflicts with the reported chain"
+        same_block = (
+            report["block_height"] == last["block_height"]
+            and report["block_hash"] == last["block_hash"]
+        )
+        if same_block:
+            if report["confirmations"] < last["confirmations"]:
+                return "confirmations must not decrease on the same block"
+            if (
+                report == last
+                and report["confirmations"] < policy["required_confirmations"]
+            ):
+                # 低于门槛的同体重放在线只回 200 不记事件：日志里出现
+                # 这样的重复报告事件即矛盾现场（达门槛的重复报告是崩溃
+                # 重试补齐提交的合法残留，不在此列）
+                return "duplicate report below the required confirmations"
+            return None
+        if (
+            last["block_height"] - report["block_height"]
+            > policy["reorg_window"]
+        ):
+            return "block height regression exceeds the reorg window"
+        return None
+
+    def put_chain_policy(
+        self,
+        wallet_id: str,
+        asset_id: object,
+        chain_id: object,
+        enabled: object,
+        required_confirmations: object,
+        reorg_window: object,
+    ) -> dict:
+        """设置（或覆盖）某资产的跨链确认策略。成功 200 返回 Q。
+
+        钱包不存在 404；标识/值非法 400（键集由 HTTP 边界校验）。策略
+        仅由 chain_policy 审计事件持久化（request_id 为资产标识，
+        actor_id/reason 为 null，details 即 Q），**同值更新也记事件**，
+        不写任何策略状态文件。恢复检查、存在性判定、校验与事件追加全部
+        在每钱包跨进程事务锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_asset_id(asset_id)
+                self._validate_chain_id(chain_id)
+                if not isinstance(enabled, bool):
+                    raise ServiceError(400, "enabled must be a boolean")
+                if (
+                    not isinstance(required_confirmations, int)
+                    or isinstance(required_confirmations, bool)
+                    or required_confirmations <= 0
+                ):
+                    raise ServiceError(
+                        400,
+                        "required_confirmations must be a positive integer",
+                    )
+                if (
+                    not isinstance(reorg_window, int)
+                    or isinstance(reorg_window, bool)
+                    or reorg_window < 0
+                ):
+                    raise ServiceError(
+                        400, "reorg_window must be a non-negative integer"
+                    )
+                policy = {
+                    "chain_id": chain_id,
+                    "enabled": enabled,
+                    "required_confirmations": required_confirmations,
+                    "reorg_window": reorg_window,
+                }
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_POLICY,
+                        request_id=asset_id,
+                        details=policy,
+                    ),
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return policy
+
+    def get_chain_policy(self, wallet_id: str, asset_id: str) -> dict:
+        """读取某资产的跨链确认策略：已配置 200 同体，未配置 404。
+
+        策略纯由事件恢复；损坏/矛盾事件 fail-closed（由 HTTP 边界转
+        503）。钱包不存在 404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在，再判定策略是否已配置
+                self._get_wallet_or_404(wallet_id)
+                self._validate_asset_id(asset_id)
+                policy = self._chain_policies(wallet_id).get(asset_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        if policy is None:
+            raise ServiceError(
+                404,
+                f"wallet {wallet_id!r} has no chain confirmation policy "
+                f"for asset {asset_id!r}",
+            )
+        return policy
+
+    def post_chain_report(
+        self,
+        wallet_id: str,
+        operation_id: object,
+        chain_id: object,
+        tx_id: object,
+        block_height: object,
+        block_hash: object,
+        confirmations: object,
+    ) -> tuple[int, dict]:
+        """上报某资产操作的链上确认数。返回 (HTTP 状态码, 报告 B)。
+
+        首报/采纳的新报告 201，同体幂等重放 200；键集（HTTP 边界）/值
+        非法 400；钱包/操作未知 404；策略未启用、链或 tx 冲突、同块
+        确认数下降、高度回退越界、终态后异体报告一律 409。报告达
+        required_confirmations 时按既有 commit 契约提交一次：报告事件
+        与紧邻的唯一提交事件构成提交点，提交失败（如余额不足）报告不
+        落盘。恢复检查、校验、状态判定与事件追加全部在锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_operation_id(operation_id)
+                self._validate_chain_id(chain_id)
+                self._validate_hex_32(tx_id, "tx_id")
+                self._validate_non_negative_int(block_height, "block_height")
+                self._validate_hex_32(block_hash, "block_hash")
+                self._validate_non_negative_int(confirmations, "confirmations")
+                record = self._store.get_asset_operation(
+                    wallet_id, operation_id
+                )
+                if record is None:
+                    raise ServiceError(
+                        404, f"asset operation {operation_id!r} not found"
+                    )
+                policy = self._chain_policies(wallet_id).get(
+                    record["asset_id"]
+                )
+                if policy is None or not policy["enabled"]:
+                    raise ServiceError(
+                        409,
+                        f"chain confirmation policy for asset "
+                        f"{record['asset_id']!r} is not enabled",
+                    )
+                if chain_id != policy["chain_id"]:
+                    raise ServiceError(
+                        409,
+                        f"chain_id {chain_id!r} does not match the "
+                        "policy chain",
+                    )
+                report = {
+                    "chain_id": chain_id,
+                    "tx_id": tx_id,
+                    "block_height": block_height,
+                    "block_hash": block_hash,
+                    "confirmations": confirmations,
+                }
+                last = self._chain_reports(wallet_id).get(operation_id)
+                if record["state"] == "committed":
+                    # 终态：仅同体幂等重放，异体一律冲突
+                    if last is not None and report == last:
+                        return 200, report
+                    raise ServiceError(
+                        409,
+                        f"asset operation {operation_id!r} is already "
+                        "committed",
+                    )
+                if last is not None and report == last:
+                    if confirmations >= policy["required_confirmations"]:
+                        # 崩溃窗口遗留：报告事件已落盘但提交被回滚，
+                        # 同体重试随新报告事件补齐唯一提交（两事件紧邻）
+                        self._commit_asset_operation_locked(
+                            wallet_id,
+                            operation_id,
+                            record,
+                            report_details=report,
+                        )
+                        return 201, report
+                    return 200, report
+                error = self._report_transition_error(policy, last, report)
+                if error is not None:
+                    raise ServiceError(409, error)
+                if confirmations >= policy["required_confirmations"]:
+                    # 达门槛：按既有 commit 契约提交一次，报告事件与
+                    # 提交事件紧邻；提交失败则报告不落盘
+                    self._commit_asset_operation_locked(
+                        wallet_id,
+                        operation_id,
+                        record,
+                        report_details=report,
+                    )
+                else:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_CHAIN_REPORT,
+                            request_id=operation_id,
+                            details=report,
+                        ),
+                    )
+                return 201, report
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _reconcile_chain_events(self, wallet_id: str) -> None:
+        """链确认事件（chain_policy/chain_report）与资产提交的严格对账
+        （调用方须持钱包事务锁；意图残留须已先恢复清零）。
+
+        按 seq 重放全部事件，逐事件核对在线规则：
+
+        - chain_policy/chain_report 事件形状必须合法（标识、hex、整数）；
+        - 报告必须指向账本中存在的操作，且当时该资产策略已启用、链一致；
+        - 报告状态机（tx/链绑定、同块确认数不降、换块回退不超窗、低于
+          门槛的同体报告不产生事件、终态后不再有报告）逐事件成立；
+        - 策略启用时的资产提交事件必须紧邻一条达门槛的 chain_report
+          （启用时人工提交 pending 在线被 409 拒绝，日志里出现即矛盾）。
+
+        任一矛盾抛 RecoveryError（fail-closed，保留现场）。纯只读，
+        不写状态、不记事件、不改 seq。
+        """
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        operations = ledger["operations"]
+        policies: dict[str, dict] = {}
+        reports: dict[str, dict] = {}
+        committed: set[str] = set()
+        prev: dict | None = None
+        for event in self._audit.all_events(wallet_id):
+            event_type = event.get("type")
+            if event_type == audit.TYPE_CHAIN_POLICY:
+                asset_id, policy = self._chain_policy_shape(
+                    wallet_id, event
+                )
+                policies[asset_id] = policy
+            elif event_type == audit.TYPE_CHAIN_REPORT:
+                operation_id, report = self._chain_report_shape(
+                    wallet_id, event
+                )
+                record = operations.get(operation_id)
+                if record is None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a chain_report event "
+                        f"for unknown asset operation {operation_id!r}"
+                    )
+                if operation_id in committed:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a chain_report event "
+                        f"for committed asset operation {operation_id!r}"
+                    )
+                policy = policies.get(record["asset_id"])
+                if policy is None or not policy["enabled"]:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a chain_report event "
+                        f"for {operation_id!r} without an enabled policy"
+                    )
+                if report["chain_id"] != policy["chain_id"]:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a chain_report event "
+                        f"for {operation_id!r} on a different chain"
+                    )
+                error = self._report_transition_error(
+                    policy, reports.get(operation_id), report
+                )
+                if error is not None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has an inconsistent "
+                        f"chain_report event for {operation_id!r}: {error}"
+                    )
+                reports[operation_id] = report
+            elif event_type == audit.TYPE_ASSET_OPERATION_COMMITTED:
+                operation_id = event.get("request_id")
+                record = (
+                    operations.get(operation_id)
+                    if isinstance(operation_id, str)
+                    else None
+                )
+                if record is not None:
+                    policy = policies.get(record["asset_id"])
+                    if policy is not None and policy["enabled"]:
+                        # 启用时只能经报告提交：提交事件必须紧邻一条
+                        # 达门槛的 chain_report
+                        trigger = (
+                            prev.get("details")
+                            if prev is not None
+                            and prev.get("type") == audit.TYPE_CHAIN_REPORT
+                            and prev.get("request_id") == operation_id
+                            else None
+                        )
+                        if (
+                            not isinstance(trigger, dict)
+                            or trigger.get("confirmations")
+                            < policy["required_confirmations"]
+                        ):
+                            raise RecoveryError(
+                                f"wallet {wallet_id!r} committed asset "
+                                f"operation {operation_id!r} without a "
+                                "preceding threshold chain report"
+                            )
+                    committed.add(operation_id)
+            prev = event
 
     # ---- 批准 / 拒绝 -----------------------------------------------------
 

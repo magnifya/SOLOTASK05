@@ -20,6 +20,9 @@
 - POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
+- PUT  /v1/wallets/<wallet_id>/chain/<asset_id>            设置跨链确认策略
+- GET  /v1/wallets/<wallet_id>/chain/<asset_id>            查询跨链确认策略
+- POST /v1/wallets/<wallet_id>/chain/<operation_id>/report 上报链上确认数
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
@@ -154,6 +157,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
                 if len(rest) == 2 and rest[0] == "assets":
                     self._send_json(200, service.get_asset(wallet_id, rest[1]))
+                    return
+                if len(rest) == 2 and rest[0] == "chain":
+                    self._send_json(
+                        200, service.get_chain_policy(wallet_id, rest[1])
+                    )
                     return
                 if len(rest) == 2 and rest[0] == "sign-sessions":
                     self._send_json(
@@ -402,6 +410,38 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
                 if (
                     len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "report"
+                ):
+                    body = self._read_json_body()
+                    # 请求体仅允许 chain_id/tx_id/block_height/block_hash/
+                    # confirmations 五键
+                    if set(body) != {
+                        "chain_id",
+                        "tx_id",
+                        "block_height",
+                        "block_hash",
+                        "confirmations",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly chain_id, tx_id, "
+                            "block_height, block_hash and confirmations",
+                        )
+                    status, result = service.post_chain_report(
+                        wallet_id,
+                        rest[1],
+                        body.get("chain_id"),
+                        body.get("tx_id"),
+                        body.get("block_height"),
+                        body.get("block_hash"),
+                        body.get("confirmations"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
                     and rest[0] == "share-rotations"
                     and rest[2] == "activate"
                 ):
@@ -472,6 +512,32 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             )
                         result = service.put_dkg_failover_policy(
                             wallet_id, body.get("enabled")
+                        )
+                        self._send_json(200, result)
+                        return
+                    if len(rest) == 2 and rest[0] == "chain":
+                        body = self._read_json_body()
+                        # PUT 仅收 chain_id/enabled/required_confirmations/
+                        # reorg_window 四键
+                        if set(body) != {
+                            "chain_id",
+                            "enabled",
+                            "required_confirmations",
+                            "reorg_window",
+                        }:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly chain_id, "
+                                "enabled, required_confirmations and "
+                                "reorg_window",
+                            )
+                        result = service.put_chain_policy(
+                            wallet_id,
+                            rest[1],
+                            body.get("chain_id"),
+                            body.get("enabled"),
+                            body.get("required_confirmations"),
+                            body.get("reorg_window"),
                         )
                         self._send_json(200, result)
                         return
