@@ -56,8 +56,10 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/replace` | 替换会话单个参与方份额 `{"replacement_id","offline_share_id"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
+| POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
+| GET  | `/v1/dkg/{id}/{did}` | 查询两方 DKG 会话视图 |
 
-ID（wallet/rotation/operation/asset/session 等）一律匹配
+ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
 JSON 对象。
 
@@ -194,6 +196,34 @@ JSON 对象。
 - 接管后该会话快照与钱包轮换解耦（与单节点替换同一规则）；旧份额
   再投递 `400`，新份额沿用 Ed25519 校验与既有审批/hot-cold 门控。
 
+### 可恢复两方 DKG
+
+`POST /v1/dkg/{id}/{did}`，请求体恰含
+`{"op","node","key","hash","peer"}` 五键（含其他键或缺键一律
+`400`）：两个参与方（`node` 为安全标识）依序推进
+register→commit→share→done 完成两方密钥生成。后端只登记各方公开
+承诺，**份额链下交换、后端绝不收份额正文**。
+
+- `register`：仅 `key` 非 null 且为 64 位小写 hex（该方公钥贡献），
+  `hash`/`peer` 必须为 null；`commit`：仅 `hash` 非 null 且为 64 位
+  小写 sha256；`share`：仅 `hash`、`peer` 非 null，确认已收到 `peer`
+  的链下份额，`hash` 必须等于 `peer` 的 commit 承诺。字段约束不满足
+  一律 `400`。
+- 首提 `201`；同方同值重放 `200`（优先于阶段判定）；异值、错阶段
+  （未齐两份注册即 commit、未齐两份承诺即 share）、第三节点一律
+  `409`；钱包不存在 `404`，非 register 的未知会话 `404`。
+- GET/POST 响应体键序固定为
+  `{id,state,nodes,committed,shared,public_key}`，`state` 为
+  `register|commit|share|done`，`nodes`/`committed`/`shared` 三数组
+  均按注册序；完成（done）时 `public_key` 为两份注册 key 按注册序
+  拼接，否则为 `null`。
+- 状态仅由七字段 `dkg_stage` 审计事件持久化（`request_id` 为会话
+  id，`actor_id`/`reason` 为 `null`，details 依次
+  `id,op,node,key,hash,peer,state`，未用值 `null`）：首提在每钱包
+  跨进程事务锁内追加，事件为唯一提交点，重放不记。矛盾/损坏现场
+  fail-closed（常驻 `503`、`serve` 拒绝就绪），灾备恢复后视图与
+  seq 不变。响应、日志与非份额文件绝不含私钥或份额正文。
+
 ### 份额轮换
 
 - `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
@@ -244,7 +274,7 @@ JSON 对象。
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
-`session_participant_replaced`、`session_takeover`。
+`session_participant_replaced`、`session_takeover`、`dkg_stage`。
 
 ## 多进程与故障恢复（保证）
 

@@ -26,7 +26,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import threading
 from typing import Optional
 
@@ -56,6 +58,7 @@ TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
 TYPE_SESSION_TAKEOVER = "session_takeover"
+TYPE_DKG_STAGE = "dkg_stage"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -66,6 +69,105 @@ EVENT_TYPES = {
     "E": TYPE_REQUEST_EXPIRED,
     "S": TYPE_REQUEST_SIGNED,
 }
+
+#: details 键序须按 README 既定顺序在落盘/查询/灾备保序的事件类型。
+#: 其余事件类型的 details 仍按 sort_keys 规范序落盘（行为不变）。
+_DETAILS_KEY_ORDER = {
+    TYPE_SESSION_PARTICIPANT_REPLACED: (
+        "session_id",
+        "old_share_id",
+        "new_share_id",
+    ),
+    TYPE_SESSION_TAKEOVER: (
+        "takeover_id",
+        "stage",
+        "old_share_id",
+        "new_share_id",
+    ),
+    TYPE_DKG_STAGE: (
+        "id",
+        "op",
+        "node",
+        "key",
+        "hash",
+        "peer",
+        "state",
+    ),
+}
+
+
+def _order_event_details(event: dict) -> None:
+    """把既定事件类型的 details 就地重排为 README 既定键序。
+
+    仅当 details 键集与既定键序恰好一致时重排；键集不符的现场留给各
+    语义对账路径 fail-closed，绝不在这里猜写。
+    """
+    order = _DETAILS_KEY_ORDER.get(event.get("type"))
+    details = event.get("details")
+    if order is None or not isinstance(details, dict):
+        return
+    if set(details) != set(order):
+        return
+    event["details"] = {key: details[key] for key in order}
+
+
+def _canonicalize_sorted(value: object) -> object:
+    """递归重排为 sort_keys 规范序（与 WalletStore._atomic_write 同字节）。"""
+    if isinstance(value, dict):
+        return {k: _canonicalize_sorted(value[k]) for k in sorted(value)}
+    if isinstance(value, list):
+        return [_canonicalize_sorted(item) for item in value]
+    return value
+
+
+def _canonical_event(event: object) -> object:
+    """单条事件的落盘规范形：七字段 sort_keys，惟既定类型 details 保序。"""
+    if not isinstance(event, dict):
+        return _canonicalize_sorted(event)
+    canonical = {}
+    for key in sorted(event):
+        value = event[key]
+        if (
+            key == "details"
+            and event.get("type") in _DETAILS_KEY_ORDER
+            and isinstance(value, dict)
+        ):
+            # 保留构造/读取时已归一为 README 既定顺序的 details 键序
+            canonical[key] = value
+        else:
+            canonical[key] = _canonicalize_sorted(value)
+    return canonical
+
+
+def _canonical_log(data: dict) -> dict:
+    """审计日志整体落盘规范形（顶层与各事件 sort_keys，既定 details 保序）。"""
+    canonical = {}
+    for key in sorted(data):
+        value = data[key]
+        if key == "events" and isinstance(value, list):
+            canonical[key] = [_canonical_event(event) for event in value]
+        else:
+            canonical[key] = _canonicalize_sorted(value)
+    return canonical
+
+
+def _atomic_write_log(path: str, data: dict) -> None:
+    """与 WalletStore._atomic_write 相同的临时文件 + 原子替换；序列化按
+    _canonical_log（既定事件类型的 details 按 README 既定键序落盘）。"""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(_canonical_log(data), f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class AuditStore:
@@ -155,6 +257,10 @@ class AuditStore:
                 raise CorruptDataError(
                     f"audit log {path!r} next_seq disagrees with its events"
                 )
+        # 既定事件类型的 details 在内存视图中归一为 README 既定键序，
+        # 使查询/重建/重写（落盘与灾备）都按该顺序保序。
+        for event in events:
+            _order_event_details(event)
         return data
 
     def check_log(self, wallet_id: str) -> None:
@@ -199,9 +305,11 @@ class AuditStore:
             next_seq = len(events) + 1
             stamped = dict(event)
             stamped["seq"] = next_seq
+            # 既定事件类型的 details 落盘前归一为 README 既定键序
+            _order_event_details(stamped)
             events.append(stamped)
             data["next_seq"] = next_seq + 1
-            WalletStore._atomic_write(path, data)
+            _atomic_write_log(path, data)
             return stamped
 
     def find_event_by_request(
@@ -304,6 +412,17 @@ class AuditStore:
         return self._events_grouped_by_request(
             wallet_id, TYPE_SESSION_TAKEOVER
         )
+
+    def dkg_stage_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 dkg_stage 事件，按 request_id（DKG 会话 id）
+        分组，组内按 seq 升序。
+
+        DKG 会话状态仅由这些事件持久化（事件是唯一提交点）：在线处理与
+        崩溃恢复据此重建各会话的 register/commit/share 推进序列。
+        纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(wallet_id, TYPE_DKG_STAGE)
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射
