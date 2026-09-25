@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from datetime import datetime, timedelta, timezone
@@ -60,6 +61,10 @@ DKG_OPS = ("register", "commit", "share")
 
 #: DKG 故障轮次允许的动作（abort 中止当前轮并派生空轮；replace 换槽派生新轮）
 DKG_FAILOVER_ACTIONS = ("abort", "replace")
+
+#: post_dkg_failover 的 approval_request_id 缺省哨兵：区分"请求体未携带
+#: 该键"与"携带了 null 值"（后者在策略启用时是非法的 400）。
+_APPROVAL_ABSENT = object()
 
 
 class ServiceError(Exception):
@@ -264,6 +269,9 @@ class WalletService:
             # DKG 会话仅由 dkg_stage 事件持久化：严格重建校验即对账，
             # 矛盾/损坏 fail-closed；对账不写任何状态、不记事件、不改 seq。
             self._dkg_sessions(wallet_id)
+            # DKG 故障审批策略仅由 dkg_failover_policy_updated 事件持久化：
+            # 严格重放校验即对账，矛盾 fail-closed；对账不写状态、不记事件。
+            self._dkg_failover_policy_enabled(wallet_id)
         except RecoveryError:
             raise
         except (OSError, ValueError) as exc:
@@ -4840,16 +4848,22 @@ class WalletService:
         node: object,
         replacement: object,
         key: object,
+        approval_request_id: object = _APPROVAL_ABSENT,
     ) -> tuple[int, dict]:
         """为两方 DKG 会话提交一个故障轮次，返回 (状态码, 新轮视图)。
 
         - 钱包/会话未知 404；参数非法 400；
         - 首轮故障基于基线轮，后续基于当前轮：round 必须恰为当前轮 +1；
-        - 首提 201；同参重放 200（优先于状态判定）；异参 409；
+        - 首提 201；同参重放 200（优先于状态判定，且不复查审批）；
+          异参 409；
         - abort 仅限非终态轮，node/replacement/key 必须全为 null，
           派生轮为 aborted 且三数组为空；replace 仅限两方已注册的
           commit|share 轮，key 为 64 位小写 hex、node 在用、
           replacement 空闲，换槽并清空 committed/shared 后回到 commit；
+        - DKG 故障审批策略禁用（缺省）时请求体恰为旧五键；启用时恰为
+          旧五键加 approval_request_id（安全标识），且须通过审批门控
+          （同钱包 approved 审批单、message 逐字等于本次参数的紧凑
+          JSON、R 恰为当前轮 +1），否则 409 且现场不变；
         - dkg_failover 事件（request_id 为 ``<id>/<轮次>``，details
           依次 id,round,action,node,replacement,key,state）是唯一
           持久化与提交点：首提在跨进程事务锁内追加，重放不记；事件
@@ -4860,6 +4874,29 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在性
                 self._get_wallet_or_404(wallet_id)
+                # 请求体键集按锁内生效的策略判定：禁用时恰为旧五键，
+                # 启用时恰为旧五键加 approval_request_id
+                policy_enabled = self._dkg_failover_policy_enabled(wallet_id)
+                if policy_enabled:
+                    if approval_request_id is _APPROVAL_ABSENT:
+                        raise ServiceError(
+                            400, "approval_request_id is required"
+                        )
+                    if (
+                        not isinstance(approval_request_id, str)
+                        or not ROTATION_ID_RE.match(approval_request_id)
+                    ):
+                        raise ServiceError(
+                            400,
+                            "approval_request_id must match "
+                            "[A-Za-z0-9_-]{1,128}",
+                        )
+                elif approval_request_id is not _APPROVAL_ABSENT:
+                    raise ServiceError(
+                        400,
+                        "approval_request_id requires the dkg failover "
+                        "policy to be enabled",
+                    )
                 self._validate_dkg_id(dkg_id)
                 if (
                     not isinstance(round_no, int)
@@ -4918,6 +4955,19 @@ class WalletService:
                 if round_no != current + 1:
                     raise ServiceError(
                         409, f"round must be {current + 1}"
+                    )
+                if policy_enabled:
+                    # 审批门控：同钱包 approved 审批单、message 逐字等于
+                    # 本次参数的紧凑 JSON；不通过一律 409 且现场不变
+                    self._check_dkg_failover_approval(
+                        wallet_id,
+                        dkg_id,
+                        round_no,
+                        action,
+                        node,
+                        replacement,
+                        key,
+                        approval_request_id,
                     )
                 current_round = session["rounds"][current]
                 state = current_round["state"]
@@ -4997,3 +5047,148 @@ class WalletService:
         except ValueError:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
+
+    # -- DKG 故障审批策略（可选） --------------------------------------------
+
+    def _dkg_failover_policy_enabled(self, wallet_id: str) -> bool:
+        """从 dkg_failover_policy_updated 事件重放该钱包的 DKG 故障审批策略。
+
+        事件是策略的唯一持久化（不落任何状态文件）：缺省 False，每条事件
+        覆盖前值（同值更新也记）。事件形状矛盾（request_id/actor_id/
+        reason 非 null、details 非恰 {"enabled": bool}）不可对账，抛
+        RecoveryError（fail-closed：常驻 503、serve 拒绝就绪）。纯只读，
+        不分配 seq、不写任何状态。"""
+        enabled = False
+        for event in self._audit.events_by_type(
+            wallet_id, audit.TYPE_DKG_FAILOVER_POLICY_UPDATED
+        ):
+            if (
+                event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a "
+                    "dkg_failover_policy_updated event with "
+                    "request/actor/reason set"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or set(details) != {"enabled"}
+                or not isinstance(details["enabled"], bool)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed "
+                    "dkg_failover_policy_updated event"
+                )
+            enabled = details["enabled"]
+        return enabled
+
+    def put_dkg_failover_policy(
+        self, wallet_id: str, body: object
+    ) -> dict:
+        """设置（或覆盖）钱包的 DKG 故障审批策略，返回 {"enabled": bool}。
+
+        请求体仅收 {"enabled": bool}（含其他键或缺键一律 400，enabled
+        非布尔 400，钱包不存在 404）。dkg_failover_policy_updated 事件
+        （request_id/actor_id/reason 为 null，details 恰为
+        {"enabled": ...}）是唯一持久化与提交点：策略不落任何状态文件，
+        同值更新也记事件，查询/恢复由事件序列重放。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                if not isinstance(body, dict) or set(body) != {"enabled"}:
+                    raise ServiceError(
+                        400, "body must contain exactly enabled"
+                    )
+                enabled = body["enabled"]
+                if not isinstance(enabled, bool):
+                    raise ServiceError(400, "enabled must be a boolean")
+                # 事件即唯一提交点：事件之外无任何状态落盘，无需回滚
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_DKG_FAILOVER_POLICY_UPDATED,
+                        details={"enabled": enabled},
+                    ),
+                )
+                return {"enabled": enabled}
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def get_dkg_failover_policy(self, wallet_id: str) -> dict:
+        """查询 DKG 故障审批策略：200 返回 {"enabled": bool}（缺省 False）。
+
+        恢复检查、钱包存在性与事件重放全部在锁内：绝不先用锁外快照
+        决定 404，也读不到并发事务半完成状态。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在
+                self._get_wallet_or_404(wallet_id)
+                return {"enabled": self._dkg_failover_policy_enabled(
+                    wallet_id
+                )}
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _check_dkg_failover_approval(
+        self,
+        wallet_id: str,
+        dkg_id: object,
+        round_no: object,
+        action: object,
+        node: object,
+        replacement: object,
+        key: object,
+        approval_request_id: str,
+    ) -> None:
+        """DKG 故障审批门控（调用方须持有钱包事务锁；仅策略启用时调用）。
+
+        approval_request_id 须指向同钱包既有审批单，其 message 逐字等于
+        本次故障参数的紧凑 JSON
+        ``{"dkg_id":D,"round":R,"action":A,"node":N,"replacement":X,"key":K}``
+        （键序如列，node/replacement/key 按旧约为字符串或 null），且
+        审批单当前为 approved（R 恰为当前轮 +1 已由调用方按请求体校验，
+        message 逐字一致即保证审批锁定的轮次未变化）。审批单未知、
+        pending/rejected/expired（含到点懒过期）或文案不符一律 409，
+        不改任何故障现场。审批单沿用 sign-requests 契约（含懒过期）。
+        """
+        record = self._store.get_request(wallet_id, approval_request_id)
+        if record is None:
+            raise ServiceError(
+                409,
+                f"approval request {approval_request_id!r} not found",
+            )
+        record = self._expire_if_needed(wallet_id, record)
+        if record["state"] != "approved":
+            raise ServiceError(
+                409,
+                f"approval request {approval_request_id!r} is "
+                f"{record['state']}, not approved",
+            )
+        expected = json.dumps(
+            {
+                "dkg_id": dkg_id,
+                "round": round_no,
+                "action": action,
+                "node": node,
+                "replacement": replacement,
+                "key": key,
+            },
+            separators=(",", ":"),
+        )
+        if record["message"] != expected:
+            raise ServiceError(
+                409,
+                "approval request message does not match the failover",
+            )

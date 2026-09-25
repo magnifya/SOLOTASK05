@@ -37,6 +37,8 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets` | 建钱包 `{"wallet_id", "shares"`，`shares` 必须为 2 |
 | GET  | `/v1/wallets/{id}` | 返回 `public_key` 与 `created_at` |
 | PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
+| PUT  | `/v1/wallets/{id}/dkg-failover-policy` | DKG 故障审批策略 `{"enabled":bool}` |
+| GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批策略（缺省 `false`） |
 | PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
@@ -253,6 +255,31 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   不记。矛盾/损坏现场 fail-closed（常驻 `503`、`serve` 拒绝就绪），
   重启/灾备恢复后轮次与 seq 不变。
 
+### DKG 故障审批（可选）
+
+`PUT /v1/wallets/{id}/dkg-failover-policy` 请求体仅收
+`{"enabled":bool}`（含其他键或缺键、`enabled` 非布尔一律 `400`，
+钱包不存在 `404`）；`GET`/`PUT` 成功 `200` 同体 `{"enabled":...}`，
+缺省 `false`。`PUT` 记 `dkg_failover_policy_updated` 事件
+（`request_id`/`actor_id`/`reason` 为 `null`，details 恰为
+`{"enabled":...}`）；策略仅由事件恢复（不落任何状态文件），同值
+更新也记事件。
+
+- 策略禁用（缺省）时 `/v1/dkg/{id}/{did}/failover` 沿用旧五键契约
+  不变；启用时请求体恰为旧五键加 `approval_request_id`（安全标识，
+  含其他键或缺键一律 `400`）。
+- `approval_request_id` 须指向同钱包既有审批单，其 `message` 逐字
+  等于紧凑 JSON
+  `{"dkg_id":"D","round":R,"action":"A","node":N,"replacement":X,"key":K}`
+  （键序如列，`node`/`replacement`/`key` 按旧约为字符串或 `null`）；
+  审批单 `approved` 且 `R` 恰为当前轮 +1 才可执行。审批单未知、
+  `pending`、`rejected`、`expired`、文案不符或轮次变化均 `409` 且
+  现场不变。审批单沿用 sign-requests 契约（含懒过期）。
+- 首提 `201` 并追加唯一 `dkg_failover` 事件（形状不变）；已提交
+  旧五键同参重放优先 `200` 且不复查审批，异参 `409`。全流程在每
+  钱包跨进程事务锁内；矛盾/损坏现场 fail-closed（常驻 `503`、
+  `serve` 拒绝就绪），重启/灾备后策略、轮次与 seq 不变。
+
 ### 份额轮换
 
 - `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
@@ -304,7 +331,7 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
-`dkg_failover`。
+`dkg_failover`、`dkg_failover_policy_updated`。
 
 ## 多进程与故障恢复（保证）
 
