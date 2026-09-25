@@ -1048,14 +1048,21 @@ class WalletStore:
 
         正常提交写入的意图含 operation_id/asset_id/delta、提交前资产
         快照 old_asset（None 或 {balance,version}）、pending 操作记录、
-        提交结果 new_balance/new_version。任一字段缺失、类型错误、布尔
-        冒整、标识不匹配或前后账目不守恒都判定为无效：调用方必须
-        fail-closed（保留意图现场，不回滚/前滚/清理），绝不把损坏意图
-        当成空意图继续。
+        提交结果 new_balance/new_version；跨链门槛报告触发的提交另含
+        report_seq（报告事件将占用的审计 seq，非布尔正整数），供恢复
+        精确摘除提交点未达成时已落盘的孤立报告事件。任一字段缺失、
+        类型错误、布尔冒整、标识不匹配或前后账目不守恒都判定为无效：
+        调用方必须 fail-closed（保留意图现场，不回滚/前滚/清理），
+        绝不把损坏意图当成空意图继续。
         """
         if not isinstance(intent, dict):
             return False
         if intent.get("operation_id") != operation_id:
+            return False
+        report_seq = intent.get("report_seq")
+        if report_seq is not None and (
+            not _is_plain_int(report_seq) or report_seq < 1
+        ):
             return False
         asset_id = intent.get("asset_id")
         if not _valid_safe_id(asset_id):

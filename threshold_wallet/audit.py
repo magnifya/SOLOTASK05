@@ -18,7 +18,10 @@
 关键性质：
 - seq 从 1 开始，写入后立即持久化；服务重启后续写，seq 接续文件中的
   next_seq（也兼容仅依据末尾事件 seq 推断的旧文件）；
-- 仅追加：只在 events 末尾追加，从不修改/删除历史事件；
+- 仅追加：业务路径只在 events 末尾追加，从不修改/删除历史事件；唯一
+  例外是 ``pop_tail_event``——崩溃事务整体回滚时在每钱包事务锁内摘除
+  本事务刚追加、提交点未达成的末尾事件（如跨链门槛报告的孤立
+  chain_report），摘除后 seq 连续无缺口；
 - 写入采用同目录临时文件 + os.replace 原子替换；
 - 调用方（service）在同一把每钱包事务锁内完成"状态变更 + 事件追加"，
   事件追加失败时回滚状态，保证状态与事件原子。
@@ -34,6 +37,7 @@ from typing import Optional
 
 from .store import (
     CorruptDataError,
+    RecoveryError,
     WalletStore,
     _check_id,
     _SAFE_ID,
@@ -337,6 +341,74 @@ class AuditStore:
             data["next_seq"] = next_seq + 1
             _atomic_write_log(path, data)
             return stamped
+
+    def next_seq(self, wallet_id: str) -> int:
+        """返回下一条事件将分配的 seq（当前事件数 + 1，无日志时为 1）。
+
+        提交事务据此把"报告事件将占用的 seq"预先记入提交意图，供崩溃
+        恢复精确对账。纯只读，不分配 seq。日志损坏抛 CorruptDataError。
+        """
+        data = self._read(wallet_id)
+        if not data:
+            return 1
+        return len(data["events"]) + 1
+
+    def pop_tail_event(
+        self,
+        wallet_id: str,
+        seq: int,
+        event_type: str,
+        request_id: str,
+    ) -> bool:
+        """回滚摘除日志末尾一条刚追加的事件（崩溃事务整体回滚专用）。
+
+        仅当 seq 恰为当前最大 seq（事件在末尾、之后无任何事件）且类型
+        与 request_id 相符时，移除该事件并回退 next_seq（原子写），返回
+        True；seq 尚未分配（事件从未落盘）返回 False，什么也不做。其余
+        任何不符——该 seq 之后还有事件、或事件类型/request_id 不匹配——
+        都是无法唯一对账的矛盾现场，抛 RecoveryError（fail-closed，
+        保留现场，绝不猜写）。
+
+        调用方须持有该钱包事务锁：被摘除的事件只能是本事务在锁内追加、
+        且提交点未达成的事件，摘除后 seq 集合仍为 1..N-1，不留缺口。
+        """
+        path = self._path(wallet_id)
+        with self._lock:
+            data = self._read_strict(wallet_id)
+            if data is None:
+                return False
+            events = data["events"]
+            if not events:
+                return False
+            # 严格加载已保证 seq 集合恰为 1..N
+            max_seq = len(events)
+            if seq > max_seq:
+                # 该 seq 从未分配：报告事件根本没有落盘
+                return False
+            if seq < max_seq:
+                raise RecoveryError(
+                    f"audit log for wallet {wallet_id!r} has events after "
+                    f"seq {seq} that should have been the tail"
+                )
+            index = None
+            for i, event in enumerate(events):
+                if event["seq"] == seq:
+                    index = i
+                    break
+            event = events[index]
+            if (
+                event.get("type") != event_type
+                or event.get("request_id") != request_id
+            ):
+                raise RecoveryError(
+                    f"audit log for wallet {wallet_id!r} tail event at seq "
+                    f"{seq} is not the expected {event_type} for "
+                    f"{request_id!r}"
+                )
+            events.pop(index)
+            data["next_seq"] = len(events) + 1
+            _atomic_write_log(path, data)
+            return True
 
     def find_event_by_request(
         self,

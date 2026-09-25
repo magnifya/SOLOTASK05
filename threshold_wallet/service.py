@@ -426,8 +426,9 @@ class WalletService:
             "details": details,
         }
 
-    def _emit(self, wallet_id: str, event: dict) -> None:
-        self._audit.append_event(wallet_id, event)
+    def _emit(self, wallet_id: str, event: dict) -> dict:
+        """追加一条审计事件，返回含 seq/at 的落盘记录。"""
+        return self._audit.append_event(wallet_id, event)
 
     # ---- 建钱包 ---------------------------------------------------------
 
@@ -1547,9 +1548,11 @@ class WalletService:
         - 事件在：提交已生效，按事件 details（即 committed 视图 R）把账本
           前滚补齐为一致的 committed 结果，再删意图（幂等，余额/版本按 R
           绝对值校正，不重复应用 delta）；
-        - 事件不在：提交未生效，按意图记录的提交前快照把操作恢复为
+        - 事件不在：提交未生效，整体回滚——先按意图的 report_seq 摘除
+          崩溃窗口可能已落盘的孤立 chain_report 报告事件（不留孤立/重复
+          报告、不留 seq 缺口），再按意图记录的提交前快照把操作恢复为
           pending、资产恢复提交前 balance/version（提交前不存在则删除
-          资产条目），再删意图。事件从未分配 seq，故无 seq 缺口。
+          资产条目），再删意图。提交事件从未分配 seq，故无 seq 缺口。
         恢复本身不记任何审计事件。任一条意图无法对账到一致状态都抛
         RecoveryError，由调用方阻止就绪/返回 503，绝不静默跳过。
         """
@@ -1702,10 +1705,23 @@ class WalletService:
             self._store.delete_asset_commit_intent(wallet_id, operation_id)
             return committed_record
 
-        # 事件未持久化：提交未生效，凭意图记录的提交前快照把操作恢复为
+        # 事件未持久化：提交未生效，整体回滚。报告触发的提交可能在崩溃
+        # 窗口内已把 chain_report 报告事件落盘（报告事件先于提交事件
+        # 追加）：按意图记录的 report_seq 精确摘除该孤立报告事件（seq
+        # 未分配说明报告从未落盘，什么也不用做；现场与 report_seq 矛盾
+        # 则无法唯一对账，RecoveryError fail-closed），绝不留下孤立报告
+        # 事件或 seq 缺口。然后凭意图记录的提交前快照把操作恢复为
         # pending、资产恢复提交前 balance/version（意图已在方法入口通过
         # 严格校验，标识/整数/守恒均可信）。提交前不存在该资产条目时
-        # 直接删除；事件从未分配 seq，故无事件、无 seq 缺口、可重试。
+        # 直接删除；提交事件从未分配 seq，故无事件、无 seq 缺口、可重试。
+        report_seq = intent.get("report_seq")
+        if report_seq is not None:
+            self._audit.pop_tail_event(
+                wallet_id,
+                report_seq,
+                audit.TYPE_CHAIN_REPORT,
+                operation_id,
+            )
         pending = intent["pending"]
         asset_id = intent["asset_id"]
         old_asset = intent["old_asset"]
@@ -1799,7 +1815,8 @@ class WalletService:
 
         调用方须已持锁、已 heal、已判定 record 为 pending。事务顺序：
 
-            1. 写提交意图（记录 committed 结果 R 与提交前资产快照）
+            1. 写提交意图（记录 committed 结果 R、提交前资产快照；报告
+               触发的提交另记 report_seq＝报告事件将占用的审计 seq）
             2. 原子提交账本：操作转 committed、balance 改、version+1
             3. （report_details 非 None 时）追加 chain_report 事件
             4. 追加唯一的 asset_operation_committed 事件（details=R，
@@ -1807,10 +1824,14 @@ class WalletService:
             5. 删除提交意图
 
         链上确认报告达门槛触发的提交传入 report_details：报告事件与提交
-        事件紧邻（报告在先），构成"报告事件后紧邻唯一提交事件"的提交点。
-        崩溃恢复以提交事件是否落盘为准：事件在则前滚补齐，事件不在则回滚
-        pending 与提交前余额/版本（此时可能留下孤立报告事件，由下一次
-        同体报告在重试提交时随新报告事件一并补齐，绝不重复提交）。
+        事件紧邻（报告在先，seq 为 n、n+1），构成"报告事件后紧邻唯一
+        提交事件"的提交点。崩溃/失败恢复以提交事件是否落盘为准：事件在
+        则前滚补齐；事件不在则整体回滚——按 report_seq 精确摘除可能已
+        落盘的孤立报告事件（不留孤立/重复报告、不留 seq 缺口），并恢复
+        pending 与提交前余额/版本，随后可整体重试。
+
+        提交点（提交事件落盘）之后的意图清理失败不失败本次提交：残留
+        意图由下一次持锁自愈按前滚清理，绝不产生孤立或重复报告事件。
         """
         asset_id = record["asset_id"]
         asset = self._store.get_asset(wallet_id, asset_id)
@@ -1835,6 +1856,13 @@ class WalletService:
             "version": new_version,
         }
         asset_record = {"balance": new_balance, "version": new_version}
+        # 报告触发的提交：报告事件将占用的 seq 预先记入意图，崩溃恢复
+        # 据此精确识别并摘除提交点未达成时已落盘的孤立报告事件
+        report_seq = (
+            self._audit.next_seq(wallet_id)
+            if report_details is not None
+            else None
+        )
         # 意图只含标识与整数，不含任何私钥材料
         intent = {
             "operation_id": operation_id,
@@ -1845,6 +1873,9 @@ class WalletService:
             "new_balance": new_balance,
             "new_version": new_version,
         }
+        if report_seq is not None:
+            intent["report_seq"] = report_seq
+        report_event_seq = None
         try:
             self._store.write_asset_commit_intent(
                 wallet_id, operation_id, intent
@@ -1858,7 +1889,7 @@ class WalletService:
             )
             if report_details is not None:
                 # 报告事件紧邻提交事件之前落盘
-                self._emit(
+                stamped = self._emit(
                     wallet_id,
                     self._audit_event(
                         audit.TYPE_CHAIN_REPORT,
@@ -1866,6 +1897,7 @@ class WalletService:
                         details=report_details,
                     ),
                 )
+                report_event_seq = stamped["seq"]
             self._emit(
                 wallet_id,
                 self._audit_event(
@@ -1877,8 +1909,10 @@ class WalletService:
         except BaseException:
             # 普通写入/事件追加失败：以事件是否真正落盘为准对账。
             # 事件在（如落盘成功但返回阶段报错）则前滚为唯一 committed，
-            # 绝不重复记事件；事件不在则回滚 pending 与提交前余额/版本，
-            # 事件从未分配 seq，故无事件、无 seq 缺口，可重试。
+            # 绝不重复记事件；事件不在则整体回滚——先摘除本事务可能已
+            # 落盘的报告事件（seq 已知且在日志末尾），再恢复 pending 与
+            # 提交前余额/版本。事件从未占用 seq，故无事件、无 seq 缺口，
+            # 可重试。
             landed = self._audit.find_event_by_request(
                 wallet_id,
                 audit.TYPE_ASSET_OPERATION_COMMITTED,
@@ -1892,17 +1926,40 @@ class WalletService:
                     asset_id,
                     asset_record,
                 )
-                self._store.delete_asset_commit_intent(
-                    wallet_id, operation_id
-                )
+                self._delete_intent_after_commit(wallet_id, operation_id)
                 return committed_record
+            if report_event_seq is not None:
+                # 报告事件已落盘而提交事件未落盘：摘除孤立报告事件，
+                # 绝不留孤立报告或 seq 缺口（摘除失败即矛盾现场，
+                # RecoveryError 向上 fail-closed）
+                self._audit.pop_tail_event(
+                    wallet_id,
+                    report_event_seq,
+                    audit.TYPE_CHAIN_REPORT,
+                    operation_id,
+                )
             self._store.restore_asset_operation(
                 wallet_id, operation_id, record, asset_id, asset
             )
             self._store.delete_asset_commit_intent(wallet_id, operation_id)
             raise
-        self._store.delete_asset_commit_intent(wallet_id, operation_id)
+        self._delete_intent_after_commit(wallet_id, operation_id)
         return committed_record
+
+    def _delete_intent_after_commit(
+        self, wallet_id: str, operation_id: str
+    ) -> None:
+        """提交点达成后清理提交意图；清理失败不失败已生效的提交。
+
+        提交事件已落盘即提交生效：此时意图清理（删除）失败绝不能让
+        调用方看到失败后又发现状态已提交，也不能诱发重复提交。残留意图
+        由下一次持锁自愈按"事件在则前滚"幂等清理（按 R 绝对值校正账本
+        后重试删除），绝不产生孤立或重复报告事件、不重复改账。
+        """
+        try:
+            self._store.delete_asset_commit_intent(wallet_id, operation_id)
+        except OSError:
+            pass
 
     def get_asset(self, wallet_id: str, asset_id: str) -> dict:
         """查询某资产的账本状态（balance/version）。
@@ -2098,9 +2155,9 @@ class WalletService:
         """新报告相对上一条报告的状态机校验；合法返回 None，否则返回错误信息。
 
         首报绑定 tx_id 与 chain_id：后续报告换 tx/换链一律冲突；同块
-        （高度与哈希均同）确认数只增不减，且低于门槛的同体重放不应产生
-        事件（对账时据此识别篡改）；换块的高度回退不得超过策略
-        reorg_window，换块后确认数可降。"""
+        （高度与哈希均同）确认数只增不减，且完全相同的重复报告不应产生
+        事件（同体重放在线只回 200 不记事件，对账时据此识别篡改）；
+        换块的高度回退不得超过策略 reorg_window，换块后确认数可降。"""
         if last is None:
             return None
         if report["tx_id"] != last["tx_id"]:
@@ -2114,14 +2171,11 @@ class WalletService:
         if same_block:
             if report["confirmations"] < last["confirmations"]:
                 return "confirmations must not decrease on the same block"
-            if (
-                report == last
-                and report["confirmations"] < policy["required_confirmations"]
-            ):
-                # 低于门槛的同体重放在线只回 200 不记事件：日志里出现
-                # 这样的重复报告事件即矛盾现场（达门槛的重复报告是崩溃
-                # 重试补齐提交的合法残留，不在此列）
-                return "duplicate report below the required confirmations"
+            if report == last:
+                # 同体重放在线只回 200 不记事件：日志里出现完全相同的
+                # 重复报告事件即矛盾现场（提交点未达成的孤立报告已在
+                # 恢复时随意图整体回滚摘除，不存在合法的重复报告残留）
+                return "duplicate report"
             return None
         if (
             last["block_height"] - report["block_height"]
@@ -2232,9 +2286,11 @@ class WalletService:
         首报/采纳的新报告 201，同体幂等重放 200；键集（HTTP 边界）/值
         非法 400；钱包/操作未知 404；策略未启用、链或 tx 冲突、同块
         确认数下降、高度回退越界、终态后异体报告一律 409。报告达
-        required_confirmations 时按既有 commit 契约提交一次：报告事件
-        与紧邻的唯一提交事件构成提交点，提交失败（如余额不足）报告不
-        落盘。恢复检查、校验、状态判定与事件追加全部在锁内完成。"""
+        required_confirmations 时按既有 commit 契约原子提交一次：报告
+        事件（seq n）与紧邻的唯一提交事件（seq n+1）构成提交点，提交
+        失败（如余额不足）报告不落盘；崩溃/强杀后由持锁自愈整体前滚
+        或回滚——回滚会摘除孤立报告事件，绝不留下孤立/重复报告或
+        seq 缺口。恢复检查、校验、状态判定与事件追加全部在锁内完成。"""
         try:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
@@ -2287,15 +2343,15 @@ class WalletService:
                     )
                 if last is not None and report == last:
                     if confirmations >= policy["required_confirmations"]:
-                        # 崩溃窗口遗留：报告事件已落盘但提交被回滚，
-                        # 同体重试随新报告事件补齐唯一提交（两事件紧邻）
-                        self._commit_asset_operation_locked(
-                            wallet_id,
-                            operation_id,
-                            record,
-                            report_details=report,
+                        # 达门槛报告事件在而操作仍为 pending：提交点未
+                        # 达成的孤立报告必然已被持锁自愈随意图整体回滚
+                        # 摘除，此处出现即无法唯一对账的矛盾现场，
+                        # fail-closed（绝不补记重复报告事件）
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has a threshold chain "
+                            f"report for pending asset operation "
+                            f"{operation_id!r}"
                         )
-                        return 201, report
                     return 200, report
                 error = self._report_transition_error(policy, last, report)
                 if error is not None:
@@ -2333,8 +2389,11 @@ class WalletService:
 
         - chain_policy/chain_report 事件形状必须合法（标识、hex、整数）；
         - 报告必须指向账本中存在的操作，且当时该资产策略已启用、链一致；
-        - 报告状态机（tx/链绑定、同块确认数不降、换块回退不超窗、低于
-          门槛的同体报告不产生事件、终态后不再有报告）逐事件成立；
+        - 报告状态机（tx/链绑定、同块确认数不降、换块回退不超窗、同体
+          报告不产生重复事件、终态后不再有报告）逐事件成立；
+        - 达门槛的 chain_report 必须紧邻其 asset_operation_committed
+          提交事件（提交点未达成的孤立报告已在恢复时随意图整体回滚
+          摘除，日志里出现即矛盾）；
         - 策略启用时的资产提交事件必须紧邻一条达门槛的 chain_report
           （启用时人工提交 pending 在线被 409 拒绝，日志里出现即矛盾）。
 
@@ -2347,8 +2406,22 @@ class WalletService:
         reports: dict[str, dict] = {}
         committed: set[str] = set()
         prev: dict | None = None
+        #: 达门槛报告事件等待紧邻提交事件的操作 id（None 表示无待核对）
+        expect_commit: str | None = None
         for event in self._audit.all_events(wallet_id):
             event_type = event.get("type")
+            if expect_commit is not None:
+                # 达门槛报告的下一条事件必须是同操作的提交事件
+                if not (
+                    event_type == audit.TYPE_ASSET_OPERATION_COMMITTED
+                    and event.get("request_id") == expect_commit
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a threshold chain_report "
+                        f"event for {expect_commit!r} without an adjacent "
+                        "commit event"
+                    )
+                expect_commit = None
             if event_type == audit.TYPE_CHAIN_POLICY:
                 asset_id, policy = self._chain_policy_shape(
                     wallet_id, event
@@ -2389,6 +2462,10 @@ class WalletService:
                         f"chain_report event for {operation_id!r}: {error}"
                     )
                 reports[operation_id] = report
+                if report["confirmations"] >= policy["required_confirmations"]:
+                    # 达门槛报告必须紧邻其提交事件（提交点）：下一条事件
+                    # 不是同操作的 asset_operation_committed 即矛盾
+                    expect_commit = operation_id
             elif event_type == audit.TYPE_ASSET_OPERATION_COMMITTED:
                 operation_id = event.get("request_id")
                 record = (
@@ -2420,6 +2497,12 @@ class WalletService:
                             )
                     committed.add(operation_id)
             prev = event
+        if expect_commit is not None:
+            # 日志末尾的达门槛报告没有其提交事件：孤立报告，矛盾现场
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a threshold chain_report event "
+                f"for {expect_commit!r} without an adjacent commit event"
+            )
 
     # ---- 批准 / 拒绝 -----------------------------------------------------
 
