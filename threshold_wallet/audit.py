@@ -60,6 +60,7 @@ TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
 TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
 TYPE_DKG_FAILOVER = "dkg_failover"
+TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {

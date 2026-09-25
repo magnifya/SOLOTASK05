@@ -6,6 +6,8 @@
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
 - PUT  /v1/wallets/<wallet_id>/transaction-policy   设置冷热钱包交易策略
 - GET  /v1/wallets/<wallet_id>/transaction-policy   查询冷热钱包交易策略
+- PUT  /v1/wallets/<wallet_id>/dkg-failover-policy  设置 DKG 故障审批开关
+- GET  /v1/wallets/<wallet_id>/dkg-failover-policy  查询 DKG 故障审批开关
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
@@ -173,6 +175,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200, service.get_transaction_policy(wallet_id)
                     )
                     return
+                if rest == ["dkg-failover-policy"]:
+                    self._send_json(
+                        200, service.get_dkg_failover_policy(wallet_id)
+                    )
+                    return
                 self._send_error(404, "not found")
             except Exception as exc:
                 # fail-closed 边界：业务错误按其状态码；恢复不可对账 /
@@ -198,18 +205,25 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if dkg_failover is not None:
                     wallet_id, dkg_id = dkg_failover
                     body = self._read_json_body()
-                    # 请求体仅允许 round/action/node/replacement/key 五键
-                    if set(body) != {
+                    # 请求体为旧五键，或旧五键 + approval_request_id
+                    # 六键（后者仅在 DKG 故障审批策略启用时合法，由
+                    # service 按策略判定，HTTP 层不读策略状态）
+                    body_keys = set(body)
+                    five_keys = {
                         "round",
                         "action",
                         "node",
                         "replacement",
                         "key",
+                    }
+                    if body_keys != five_keys and body_keys != five_keys | {
+                        "approval_request_id"
                     }:
                         raise ServiceError(
                             400,
                             "body must contain exactly round, action, "
-                            "node, replacement and key",
+                            "node, replacement and key, optionally with "
+                            "approval_request_id",
                         )
                     status, result = service.post_dkg_failover(
                         wallet_id,
@@ -219,6 +233,10 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("node"),
                         body.get("replacement"),
                         body.get("key"),
+                        body.get(
+                            "approval_request_id",
+                            WalletService._NO_APPROVAL,
+                        ),
                     )
                     self._send_json(status, result)
                     return
@@ -441,6 +459,19 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             body.get("mode"),
                             body.get("max_delta"),
                             body.get("allowed_assets"),
+                        )
+                        self._send_json(200, result)
+                        return
+                    if rest == ["dkg-failover-policy"]:
+                        body = self._read_json_body()
+                        # PUT 仅收 {"enabled": bool}
+                        if set(body) != {"enabled"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly enabled",
+                            )
+                        result = service.put_dkg_failover_policy(
+                            wallet_id, body.get("enabled")
                         )
                         self._send_json(200, result)
                         return

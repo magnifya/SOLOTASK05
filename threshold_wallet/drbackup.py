@@ -648,6 +648,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "session_takeover",
         "dkg_stage",
         "dkg_failover",
+        "dkg_failover_policy_updated",
     )
 )
 

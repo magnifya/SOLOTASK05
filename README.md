@@ -39,6 +39,8 @@ python -m unittest discover -s tests -v
 | PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
 | PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
+| PUT  | `/v1/wallets/{id}/dkg-failover-policy` | DKG 故障审批开关 `{"enabled":bool}` |
+| GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批开关（缺省 `{"enabled":false}`） |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
@@ -58,7 +60,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
 | POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
 | GET  | `/v1/dkg/{id}/{did}` | 查询两方 DKG 会话视图 |
-| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}` |
+| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}`（启用故障审批时另加 `approval_request_id`） |
 
 ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -227,11 +229,13 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 
 ### DKG 故障轮次
 
-`POST /v1/dkg/{id}/{did}/failover`（仅 POST），请求体恰含
+`POST /v1/dkg/{id}/{did}/failover`（仅 POST）。DKG 故障审批开关缺省
+**关闭**（见下文「DKG 故障审批」）：关闭时请求体恰含
 `{"round","action","node","replacement","key"}` 五键（含其他键或缺键
-一律 `400`）：当某方节点故障时，从当前轮派生下一轮（`round` 必须恰为
+一律 `400`）。当某方节点故障时，从当前轮派生下一轮（`round` 必须恰为
 当前轮 +1）——首轮故障基于基线轮（第 1 轮），后续故障基于当前轮。
-`node`/`replacement` 为安全标识。
+`node`/`replacement` 为安全标识。开关启用时请求体在旧五键之外恰增
+`approval_request_id` 一键，其余契约不变。
 
 - `abort`：仅限非终态轮（非 `done`/`aborted`），`node`/`replacement`/
   `key` 必须全为 `null`；派生轮 `state` 为 `aborted`，三数组为空。
@@ -239,8 +243,9 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   hex（换入方公钥贡献），`node` 须为当前轮在用节点、`replacement`
   须空闲；新轮中 `replacement` 顶替 `node` 的槽位，`committed`/
   `shared` 两数组清空，回到 `commit` 阶段。非法 `400`、冲突 `409`。
-- 首提 `201`；同参重放 `200`（优先于状态判定）；同 `round` 异参
-  `409`；`round` 不等于当前轮 +1 `409`；钱包/会话未知 `404`。
+- 首提 `201`；已提交轮次的旧五键同参重放 `200`（**优先于状态与审批
+  判定，不复查审批单**）；同 `round` 异参 `409`；`round` 不等于
+  当前轮 +1 `409`；钱包/会话未知 `404`。
 - 无任何故障轮次时，`/v1/dkg/{id}/{did}` 无需参照轮次（行为与旧版
   一致）；存在故障轮次后必须带 `?round=R` 当前轮：缺参 `409`、旧轮
   `409`、未知轮 `404`、非法 R `400`；GET 成功 `200`，POST 体仍为旧
@@ -248,10 +253,40 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   `commit`/`share` 沿用旧约。
 - 故障轮次仅由 `dkg_failover` 审计事件持久化（`request_id` 为
   `<会话id>/<轮次>`，`actor_id`/`reason` 为 `null`，details 依次
-  `id,round,action,node,replacement,key,state`）：首提在每钱包跨进程
-  事务锁内追加，事件为唯一提交点，跨进程并发只有一个 `201`，重放
-  不记。矛盾/损坏现场 fail-closed（常驻 `503`、`serve` 拒绝就绪），
-  重启/灾备恢复后轮次与 seq 不变。
+  `id,round,action,node,replacement,key,state`，**不含审批标识**）：
+  首提在每钱包跨进程事务锁内追加，事件为唯一提交点，跨进程并发只有
+  一个 `201`，重放不记。矛盾/损坏现场 fail-closed（常驻 `503`、
+  `serve` 拒绝就绪），重启/灾备恢复后轮次与 seq 不变。响应、日志、
+  非份额文件绝不含私钥或份额正文。
+
+### DKG 故障审批（可选）
+
+- `PUT /v1/wallets/{id}/dkg-failover-policy`：请求体仅收
+  `{"enabled": bool}`（恰一键，多/缺或非布尔 `400`），成功 `200`
+  返回同体；`GET` 成功 `200` 同体，从未设置时缺省
+  `{"enabled": false}`（无 `404`）；钱包不存在 `404`。
+- 开关仅由 `dkg_failover_policy_updated` 审计事件持久化
+  （`request_id`/`actor_id`/`reason` 均为 `null`，details 恰为
+  `{"enabled": bool}`，取最后一条恢复），不写策略状态文件；**同值
+  更新也记事件**。事件损坏/形状矛盾 fail-closed（常驻 `503`、`serve`
+  拒绝就绪），重启/灾备恢复后开关与 seq 不变。
+- 开关启用时 `POST .../failover` 请求体恰收旧五键及
+  `approval_request_id`（匹配安全标识，非法/缺失 `400`）；关闭时
+  夹带该键一律 `400`。
+- `approval_request_id` 必须指向**同一钱包**既有审批单；审批工作流
+  沿用 sign-requests 契约（须先配置审批策略、建单并批准）。审批单
+  `message` 必须与紧凑 JSON **逐字一致**（无空格、键序固定）：
+  `{"dkg_id":"D","round":R,"action":"A","node":N,"replacement":X,"key":K}`，
+  其中 N/X/K 按旧五键约定为字符串或 `null`。
+- 审批单为 `approved` 且提交轮次恰为当前轮 +1 时故障方可执行
+  （`201`）；审批单未知、`pending`、`rejected`、`expired`（操作前
+  按既有契约懒过期）、message 不符，或审批通过但轮次已变化，一律
+  `409` 且不追加事件、DKG 现场不变。
+- 已提交轮次的旧五键同参重放优先返回 `200`，不再复查开关与审批单
+  现状（审批单事后被拒绝/过期、开关切换都不影响幂等重放）；异参仍
+  `409`。
+- 审批检查、事件追加与 DKG 轮次派生全在同一把每钱包跨进程事务锁内
+  原子完成，跨进程并发同一轮次只有一个 `201`，审计 seq 连续不重号。
 
 ### 份额轮换
 
@@ -304,7 +339,7 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
-`dkg_failover`。
+`dkg_failover`、`dkg_failover_policy_updated`。
 
 ## 多进程与故障恢复（保证）
 
