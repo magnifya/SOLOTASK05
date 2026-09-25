@@ -54,6 +54,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
+| POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/replace` | 替换会话单节点参与者 `{"replacement_id","offline_share_id"}` |
 
 ID（wallet/rotation/operation/asset/session 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -127,6 +128,30 @@ JSON 对象。
   `expired`/`signed`；重放不产生事件，details 只含标识/状态/整数/原文，
   绝不含签名或私钥。
 
+### 会话单节点替换
+
+`POST /v1/wallets/{id}/sign-sessions/{sid}/participants/replace`，请求体
+仅 `{"replacement_id","offline_share_id"}`，两个 ID 均为安全标识
+（非法 `400`）；钱包/会话未知 `404`；会话非 `collecting|ready`（含到点
+懒过期）或 `offline_share_id` 不是该会话当前在用份额 `409`。
+
+- 首次替换生成全新 Ed25519 份额 `<replacement_id>-share` 替换原槽位：
+  会话快照原槽位换入新 id，剔除旧份额已收签名、保留另一份（ready 回
+  退为 collecting）。成功 `201`；同 ID 同参重放 `200`（**已提交重放
+  优先**，不再做状态/到期检查）；同 ID 异参或派生份额 id 已被占用
+  `409`。响应为既有会话视图。
+- 新份额私钥只写入 `shares/<id>/<replacement_id>-share.json`（恰
+  `share_id`/`public_key`/`private_key` 三键，两个 hex 值均为 64 位
+  小写；UTF-8 无 BOM、`sort_keys`、2 空格缩进、末尾换行的原子写）。
+  钱包元数据与钱包公钥不变。
+- 替换后旧份额投递 `400`；新份额沿用 Ed25519 校验与既有审批/hot-cold
+  门控，两份齐备后按原规则聚合。
+- 审计事件 `session_participant_replaced`：`request_id` 为会话 id，
+  `actor_id`/`reason` 为 `null`，`details` 恰含
+  `session_id,old_share_id,new_share_id`。该事件为唯一提交点：落盘前
+  回滚并删除新份额文件，落盘后前滚补齐；跨进程仅一个 `201`，损坏或
+  矛盾现场保留并 `503`。
+
 ### 份额轮换
 
 - `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
@@ -176,7 +201,8 @@ JSON 对象。
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
-`transaction_policy_updated`、`session_event`。
+`transaction_policy_updated`、`session_event`、
+`session_participant_replaced`。
 
 ## 多进程与故障恢复（保证）
 

@@ -1877,12 +1877,15 @@ class WalletStore:
             self.save_wallet_meta(wallet_id, new_meta)
 
         # 链顶份额逐份落盘；shares/ 目录最终只能剩链顶两份（清掉创世及
-        # 历史各轮残留，也清掉崩溃窗口换入到一半的杂份）。
+        # 历史各轮残留，也清掉崩溃窗口换入到一半的杂份）。会话单节点替换
+        # 的份额（"<replacement_id>-share"，钱包/轮换份额绝不以 "-share"
+        # 结尾）不属于轮换现场，由签名会话恢复按
+        # session_participant_replaced 事件单独对账，这里一律保留。
         for share_record in tail_share_records:
             self.save_share(wallet_id, share_record)
         tail_set = set(tail_share_ids)
         for share_id in self.list_share_files(wallet_id):
-            if share_id not in tail_set:
+            if share_id not in tail_set and not share_id.endswith("-share"):
                 self.delete_share(wallet_id, share_id)
 
         # 已提交各轮的暂存私钥/备份残留全部清干净（历史轮一般已无目录）。
@@ -1991,7 +1994,13 @@ class WalletStore:
             if ids != tail_ids:
                 return False
             # shares/ 目录只能有链顶两份，且逐份与链顶公钥密码学一致
-            if set(self.list_share_files(wallet_id)) != set(tail_ids):
+            # （会话单节点替换的 "-share" 份额由签名会话恢复单独对账，
+            # 不在此判定）
+            if {
+                sid
+                for sid in self.list_share_files(wallet_id)
+                if not sid.endswith("-share")
+            } != set(tail_ids):
                 return False
             halves = (
                 bytes.fromhex(tail_pub)[:32],

@@ -54,6 +54,7 @@ TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
+TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -257,6 +258,46 @@ class AuditStore:
             if isinstance(request_id, str):
                 result.setdefault(request_id, []).append(dict(event))
         return result
+
+    def participant_replaced_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 session_participant_replaced 事件，按 request_id
+        （会话 id）分组。
+
+        会话单节点替换以该事件为唯一提交点：事件在则替换不可撤回（前滚），
+        事件不在则回滚并清理新份额文件。纯只读，不分配 seq。"""
+        data = self._read(wallet_id)
+        result: dict[str, list[dict]] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != TYPE_SESSION_PARTICIPANT_REPLACED:
+                continue
+            request_id = event.get("request_id")
+            if isinstance(request_id, str):
+                result.setdefault(request_id, []).append(dict(event))
+        return result
+
+    def find_participant_replaced_event(
+        self, wallet_id: str, request_id: str, new_share_id: str
+    ) -> Optional[dict]:
+        """按 (request_id, details.new_share_id) 查找一条已持久化的
+        session_participant_replaced 事件，不存在返回 None。
+
+        替换事务的崩溃对账据此判定提交点是否已落盘。纯只读，不分配 seq。"""
+        for event in self.participant_replaced_events(wallet_id).get(
+            request_id, []
+        ):
+            details = event.get("details")
+            if (
+                isinstance(details, dict)
+                and details.get("new_share_id") == new_share_id
+            ):
+                return dict(event)
+        return None
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射

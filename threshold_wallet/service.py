@@ -24,6 +24,7 @@ from .store import (
     DuplicateWalletError,
     RecoveryError,
     WalletStore,
+    _SAFE_SHARE_ID,
     parse_utc_iso,
 )
 
@@ -2254,11 +2255,10 @@ class WalletService:
             )
 
         absent = [sid for sid in share_ids if sid not in public]
-        if absent:
-            raise RecoveryError(
-                f"wallet {wallet_id!r} sign session references shares "
-                f"{absent!r} with no resolvable public key"
-            )
+        # 会话单节点替换换入的份额不在钱包元数据/轮换链中：其权威公钥来自
+        # 对应份额文件（缺失/损坏/矛盾即 fail-closed）
+        for sid in absent:
+            public[sid] = self._replacement_share_public_key(wallet_id, sid)
         return {sid: public[sid] for sid in share_ids}
 
     @staticmethod
@@ -2556,16 +2556,23 @@ class WalletService:
             # 未收过的新份额：collecting/ready 仅接受当前在用快照中的份额；
             # 轮换后失效旧份额与不属于本会话快照的份额一律 400。signed 为
             # 终态，其两份份额必在 received 中，故走到这里的必为非法份额。
-            if share_id not in session_ids or share_id not in share_pub:
+            if share_id not in session_ids:
                 raise ServiceError(
                     400, f"unknown or inactive share_id {share_id!r}"
+                )
+            # 会话单节点替换换入的份额不是钱包在用份额：其公钥从对应份额
+            # 文件解析（缺失/损坏/矛盾 fail-closed，转 503）
+            public_hex = share_pub.get(share_id)
+            if public_hex is None:
+                public_hex = self._replacement_share_public_key(
+                    wallet_id, share_id
                 )
 
             # 新份额：必须是在用份额私钥对 id 与 message 直接拼接载荷的
             # 有效 Ed25519 签名
             payload = crypto.build_payload(session_id, record["message"])
             if not crypto.verify_share(
-                bytes.fromhex(share_pub[share_id]), payload, signature
+                bytes.fromhex(public_hex), payload, signature
             ):
                 raise ServiceError(
                     400, f"signature verification failed for {share_id}"
@@ -2631,6 +2638,222 @@ class WalletService:
             return 409, self._session_view(record)
         signed_record = self._commit_session_signed(wallet_id, record)
         return 200, self._session_view(signed_record)
+
+    # ---- 会话单节点替换 ---------------------------------------------------
+
+    @staticmethod
+    def _validate_replacement_id(replacement_id: object) -> None:
+        if not isinstance(replacement_id, str) or not ROTATION_ID_RE.match(
+            replacement_id
+        ):
+            raise ServiceError(
+                400, "replacement_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    @staticmethod
+    def _validate_offline_share_id(offline_share_id: object) -> None:
+        if not isinstance(offline_share_id, str) or not ROTATION_ID_RE.match(
+            offline_share_id
+        ):
+            raise ServiceError(
+                400, "offline_share_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    def _replacement_share_public_key(
+        self, wallet_id: str, share_id: str
+    ) -> str:
+        """从份额文件解析（并严格校验）替换份额的公钥。
+
+        会话单节点替换生成的新份额不是钱包在用份额，其公钥只能来自
+        ``shares/<wallet_id>/<share_id>.json``：文件缺失、形状非法、hex
+        非 64 位小写、私钥推导不出记录公钥等任何矛盾都抛 RecoveryError
+        （fail-closed：常驻请求 503、阻止就绪），绝不信任请求自报或猜写。
+        """
+        record = self._store.get_share(wallet_id, share_id)
+        problem = RecoveryError(
+            f"wallet {wallet_id!r} replacement share {share_id!r} "
+            "cannot be reconciled"
+        )
+        if not isinstance(record, dict):
+            raise problem
+        if set(record) != {"share_id", "public_key", "private_key"}:
+            raise problem
+        if record["share_id"] != share_id:
+            raise problem
+        public_hex = record["public_key"]
+        private_hex = record["private_key"]
+        for value in (public_hex, private_hex):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)
+            ):
+                raise problem
+        public_bytes = bytes.fromhex(public_hex)
+        private_bytes = bytes.fromhex(private_hex)
+        try:
+            derived = crypto.public_key_from_private(private_bytes)
+        except (ValueError, TypeError):
+            raise problem
+        if derived != public_bytes:
+            raise problem
+        return public_hex
+
+    def replace_sign_session_participant(
+        self,
+        wallet_id: str,
+        session_id: str,
+        replacement_id: object,
+        offline_share_id: object,
+    ) -> tuple[int, dict]:
+        """替换会话的一名参与者（单节点替换），返回 (状态码, 会话视图)。
+
+        - 首替 201；同 replacement_id 同 offline_share_id 重放 200（已提交
+          重放优先，不再做状态/到期检查）；同 ID 异参或派生份额 id 被占用
+          409；两 ID 非法 400；钱包/会话未知 404；会话非 collecting|ready
+          （含到点懒过期）或目标不是当前在用份额 409。
+        - 新份额 ``<replacement_id>-share`` 为全新 Ed25519 密钥对，私钥只
+          写入 ``shares/<wallet_id>/<新 id>.json``（恰
+          share_id/public_key/private_key 三键）；会话快照原槽位换入新
+          id，剔除旧份额已收签名、保留另一份。
+        - session_participant_replaced 事件为唯一提交点：事件未落盘则
+          回滚会话记录并删除新份额文件；事件已落盘则前滚补齐。
+        """
+        try:
+            return self._replace_participant_tx(
+                wallet_id, session_id, replacement_id, offline_share_id
+            )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _replace_participant_tx(
+        self,
+        wallet_id: str,
+        session_id: str,
+        replacement_id: object,
+        offline_share_id: object,
+    ) -> tuple[int, dict]:
+        with self._wallet_lock(wallet_id):
+            self._heal_wallet(wallet_id)
+            # 404 优先于 400：锁内先判定钱包存在性
+            wallet = self._store.get_wallet(wallet_id)
+            if wallet is None:
+                raise ServiceError(404, f"wallet {wallet_id!r} not found")
+            self._validate_session_id(session_id)
+            record = self._store.get_sign_session(wallet_id, session_id)
+            if record is None:
+                raise ServiceError(
+                    404, f"sign session {session_id!r} not found"
+                )
+            self._validate_replacement_id(replacement_id)
+            self._validate_offline_share_id(offline_share_id)
+            # replacement_id 为安全标识（<=128），派生份额 id 追加 "-share"
+            # 后仍落在份额标识上限（136）内
+            new_share_id = f"{replacement_id}-share"
+
+            # 已提交重放优先：以 session_participant_replaced 事件为准。
+            # 同 ID 同参 200（原样返回磁盘当前视图，不触发懒过期、不记事件）；
+            # 同 ID 异参 409；派生份额 id 被其他会话的已提交替换占用 409。
+            replacements = self._audit.participant_replaced_events(wallet_id)
+            for event in replacements.get(session_id, []):
+                details = event["details"]
+                if details["new_share_id"] != new_share_id:
+                    continue
+                if details["old_share_id"] == offline_share_id:
+                    return 200, self._session_view(record)
+                raise ServiceError(
+                    409,
+                    f"replacement {replacement_id!r} already committed with "
+                    "different parameters",
+                )
+            for other_session, events in replacements.items():
+                if other_session == session_id:
+                    continue
+                for event in events:
+                    if event["details"]["new_share_id"] == new_share_id:
+                        raise ServiceError(
+                            409,
+                            f"replacement share {new_share_id!r} is already "
+                            "in use",
+                        )
+
+            # 懒过期：到点的 collecting/ready 原子转 expired（仅一次事件）
+            record = self._session_expire_if_needed(wallet_id, record)
+            if record["state"] not in ("collecting", "ready"):
+                raise ServiceError(
+                    409,
+                    f"sign session {session_id!r} is {record['state']}, "
+                    "not collecting or ready",
+                )
+            if offline_share_id not in record["share_ids"]:
+                raise ServiceError(
+                    409,
+                    f"share {offline_share_id!r} is not an active participant "
+                    f"of sign session {session_id!r}",
+                )
+
+            # 崩溃窗口残留（份额文件已写、替换事件未落盘）：按未提交回滚，
+            # 删除孤儿新份额后走首次替换
+            if new_share_id in self._store.list_share_files(wallet_id):
+                self._store.delete_share(wallet_id, new_share_id)
+
+            new_key = crypto.generate_share_key(new_share_id)
+            share_record = {
+                "share_id": new_key.share_id,
+                "public_key": new_key.public_bytes.hex(),
+                # 仅该份额自己的私钥；系统中不存在完整私钥
+                "private_key": new_key.private_bytes.hex(),
+            }
+            updated = dict(record)
+            # 原槽位换入新份额 id；剔除旧份额已收签名、保留另一份
+            updated["share_ids"] = [
+                new_share_id if sid == offline_share_id else sid
+                for sid in record["share_ids"]
+            ]
+            updated["shares"] = [
+                entry
+                for entry in record["shares"]
+                if entry["share_id"] != offline_share_id
+            ]
+            updated["state"] = (
+                "ready" if len(updated["shares"]) == 2 else "collecting"
+            )
+            event = self._audit_event(
+                audit.TYPE_SESSION_PARTICIPANT_REPLACED,
+                request_id=session_id,
+                details={
+                    "session_id": session_id,
+                    "old_share_id": offline_share_id,
+                    "new_share_id": new_share_id,
+                },
+            )
+            try:
+                # 事务顺序：新份额文件 -> 替换事件（唯一提交点）-> 会话记录。
+                # 事件前只写可安全删除/可前滚补齐的现场。
+                self._store.save_share(wallet_id, share_record)
+                self._emit(wallet_id, event)
+                self._store.update_sign_session(wallet_id, session_id, updated)
+            except BaseException:
+                # 以替换事件是否真正落盘为唯一判据，而不是是否抛错
+                landed = self._audit.find_participant_replaced_event(
+                    wallet_id, session_id, new_share_id
+                )
+                if landed is not None:
+                    # 事件已落盘（提交不可撤回）：前滚补齐份额文件与会话
+                    # 记录，绝不回滚、不重复记事件
+                    self._store.save_share(wallet_id, share_record)
+                    self._store.update_sign_session(
+                        wallet_id, session_id, updated
+                    )
+                    return 201, self._session_view(updated)
+                # 事件未落盘：会话记录尚未更新（更新排在事件之后），回滚
+                # 只需删除新份额文件
+                self._store.delete_share(wallet_id, new_share_id)
+                raise
+            return 201, self._session_view(updated)
 
     # -- 签名会话严格加载与崩溃恢复 ----------------------------------------
 
@@ -2708,8 +2931,24 @@ class WalletService:
         # 的矛盾现场，必须读取审计并 fail-closed。
         file_exists = self._store.sign_session_file_exists(wallet_id)
         if not file_exists:
+            # 无会话文件也可能残留单节点替换的崩溃现场（新份额文件已写、
+            # 会话记录/事件未落盘）：仅当发现 "-share" 份额文件时才读取
+            # 审计对账——无任何替换痕迹时保持零审计依赖。
+            if any(
+                sid.endswith("-share")
+                for sid in self._store.list_share_files(wallet_id)
+            ):
+                if self._audit.participant_replaced_events(wallet_id):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has participant replacement "
+                        "events but no sign session file"
+                    )
+                self._cleanup_orphan_replacement_shares(wallet_id, set())
             return
         events_by_session = self._audit.session_events(wallet_id)
+        replacements_by_session = self._audit.participant_replaced_events(
+            wallet_id
+        )
         timeline = self._rotation_timeline(wallet_id)
         wallet = self._store.get_wallet(wallet_id)
         if records and not isinstance(wallet, dict):
@@ -2742,21 +2981,85 @@ class WalletService:
                     "created event but no session record"
                 )
 
+        # 单节点替换事件的全局对账：有事件无记录＝矛盾；派生新份额 id 跨
+        # 会话重复＝重复提交点；已提交替换的份额文件必须存在且自洽。
+        committed_new_ids: set[str] = set()
+        for session_id, rep_events in replacements_by_session.items():
+            if session_id not in recorded_ids:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} has "
+                    "participant replacement events but no session record"
+                )
+            for event in rep_events:
+                details = event.get("details")
+                new_id = (
+                    details.get("new_share_id")
+                    if isinstance(details, dict)
+                    else None
+                )
+                if not isinstance(new_id, str):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has a participant replacement event without a "
+                        "new_share_id"
+                    )
+                if new_id in committed_new_ids:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} replacement share {new_id!r} "
+                        "is committed by more than one session"
+                    )
+                committed_new_ids.add(new_id)
+        for new_id in sorted(committed_new_ids):
+            # 已提交替换的份额文件缺失/损坏/密钥矛盾：fail-closed，保留现场
+            self._replacement_share_public_key(wallet_id, new_id)
+
         for record in records:
             self._recover_one_sign_session(
                 wallet_id,
                 record,
                 events_by_session,
+                replacements_by_session.get(record["id"], []),
                 timeline,
                 current_ids,
                 wallet,
             )
+        # 事件未落盘的替换残留（崩溃窗口：份额文件已写、提交点未达）：
+        # 安全删除孤儿新份额，绝不触碰任何已提交/在用份额文件
+        self._cleanup_orphan_replacement_shares(wallet_id, committed_new_ids)
+
+    def _cleanup_orphan_replacement_shares(
+        self, wallet_id: str, committed_new_ids: set[str]
+    ) -> None:
+        """删除无已提交替换事件对应的 "-share" 份额文件（未提交替换残留）。
+
+        钱包在用份额（share-1/2）与轮换份额（<rid>-share-1/2）绝不以
+        "-share" 结尾，故该后缀的文件只可能来自单节点替换；有已提交事件
+        对应的一律保留。调用方须持钱包事务锁。"""
+        wallet = self._store.get_wallet(wallet_id)
+        in_use: set[str] = set()
+        if isinstance(wallet, dict):
+            for entry in wallet.get("shares", []):
+                if isinstance(entry, dict) and isinstance(
+                    entry.get("share_id"), str
+                ):
+                    in_use.add(entry["share_id"])
+        for rotation in self._store.list_rotations(wallet_id):
+            for sid in rotation.get("share_ids", []):
+                if isinstance(sid, str):
+                    in_use.add(sid)
+        for sid in self._store.list_share_files(wallet_id):
+            if not sid.endswith("-share"):
+                continue
+            if sid in committed_new_ids or sid in in_use:
+                continue
+            self._store.delete_share(wallet_id, sid)
 
     def _recover_one_sign_session(
         self,
         wallet_id: str,
         record: dict,
         events_by_session: dict[str, list[dict]],
+        replacements: list[dict],
         timeline: list[tuple[int, tuple[str, str]]],
         current_ids: tuple[str, str] | None,
         wallet: dict,
@@ -2781,8 +3084,15 @@ class WalletService:
             "created"
         ) != 1:
             # created 必须是首个动作且唯一；无 created 事件 -> 创建未提交，
-            # 回滚删除残留记录（事件未落盘的残留记录重启即清）。
+            # 回滚删除残留记录（事件未落盘的残留记录重启即清）。但已有提交
+            # 的替换事件时删除记录会丢提交点：矛盾现场，fail-closed。
             if "created" not in actions:
+                if replacements:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has participant replacement events but no created "
+                        "event"
+                    )
                 self._store.delete_sign_session(wallet_id, session_id)
                 return
             raise RecoveryError(
@@ -2800,6 +3110,83 @@ class WalletService:
                 f"wallet {wallet_id!r} sign session {session_id!r} created "
                 "event does not match the record"
             )
+
+        # ---- 单节点替换链：严格校验并构造会话级在用快照函数 --------------
+        # session_participant_replaced 事件使会话快照在钱包轮换时间线之上
+        # 继续演化：每次替换把当时快照中 old 所在槽位换为 new。
+        rep_chain: list[tuple[int, str, str]] = []
+        for event in replacements:
+            seq = event.get("seq")
+            details = event.get("details")
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not isinstance(details, dict)
+                or set(details)
+                != {"session_id", "old_share_id", "new_share_id"}
+                or details.get("session_id") != session_id
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} has a "
+                    "malformed participant replacement event"
+                )
+            old_id = details["old_share_id"]
+            new_id = details["new_share_id"]
+            if (
+                not isinstance(old_id, str)
+                or not _SAFE_SHARE_ID.match(old_id)
+                or not isinstance(new_id, str)
+                or not new_id.endswith("-share")
+                or not ROTATION_ID_RE.match(new_id[: -len("-share")])
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} has a "
+                    "participant replacement event with malformed share ids"
+                )
+            rep_chain.append((seq, old_id, new_id))
+        rep_chain.sort(key=lambda item: item[0])
+
+        def snapshot_at(
+            seq: int, chain: list[tuple[int, str, str]]
+        ) -> list[str]:
+            """会话在指定审计 seq 时刻的在用快照：钱包轮换时间线打底，
+            再应用该 seq 之前（含）且晚于最近一次轮换激活的替换事件。"""
+            base = list(self._active_share_set_at(timeline, seq))
+            last_activation = 0
+            for activation_seq, _unused in timeline:
+                if activation_seq <= seq:
+                    last_activation = activation_seq
+            for rep_seq, old_id, new_id in chain:
+                if last_activation < rep_seq <= seq and old_id in base:
+                    base[base.index(old_id)] = new_id
+            return base
+
+        # 替换链严格校验：替换不得早于 created；每次替换的 old 必须是当时
+        # 快照内的在用份额；new 不得已在快照中、不得重复提交。
+        created_seq = session_events[0]["seq"]
+        applied: list[tuple[int, str, str]] = []
+        for rep_seq, old_id, new_id in rep_chain:
+            if rep_seq <= created_seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} has a "
+                    "participant replacement before its created event"
+                )
+            snap = snapshot_at(rep_seq, applied)
+            if old_id not in snap:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} "
+                    f"replaces share {old_id!r} that was not active at seq "
+                    f"{rep_seq!r}"
+                )
+            if new_id in snap or any(n == new_id for _, _, n in applied):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} "
+                    f"commits replacement share {new_id!r} twice"
+                )
+            applied.append((rep_seq, old_id, new_id))
+        rep_chain = applied
 
         # 严格校验动作顺序，并重建各动作提交时刻的已收份额序列。
         # committed_events: 按 seq 顺序的 share_received 事件（跨轮换）。
@@ -2827,7 +3214,7 @@ class WalletService:
                         f"wallet {wallet_id!r} sign session {session_id!r} "
                         "share_received event has malformed share_id"
                     )
-                active_set = self._active_share_set_at(timeline, seq)
+                active_set = snapshot_at(seq, rep_chain)
                 if sid not in active_set:
                     raise RecoveryError(
                         f"wallet {wallet_id!r} sign session {session_id!r} "
@@ -2848,8 +3235,7 @@ class WalletService:
                 effective = [
                     e
                     for e in committed_events
-                    if e["details"]["share_id"]
-                    in self._active_share_set_at(timeline, seq)
+                    if e["details"]["share_id"] in snapshot_at(seq, rep_chain)
                 ]
                 expected_state = (
                     "ready" if len(effective) == 2 else "collecting"
@@ -2866,7 +3252,7 @@ class WalletService:
                         f"wallet {wallet_id!r} sign session {session_id!r} "
                         "signed event has malformed state"
                     )
-                active_set = self._active_share_set_at(timeline, seq)
+                active_set = snapshot_at(seq, rep_chain)
                 effective = [
                     e
                     for e in committed_events
@@ -2914,18 +3300,41 @@ class WalletService:
             None,
         )
 
-        # 终态冻结其提交时刻的在用快照；非终态以钱包当前在用份额为准。
+        # 替换不得出现在终态之后（终态会话不可再替换参与者）
+        terminal_event_seq = signed_seq or expired_seq
+        if terminal_event_seq is not None:
+            for rep_seq, _old, _new in rep_chain:
+                if rep_seq > terminal_event_seq:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has a participant replacement after its terminal "
+                        "event"
+                    )
+
+        # 终态冻结其提交时刻的在用快照；非终态以钱包当前在用份额为准，
+        # 再应用最近一次轮换激活之后的全部已提交替换。
         if terminal == "signed":
-            effective_ids = self._active_share_set_at(timeline, signed_seq)
+            effective_ids = tuple(snapshot_at(signed_seq, rep_chain))
         elif terminal == "expired":
-            effective_ids = self._active_share_set_at(timeline, expired_seq)
+            effective_ids = tuple(snapshot_at(expired_seq, rep_chain))
         else:
             if current_ids is None:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} metadata missing during session "
                     "recovery"
                 )
-            effective_ids = current_ids
+            migrated = list(current_ids)
+            last_activation = timeline[-1][0] if timeline else 0
+            for rep_seq, old_id, new_id in rep_chain:
+                if rep_seq <= last_activation:
+                    continue
+                if old_id not in migrated:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        f"replaces share {old_id!r} that is not active"
+                    )
+                migrated[migrated.index(old_id)] = new_id
+            effective_ids = tuple(migrated)
 
         committed_ids = [
             event["details"]["share_id"] for event in committed_events
@@ -2968,11 +3377,21 @@ class WalletService:
                     continue
                 if (
                     sid not in act_ids
-                    and sid
-                    in self._active_share_set_at(timeline, act_seq - 1)
+                    and sid in snapshot_at(act_seq - 1, rep_chain)
                 ):
                     evicted = True
                     break
+            if not evicted:
+                # 单节点替换同样剔除旧份额：替换事件提交后旧份额的已存
+                # 签名被移除（其 share_received 事件保留在仅追加审计中）
+                for rep_seq, old_id, _new_id in rep_chain:
+                    if rep_seq <= event_seq:
+                        continue
+                    if terminal_seq is not None and rep_seq > terminal_seq:
+                        continue
+                    if old_id == sid:
+                        evicted = True
+                        break
             if not evicted:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} sign session {session_id!r} "
@@ -2980,12 +3399,13 @@ class WalletService:
                 )
 
         # 非终态记录的 share_ids 必须等于某一历史时刻的在用快照；终态记录
-        # 的 share_ids 必须冻结为终态提交时刻快照。
+        # 的 share_ids 必须冻结为终态提交时刻快照。历史快照由轮换激活与
+        # 单节点替换共同确定（快照只在这两类事件处变化）。
         historical_sets = {("share-1", "share-2")}
-        for act_seq, act_ids in timeline:
-            historical_sets.add(
-                self._active_share_set_at(timeline, act_seq)
-            )
+        snapshot_points = [act_seq for act_seq, _act_ids in timeline]
+        snapshot_points += [rep_seq for rep_seq, _o, _n in rep_chain]
+        for point in snapshot_points:
+            historical_sets.add(tuple(snapshot_at(point, rep_chain)))
         recorded_ids = tuple(record["share_ids"])
         if recorded_ids not in historical_sets:
             raise RecoveryError(
