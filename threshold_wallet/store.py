@@ -1125,6 +1125,14 @@ class WalletStore:
         report = intent.get("report")
         if report is not None and not chain_report_shape_ok(report):
             return False
+        # 多源仲裁触发的提交在意图中随附布尔 vote（与报告触发二选一，
+        # 在线只可能由达 quorum 的仲裁路径写入）：崩溃恢复据此判定
+        # "票事件 + 提交事件"两事件提交点是否完整。
+        vote = intent.get("vote")
+        if vote is not None and not isinstance(vote, bool):
+            return False
+        if report is not None and vote is not None:
+            return False
         old_balance = old_asset["balance"] if old_asset is not None else 0
         old_version = old_asset["version"] if old_asset is not None else 0
         return (

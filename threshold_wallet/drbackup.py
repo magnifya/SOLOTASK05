@@ -651,6 +651,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "dkg_failover_policy_updated",
         "chain_policy",
         "chain_report",
+        "chain_vote",
     )
 )
 

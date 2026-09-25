@@ -63,6 +63,7 @@ TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
 TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
+TYPE_CHAIN_VOTE = "chain_vote"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -119,6 +120,12 @@ _DETAILS_KEY_ORDER = {
         "block_hash",
         "confirmations",
     ),
+    # chain_vote 事件有两种 details 形状（策略与票），各自保序：
+    # 策略 {sources,quorum}，票 {source,report,state}。
+    TYPE_CHAIN_VOTE: (
+        ("sources", "quorum"),
+        ("source", "report", "state"),
+    ),
 }
 
 
@@ -132,9 +139,13 @@ def _order_event_details(event: dict) -> None:
     details = event.get("details")
     if order is None or not isinstance(details, dict):
         return
-    if set(details) != set(order):
-        return
-    event["details"] = {key: details[key] for key in order}
+    # 同一事件类型存在多种既定 details 形状时（如 chain_vote 的策略/票），
+    # 命中任一形状即按该形状键序重排；都不命中留给语义对账 fail-closed。
+    orders = order if (order and isinstance(order[0], tuple)) else (order,)
+    for keys in orders:
+        if set(details) == set(keys):
+            event["details"] = {key: details[key] for key in keys}
+            return
 
 
 def _canonicalize_sorted(value: object) -> object:

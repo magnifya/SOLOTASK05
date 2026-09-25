@@ -23,6 +23,9 @@
 - PUT  /v1/wallets/<wallet_id>/chain/<asset_id>            设置跨链确认策略
 - GET  /v1/wallets/<wallet_id>/chain/<asset_id>            查询跨链确认策略
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/report 上报链上确认数
+- PUT  /v1/wallets/<wallet_id>/chain/<asset_id>/arbitration 设置多源仲裁策略
+- GET  /v1/wallets/<wallet_id>/chain/<asset_id>/arbitration 查询多源仲裁策略
+- POST /v1/wallets/<wallet_id>/chain/<operation_id>/observe 安全源上报观察票
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
@@ -161,6 +164,16 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if len(rest) == 2 and rest[0] == "chain":
                     self._send_json(
                         200, service.get_chain_policy(wallet_id, rest[1])
+                    )
+                    return
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "arbitration"
+                ):
+                    self._send_json(
+                        200,
+                        service.get_chain_arbitration(wallet_id, rest[1]),
                     )
                     return
                 if len(rest) == 2 and rest[0] == "sign-sessions":
@@ -442,6 +455,27 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
                 if (
                     len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "observe"
+                ):
+                    body = self._read_json_body()
+                    # 请求体仅允许 source/report 两键
+                    if set(body) != {"source", "report"}:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly source and report",
+                        )
+                    status, result = service.observe(
+                        wallet_id,
+                        rest[1],
+                        body.get("source"),
+                        body.get("report"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
                     and rest[0] == "share-rotations"
                     and rest[2] == "activate"
                 ):
@@ -538,6 +572,26 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             body.get("enabled"),
                             body.get("required_confirmations"),
                             body.get("reorg_window"),
+                        )
+                        self._send_json(200, result)
+                        return
+                    if (
+                        len(rest) == 3
+                        and rest[0] == "chain"
+                        and rest[2] == "arbitration"
+                    ):
+                        body = self._read_json_body()
+                        # PUT 仅收 sources/quorum 两键
+                        if set(body) != {"sources", "quorum"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly sources and quorum",
+                            )
+                        result = service.put_chain_arbitration(
+                            wallet_id,
+                            rest[1],
+                            body.get("sources"),
+                            body.get("quorum"),
                         )
                         self._send_json(200, result)
                         return

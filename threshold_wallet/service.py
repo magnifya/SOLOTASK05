@@ -26,6 +26,7 @@ from .store import (
     RecoveryError,
     WalletStore,
     _SAFE_SHARE_ID,
+    chain_report_shape_ok,
     parse_utc_iso,
 )
 
@@ -274,6 +275,10 @@ class WalletService:
             # 链确认事件（chain_policy/chain_report）与提交门控对账：
             # 报告状态机逐事件重放，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_events(wallet_id)
+            # 多源仲裁事件（chain_vote：策略与观察票）与账本/提交门控
+            # 对账：票状态机逐事件重放、adopted 票紧邻提交事件、仲裁
+            # 配置后无人工/链报告提交，矛盾/损坏 fail-closed；纯只读。
+            self._reconcile_chain_vote_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 会话仅由 dkg_stage 事件持久化：严格重建校验即对账，
             # 矛盾/损坏 fail-closed；对账不写任何状态、不记事件、不改 seq。
@@ -410,6 +415,8 @@ class WalletService:
                 # 链确认报告/策略事件与账本提交门控同属账本一致性：
                 # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_events(wallet_id)
+                # 多源仲裁策略/票事件同理按 seq 重放对账。
+                self._reconcile_chain_vote_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
@@ -1669,6 +1676,9 @@ class WalletService:
         # 报告触发的提交在意图中随附达门槛报告 B：报告事件与提交事件同批
         # 原子落盘，恢复据此核对两事件提交点完整且紧邻同体。
         report = intent.get("report")
+        # 仲裁触发的提交在意图中随附达 quorum 票的布尔 report：票事件与
+        # 提交事件同批原子落盘，恢复据此核对两事件提交点完整且紧邻同体。
+        vote = intent.get("vote")
         event = self._audit.find_event_by_request(
             wallet_id,
             audit.TYPE_ASSET_OPERATION_COMMITTED,
@@ -1699,6 +1709,10 @@ class WalletService:
             if report is not None:
                 self._check_report_commit_pair(
                     wallet_id, operation_id, event, report
+                )
+            if vote is not None:
+                self._check_vote_commit_pair(
+                    wallet_id, operation_id, event, vote
                 )
             committed_record = {
                 "operation_id": operation_id,
@@ -1735,6 +1749,14 @@ class WalletService:
             # fail-closed 保留现场，绝不静默回滚抹掉证据后继续服务。
             self._check_report_rollback_prefix(
                 wallet_id, operation_id, intent, report
+            )
+        if vote is not None:
+            # 仲裁触发的提交：票事件与提交事件同批原子落盘，提交事件
+            # 缺失即意图随附的达 quorum 票也不可能落盘。回滚前重放该
+            # 操作既有历史票严格判定——历史票必须合法（源在策略内、同
+            # 源不异报、未达 quorum），且意图票在其时刻策略下达 quorum。
+            self._check_vote_rollback_prefix(
+                wallet_id, operation_id, intent, vote
             )
         pending = intent["pending"]
         asset_id = intent["asset_id"]
@@ -1917,6 +1939,16 @@ class WalletService:
                     f"asset {record['asset_id']!r} requires chain "
                     "confirmation reports to commit",
                 )
+            # 资产已配置多源仲裁策略时，pending 操作只能等安全源观察票
+            # 达 quorum 后随票自动提交，人工提交一律 409（committed
+            # 重放在上方已直接返回 200，不受影响）
+            arbitration, _votes = self._arbitration_state(wallet_id)
+            if arbitration.get(record["asset_id"]) is not None:
+                raise ServiceError(
+                    409,
+                    f"asset {record['asset_id']!r} requires multi-source "
+                    "arbitration votes to commit",
+                )
             committed_record = self._commit_asset_operation_locked(
                 wallet_id, operation_id, record
             )
@@ -1928,24 +1960,28 @@ class WalletService:
         operation_id: str,
         record: dict,
         report_details: dict | None = None,
+        vote_details: dict | None = None,
     ) -> dict:
         """在每钱包事务锁内提交一条 pending 操作，返回 committed 视图 R。
 
         调用方须已持锁、已 heal、已判定 record 为 pending。事务顺序：
 
             1. 写提交意图（记录 committed 结果 R 与提交前资产快照；
-               报告触发的提交另随附达门槛报告 B）
+               报告触发的提交另随附达门槛报告 B，仲裁触发的提交另随附
+               达 quorum 的布尔 vote）
             2. 原子提交账本：操作转 committed、balance 改、version+1
             3. 追加提交事件（report_details 非 None 时，chain_report 与
                asset_operation_committed 两事件同批一次原子落盘，
-               seq 为 n、n+1，报告在先）
+               seq 为 n、n+1，报告在先；vote_details 非 None 时同理，
+               chain_vote 票事件在先）
             4. 删除提交意图
 
-        链上确认报告达门槛触发的提交传入 report_details：报告事件与提交
-        事件紧邻同批落盘，构成"报告事件后紧邻唯一提交事件"的单一提交点，
-        崩溃窗口内绝不出现孤立报告事件或 seq 缺口。崩溃恢复以提交事件
-        是否落盘为准：事件在则前滚补齐（并核对紧邻报告事件与意图随附
-        报告一致），事件不在则整体回滚 pending 与提交前余额/版本。
+        链上确认报告达门槛或多源仲裁票达 quorum 触发的提交分别传入
+        report_details / vote_details（二者互斥）：触发事件与提交事件
+        紧邻同批落盘，构成"触发事件后紧邻唯一提交事件"的单一提交点，
+        崩溃窗口内绝不出现孤立触发事件或 seq 缺口。崩溃恢复以提交事件
+        是否落盘为准：事件在则前滚补齐（并核对紧邻触发事件与意图随附
+        详情一致），事件不在则整体回滚 pending 与提交前余额/版本。
         """
         asset_id = record["asset_id"]
         asset = self._store.get_asset(wallet_id, asset_id)
@@ -1981,9 +2017,15 @@ class WalletService:
             "new_version": new_version,
         }
         if report_details is not None:
+            if vote_details is not None:
+                raise ValueError("report and vote commits are mutually exclusive")
             # 报告触发的提交：意图随附达门槛报告 B，崩溃恢复据此把
             # 两事件提交点与孤立报告矛盾现场严格区分开
             intent["report"] = report_details
+        if vote_details is not None:
+            # 仲裁触发的提交：意图随附达 quorum 票的布尔 report，崩溃恢复
+            # 据此把两事件提交点与孤立票矛盾现场严格区分开
+            intent["vote"] = vote_details["report"]
         try:
             self._store.write_asset_commit_intent(
                 wallet_id, operation_id, intent
@@ -2005,6 +2047,23 @@ class WalletService:
                             audit.TYPE_CHAIN_REPORT,
                             request_id=operation_id,
                             details=report_details,
+                        ),
+                        self._audit_event(
+                            audit.TYPE_ASSET_OPERATION_COMMITTED,
+                            request_id=operation_id,
+                            details=committed_record,
+                        ),
+                    ],
+                )
+            elif vote_details is not None:
+                # 达 quorum 的票事件与提交事件同批一次原子落盘
+                self._audit.append_events(
+                    wallet_id,
+                    [
+                        self._audit_event(
+                            audit.TYPE_CHAIN_VOTE,
+                            request_id=operation_id,
+                            details=vote_details,
                         ),
                         self._audit_event(
                             audit.TYPE_ASSET_OPERATION_COMMITTED,
@@ -2403,6 +2462,20 @@ class WalletService:
                     raise ServiceError(
                         404, f"asset operation {operation_id!r} not found"
                     )
+                # 多源仲裁配置后，pending 操作只能由安全源观察票驱动，
+                # 链上确认报告一律 409（committed 重放在下方终态分支仍
+                # 200 同体，不会走到这里）。
+                arbitration, _vote_map = self._arbitration_state(wallet_id)
+                if (
+                    record["state"] == "pending"
+                    and arbitration.get(record["asset_id"]) is not None
+                ):
+                    raise ServiceError(
+                        409,
+                        f"asset {record['asset_id']!r} is under multi-source "
+                        "arbitration; chain reports are not accepted for "
+                        "pending operations",
+                    )
                 policy = self._chain_policies(wallet_id).get(
                     record["asset_id"]
                 )
@@ -2564,8 +2637,10 @@ class WalletService:
                 if record is not None:
                     policy = policies.get(record["asset_id"])
                     if policy is not None and policy["enabled"]:
-                        # 启用时只能经报告提交：提交事件必须紧邻一条
-                        # 达门槛的 chain_report
+                        # 启用时人工提交被拒，只能经链确认报告或（该资产
+                        # 另配多源仲裁后）达 quorum 的仲裁票提交：提交
+                        # 事件必须紧邻一条达门槛的 chain_report 或一条
+                        # adopted chain_vote 票，否则是矛盾现场。
                         trigger = (
                             prev.get("details")
                             if prev is not None
@@ -2573,18 +2648,767 @@ class WalletService:
                             and prev.get("request_id") == operation_id
                             else None
                         )
-                        if (
-                            not isinstance(trigger, dict)
-                            or trigger.get("confirmations")
-                            < policy["required_confirmations"]
-                        ):
+                        vote_trigger = (
+                            prev.get("details")
+                            if prev is not None
+                            and prev.get("type") == audit.TYPE_CHAIN_VOTE
+                            and prev.get("request_id") == operation_id
+                            else None
+                        )
+                        report_ok = isinstance(
+                            trigger, dict
+                        ) and trigger.get(
+                            "confirmations"
+                        ) >= policy["required_confirmations"]
+                        vote_ok = (
+                            isinstance(vote_trigger, dict)
+                            and vote_trigger.get("state") == "adopted"
+                        )
+                        if not report_ok and not vote_ok:
                             raise RecoveryError(
                                 f"wallet {wallet_id!r} committed asset "
                                 f"operation {operation_id!r} without a "
-                                "preceding threshold chain report"
+                                "preceding threshold chain report or "
+                                "adopted arbitration ballot"
                             )
                     committed.add(operation_id)
             prev = event
+
+    # ---- 多源仲裁 ---------------------------------------------------------
+
+    @staticmethod
+    def _chain_vote_policy_shape(wallet_id: str, event: dict) -> tuple[str, dict]:
+        """严格校验一条仲裁策略形态的 chain_vote 事件，返回 (资产标识, Q)。
+
+        request_id 为资产标识（安全 id），actor_id/reason 为 null，
+        details 恰含 {sources, quorum}：sources 为非空对象、键为安全 id、
+        值全为布尔（启用源），quorum 为 [2, 启用源数] 内的非布尔整数。
+        畸形事件是不可对账现场（RecoveryError，fail-closed）。"""
+        if (
+            event.get("actor_id") is not None
+            or event.get("reason") is not None
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_vote policy event with "
+                "actor/reason set"
+            )
+        asset_id = event.get("request_id")
+        if not isinstance(asset_id, str) or not ROTATION_ID_RE.match(
+            asset_id
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_vote policy event "
+                "without an asset id"
+            )
+        details = event.get("details")
+        if not isinstance(details, dict) or set(details) != {
+            "sources",
+            "quorum",
+        }:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_vote policy event"
+            )
+        sources = details["sources"]
+        quorum = details["quorum"]
+        if not isinstance(sources, dict) or not sources:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_vote policy event"
+            )
+        enabled = 0
+        for source, flag in sources.items():
+            if (
+                not isinstance(source, str)
+                or not ROTATION_ID_RE.match(source)
+                or not isinstance(flag, bool)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed chain_vote "
+                    "policy event"
+                )
+            if flag:
+                enabled += 1
+        if (
+            not isinstance(quorum, int)
+            or isinstance(quorum, bool)
+            or quorum < 2
+            or quorum > enabled
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_vote policy event"
+            )
+        return asset_id, {"sources": dict(sources), "quorum": quorum}
+
+    @staticmethod
+    def _chain_vote_ballot_shape(wallet_id: str, event: dict) -> tuple[str, dict]:
+        """严格校验一条观察票形态的 chain_vote 事件，返回 (操作 id, 票)。
+
+        request_id 为资产操作 id，actor_id/reason 为 null，details 恰含
+        {source, report, state}：source 为安全 id，report 为布尔，
+        state ∈ {collecting, conflict, adopted}。畸形即不可对账现场。"""
+        if (
+            event.get("actor_id") is not None
+            or event.get("reason") is not None
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_vote ballot event with "
+                "actor/reason set"
+            )
+        operation_id = event.get("request_id")
+        if not isinstance(operation_id, str) or not ROTATION_ID_RE.match(
+            operation_id
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_vote ballot event "
+                "without an operation id"
+            )
+        details = event.get("details")
+        if not isinstance(details, dict) or set(details) != {
+            "source",
+            "report",
+            "state",
+        }:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_vote ballot event"
+            )
+        source = details["source"]
+        report = details["report"]
+        state = details["state"]
+        if (
+            not isinstance(source, str)
+            or not ROTATION_ID_RE.match(source)
+            or not isinstance(report, bool)
+            or state not in ("collecting", "conflict", "adopted")
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed chain_vote ballot event"
+            )
+        return operation_id, {
+            "source": source,
+            "report": report,
+            "state": state,
+        }
+
+    def _chain_vote_events(self, wallet_id: str) -> list[dict]:
+        """该钱包全部 chain_vote 事件，按 seq 升序（返回副本）。"""
+        return self._audit.events_by_type(wallet_id, audit.TYPE_CHAIN_VOTE)
+
+    def _arbitration_state(
+        self, wallet_id: str
+    ) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+        """从 chain_vote 事件序列恢复仲裁现场（调用方须持钱包锁）。
+
+        返回 (policies, ballots)：
+
+        - policies：{资产标识: Q}，每个资产的仲裁策略取最后一条策略
+          形态的 chain_vote 事件（同值更新也记事件，恢复取末条）；
+        - ballots：{操作 id: [票事件按 seq 升序]}，每操作至多每个源
+          一条票（同源源 id 重复出现即矛盾现场）。
+
+        策略与票都仅由审计事件持久化；畸形/矛盾事件 fail-closed
+        （RecoveryError），绝不静默按缺省处理。纯只读，不分配 seq。"""
+        policies: dict[str, dict] = {}
+        ballots: dict[str, list[dict]] = {}
+        for event in self._chain_vote_events(wallet_id):
+            details = event.get("details")
+            if isinstance(details, dict) and set(details) == {
+                "sources",
+                "quorum",
+            }:
+                asset_id, policy = self._chain_vote_policy_shape(
+                    wallet_id, event
+                )
+                policies[asset_id] = policy
+            elif isinstance(details, dict) and set(details) == {
+                "source",
+                "report",
+                "state",
+            }:
+                operation_id, ballot = self._chain_vote_ballot_shape(
+                    wallet_id, event
+                )
+                ballots.setdefault(operation_id, []).append(ballot)
+            else:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed chain_vote event"
+                )
+        for operation_id, votes in ballots.items():
+            seen: set[str] = set()
+            for ballot in votes:
+                if ballot["source"] in seen:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple chain_vote "
+                        f"ballots from {ballot['source']!r} for "
+                        f"{operation_id!r}"
+                    )
+                seen.add(ballot["source"])
+        return policies, ballots
+
+    @staticmethod
+    def _arbitration_ballot_state(votes: list[dict]) -> str:
+        """按各源最后（也是唯一）票的布尔 report 汇总当前状态。
+
+        真票与假票并存（两类计数都 >0）为 conflict；否则为 collecting。
+        adopted 不由此判定（它是终态标记，由提交后回传）。"""
+        yes = sum(1 for vote in votes if vote["report"])
+        no = len(votes) - yes
+        if yes > 0 and no > 0:
+            return "conflict"
+        return "collecting"
+
+    def put_chain_arbitration(
+        self,
+        wallet_id: str,
+        asset_id: object,
+        sources: object,
+        quorum: object,
+    ) -> dict:
+        """设置（或覆盖）某资产的多源仲裁策略。成功 200 返回 Q。
+
+        Q={"sources","quorum"}：sources 为 ``{安全ID: bool}``（按 ID
+        升序校验，至少一个启用源），quorum 为 [2, 启用源数] 内非布尔
+        整数。策略仅由 chain_vote 审计事件持久化（request_id 为资产
+        标识，actor_id/reason 为 null，details 即 Q），**同值更新也记
+        事件**，不写任何策略状态文件。
+
+        钱包不存在 404；标识/值非法 400（键集由 HTTP 边界校验）；该
+        资产存在未决（pending）资产操作时 409 不改。恢复检查、存在性
+        判定、校验与事件追加全部在每钱包跨进程事务锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_asset_id(asset_id)
+                if not isinstance(sources, dict) or not sources:
+                    raise ServiceError(
+                        400,
+                        "sources must be a non-empty object mapping source "
+                        "ids to booleans",
+                    )
+                enabled_ids: list[str] = []
+                for source, flag in sources.items():
+                    self._validate_source_id(source)
+                    if not isinstance(flag, bool):
+                        raise ServiceError(
+                            400, "each sources value must be a boolean"
+                        )
+                    if flag:
+                        enabled_ids.append(source)
+                if not (
+                    isinstance(quorum, int)
+                    and not isinstance(quorum, bool)
+                    and 2 <= quorum <= len(enabled_ids)
+                ):
+                    raise ServiceError(
+                        400,
+                        "quorum must be an integer within [2, number of "
+                        "enabled sources]",
+                    )
+                # 先严格重放既有 chain_vote 事件（策略与票）：历史损坏/
+                # 矛盾即 fail-closed，绝不追加事件把现场盖成"看似合法"。
+                self._arbitration_state(wallet_id)
+                # 未决判定先于写入：该资产任何 pending 操作都拒绝改策略，
+                # 账本/version/审计均不变。
+                ledger = self._store.check_asset_ledger_semantics(wallet_id)
+                for record in ledger["operations"].values():
+                    if (
+                        record["asset_id"] == asset_id
+                        and record["state"] == "pending"
+                    ):
+                        raise ServiceError(
+                            409,
+                            f"asset {asset_id!r} has a pending operation; "
+                            "arbitration policy is locked while undecided",
+                        )
+                # sources 以 ID 升序落盘（响应/事件 details 键序稳定）
+                ordered_sources = {
+                    source: sources[source]
+                    for source in sorted(sources)
+                }
+                policy = {"sources": ordered_sources, "quorum": quorum}
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_VOTE,
+                        request_id=asset_id,
+                        details=policy,
+                    ),
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return policy
+
+    def get_chain_arbitration(
+        self, wallet_id: str, asset_id: str
+    ) -> dict:
+        """读取某资产的多源仲裁策略：已配置 200 同体，未配置 404。
+
+        策略纯由 chain_vote 事件恢复（取该资产最后一条策略形态事件）；
+        损坏/矛盾事件 fail-closed（由 HTTP 边界转 503）。钱包不存在 404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在，再判定策略是否已配置
+                self._get_wallet_or_404(wallet_id)
+                self._validate_asset_id(asset_id)
+                policies, _ballots = self._arbitration_state(wallet_id)
+                policy = policies.get(asset_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        if policy is None:
+            raise ServiceError(
+                404,
+                f"wallet {wallet_id!r} has no multi-source arbitration "
+                f"policy for asset {asset_id!r}",
+            )
+        return policy
+
+    @staticmethod
+    def _validate_source_id(source: object) -> None:
+        if not isinstance(source, str) or not ROTATION_ID_RE.match(source):
+            raise ServiceError(
+                400, "source must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    def observe(
+        self,
+        wallet_id: str,
+        operation_id: object,
+        source: object,
+        report: object,
+    ) -> tuple[int, dict]:
+        """安全源上报对某资产操作的观察票。返回 (HTTP 状态码, {state})。
+
+        - 各源首收 201；同源同体重放 200（不记事件）；
+        - 同源改报 409 不改；source 非安全 ID/非布尔 report 400；
+          source 未知或在当前策略中停用 409；钱包/操作未知 404；
+          终态（committed）后新增票 409 不改；
+        - 不同源投出不同布尔票并存为 conflict；
+        - 真票达 quorum 时在锁内原子提交：达 quorum 票事件与紧邻的唯一
+          asset_operation_committed 事件同批落盘，state 回 adopted；
+          其余冲突情形维持 collecting/conflict。
+
+        恢复检查、校验、状态判定与事件追加全部在每钱包跨进程事务锁内
+        完成；跨进程并发只有一个 201 触发提交。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_operation_id(operation_id)
+                self._validate_source_id(source)
+                if not isinstance(report, bool):
+                    raise ServiceError(400, "report must be a boolean")
+                record = self._store.get_asset_operation(
+                    wallet_id, operation_id
+                )
+                if record is None:
+                    raise ServiceError(
+                        404, f"asset operation {operation_id!r} not found"
+                    )
+                policies, ballots = self._arbitration_state(wallet_id)
+                policy = policies.get(record["asset_id"])
+                if policy is None:
+                    # 该资产未配置仲裁策略：任何源都属"未知源"，按冲突
+                    # 处理（409），与链确认报告"策略未配置 409"同构。
+                    raise ServiceError(
+                        409,
+                        f"asset {record['asset_id']!r} has no multi-source "
+                        "arbitration policy; the source is unknown",
+                    )
+                sources = policy["sources"]
+                prior = ballots.get(operation_id, [])
+                mine = next(
+                    (vote for vote in prior if vote["source"] == source),
+                    None,
+                )
+                if record["state"] == "committed":
+                    # 终态判定优先于"当前策略启用源"门控：曾参与投票的
+                    # 源即便在操作提交后的策略更新中被停用，其同源同体
+                    # 重放仍是幂等 200（重放不复查策略现状，与 DKG 故障
+                    # 轮次重放同一原则），回操作当前状态 adopted；改报或
+                    # 从未投过票的新源一律 409 不改。
+                    if mine is not None and mine["report"] == report:
+                        return 200, {"state": "adopted"}
+                    raise ServiceError(
+                        409,
+                        f"asset operation {operation_id!r} is already "
+                        "committed",
+                    )
+                if not sources.get(source, False):
+                    raise ServiceError(
+                        409,
+                        f"source {source!r} is unknown or disabled by the "
+                        "arbitration policy",
+                    )
+                if mine is not None:
+                    if mine["report"] == report:
+                        # 同源同体重放：不记事件，回当前汇总状态
+                        return (
+                            200,
+                            {
+                                "state": self._arbitration_ballot_state(prior)
+                            },
+                        )
+                    raise ServiceError(
+                        409,
+                        f"source {source!r} already reported "
+                        f"{mine['report']!r} for operation "
+                        f"{operation_id!r}",
+                    )
+                votes = prior + [
+                    {"source": source, "report": report}
+                ]
+                yes = sum(1 for vote in votes if vote["report"])
+                if yes >= policy["quorum"]:
+                    # 达 quorum：票与提交在锁内原子完成。达 quorum 票事件
+                    # 与紧邻的唯一提交事件同批落盘（见
+                    # _commit_asset_operation_locked），state 为 adopted。
+                    vote_details = {
+                        "source": source,
+                        "report": report,
+                        "state": "adopted",
+                    }
+                    self._commit_asset_operation_locked(
+                        wallet_id,
+                        operation_id,
+                        record,
+                        vote_details=vote_details,
+                    )
+                    return 201, {"state": "adopted"}
+                state = self._arbitration_ballot_state(votes)
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_VOTE,
+                        request_id=operation_id,
+                        details={
+                            "source": source,
+                            "report": report,
+                            "state": state,
+                        },
+                    ),
+                )
+                return 201, {"state": state}
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _check_vote_commit_pair(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        commit_event: dict,
+        vote_report: bool,
+    ) -> None:
+        """核对仲裁触发提交的两事件提交点：提交事件前一条必须是同操作、
+        details 为 adopted 且 report 与意图随附布尔一致的 chain_vote 票。
+
+        两事件同批原子落盘且紧邻（seq 为 n、n+1）；前条缺失、类型/操作
+        不符或票内容不一致都是不可对账的矛盾现场（RecoveryError，
+        fail-closed，保留现场）。"""
+        commit_seq = commit_event.get("seq")
+        predecessor = None
+        if isinstance(commit_seq, int) and not isinstance(commit_seq, bool):
+            for candidate in self._audit.all_events(wallet_id):
+                if candidate.get("seq") == commit_seq - 1:
+                    predecessor = candidate
+                    break
+        details = predecessor.get("details") if predecessor is not None else None
+        if (
+            predecessor is None
+            or predecessor.get("type") != audit.TYPE_CHAIN_VOTE
+            or predecessor.get("request_id") != operation_id
+            or not isinstance(details, dict)
+            or set(details) != {"source", "report", "state"}
+            or details.get("report") != vote_report
+            or details.get("state") != "adopted"
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} committed asset operation "
+                f"{operation_id!r} without an adjacent matching adopted "
+                "chain_vote event"
+            )
+
+    def _check_vote_rollback_prefix(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        intent: dict,
+        vote_report: bool,
+    ) -> None:
+        """回滚仲裁票意图前的严格判定（提交事件缺失时，调用方须持锁）。
+
+        重放该操作既有历史票（seq 升序）：历史必须是在线合法票序列
+        （源在当时策略内且启用、同源不异报——事件存储每源至多一条、
+        状态与投票汇总一致），历史中绝无 adopted 票（其紧邻提交事件
+        缺失即矛盾），且意图票在历史票加入后真票恰达 quorum（达 quorum
+        的提交只会由真票触发）。任何一步无法判定都是崩溃窗口外的矛盾
+        现场（外部篡改/半写），RecoveryError 保留现场，绝不静默回滚。"""
+        history: list[dict] = []
+        for event in self._chain_vote_events(wallet_id):
+            details = event.get("details")
+            if not isinstance(details, dict) or set(details) != {
+                "source",
+                "report",
+                "state",
+            }:
+                # 策略形态事件不参与某操作的历史票（形状由
+                # _arbitration_state 严格校验）
+                continue
+            past_operation, past = self._chain_vote_ballot_shape(
+                wallet_id, event
+            )
+            if past_operation == operation_id:
+                history.append(past)
+        policies, _ballots = self._arbitration_state(wallet_id)
+        policy = policies.get(intent["asset_id"])
+        if policy is None:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} vote intent for asset operation "
+                f"{operation_id!r} has no arbitration policy"
+            )
+        sources = policy["sources"]
+        quorum = policy["quorum"]
+        seen_sources: set[str] = set()
+        for index, past in enumerate(history):
+            if past["state"] == "adopted":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an adopted chain_vote for "
+                    f"asset operation {operation_id!r} without its committed "
+                    "event"
+                )
+            if not sources.get(past["source"], False):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_vote from an unknown "
+                    f"or disabled source for {operation_id!r}"
+                )
+            if past["source"] in seen_sources:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has repeated chain_vote ballots "
+                    f"from {past['source']!r} for {operation_id!r}"
+                )
+            seen_sources.add(past["source"])
+            expected = self._arbitration_ballot_state(history[: index + 1])
+            if past["state"] != expected:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an inconsistent chain_vote "
+                    f"state for {operation_id!r}"
+                )
+        yes = sum(1 for vote in history if vote["report"])
+        if yes >= quorum:
+            # 历史真票已达 quorum 却没有 adopted 票/提交事件：矛盾现场
+            raise RecoveryError(
+                f"wallet {wallet_id!r} chain_vote history for "
+                f"{operation_id!r} reached quorum without adoption"
+            )
+        if not vote_report or yes + 1 != quorum:
+            # 在线只有真票达 quorum 才会写票+提交意图；意图票为假票或
+            # 加入后真票数不等于 quorum（超过或不到）都不可能来自正常流程
+            raise RecoveryError(
+                f"wallet {wallet_id!r} vote intent for asset operation "
+                f"{operation_id!r} is not the legal quorum ballot"
+            )
+
+    def _reconcile_chain_vote_events(self, wallet_id: str) -> None:
+        """chain_vote 事件（仲裁策略与观察票）与账本/链确认提交的严格
+        对账（调用方须持钱包事务锁；意图残留须已先恢复清零）。
+
+        按 seq 重放全部事件，逐事件核对在线规则：
+
+        - 策略事件形状合法（sources 为安全 ID→布尔、quorum ∈
+          [2, 启用源数]）；
+        - 票事件必须指向账本中存在的操作，且投票时刻该资产已配置仲裁
+          策略、源在该时刻策略中启用；同源至多一条票；
+        - 非 adopted 票的 state 必须等于按历史票汇总的 collecting/
+          conflict；adopted 票必须紧邻同操作的
+          asset_operation_committed（两事件同批原子落盘），且真票达
+          quorum；
+        - 仲裁策略启用（存在）时该资产的人工提交与链确认报告提交都不
+          得发生（pending 操作的这两条路径在线都被 409 拒绝）；
+        - committed 操作若伴随票提交，其紧邻前驱必须是同操作 adopted
+          票；终态后不得再有该操作的票。
+
+        任一矛盾抛 RecoveryError（fail-closed，保留现场）。纯只读，
+        不写状态、不记事件、不改 seq。
+        """
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        operations = ledger["operations"]
+        events = self._audit.all_events(wallet_id)
+        # 每操作的提交事件 seq（账本 ↔ 事件双向对账已保证至多一条）：
+        # 该 seq 之后再出现该操作的票即"终态后新增票"矛盾现场。
+        commit_seq_by_op: dict[str, int] = {}
+        for event in events:
+            if (
+                event.get("type")
+                == audit.TYPE_ASSET_OPERATION_COMMITTED
+            ):
+                op = event.get("request_id")
+                if isinstance(op, str):
+                    commit_seq_by_op[op] = event["seq"]
+        policies: dict[str, dict] = {}
+        ballots: dict[str, list[dict]] = {}
+        ballot_seqs: dict[str, list[int]] = {}
+        adopted: set[str] = set()
+        for index, event in enumerate(events):
+            event_type = event.get("type")
+            if event_type != audit.TYPE_CHAIN_VOTE:
+                continue
+            details = event.get("details")
+            if isinstance(details, dict) and set(details) == {
+                "sources",
+                "quorum",
+            }:
+                asset_id, policy = self._chain_vote_policy_shape(
+                    wallet_id, event
+                )
+                # 在线时该资产存在任何持票未决（pending）操作，PUT 一律
+                # 409。故策略事件时刻，该资产此前投过票的操作必须已经
+                # 提交（提交 seq 早于本策略事件）；仍未决即矛盾现场。
+                for operation_id in ballot_seqs:
+                    record = operations.get(operation_id)
+                    if record is None or record["asset_id"] != asset_id:
+                        continue
+                    commit_seq = commit_seq_by_op.get(operation_id)
+                    if commit_seq is None or commit_seq > event["seq"]:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has an arbitration policy "
+                            f"update for asset {asset_id!r} while operation "
+                            f"{operation_id!r} still had undecided ballots"
+                        )
+                policies[asset_id] = policy
+                continue
+            operation_id, ballot = self._chain_vote_ballot_shape(
+                wallet_id, event
+            )
+            record = operations.get(operation_id)
+            if record is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_vote ballot for "
+                    f"unknown asset operation {operation_id!r}"
+                )
+            policy = policies.get(record["asset_id"])
+            if policy is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_vote ballot for "
+                    f"{operation_id!r} before its arbitration policy"
+                )
+            if not policy["sources"].get(ballot["source"], False):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_vote ballot from an "
+                    f"unknown or disabled source for {operation_id!r}"
+                )
+            history = ballots.get(operation_id, [])
+            if any(vote["source"] == ballot["source"] for vote in history):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has repeated chain_vote ballots "
+                    f"from {ballot['source']!r} for {operation_id!r}"
+                )
+            if operation_id in adopted:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_vote ballot for an "
+                    f"already adopted operation {operation_id!r}"
+                )
+            commit_seq = commit_seq_by_op.get(operation_id)
+            if commit_seq is not None and event["seq"] > commit_seq:
+                # 终态后新增票：在线对 committed 操作的新源投票/改报一律
+                # 409 不落事件，审计里出现即矛盾现场
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_vote ballot for "
+                    f"{operation_id!r} after its committed event"
+                )
+            if ballot["state"] == "adopted":
+                follower = (
+                    events[index + 1] if index + 1 < len(events) else None
+                )
+                if (
+                    follower is None
+                    or follower.get("type")
+                    != audit.TYPE_ASSET_OPERATION_COMMITTED
+                    or follower.get("request_id") != operation_id
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has an adopted chain_vote "
+                        f"for {operation_id!r} without an adjacent committed "
+                        "event"
+                    )
+                votes = history + [ballot]
+                yes = sum(1 for vote in votes if vote["report"])
+                if not ballot["report"] or yes != policy["quorum"]:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} adopted chain_vote for "
+                        f"{operation_id!r} did not reach quorum with true "
+                        "ballots"
+                    )
+                adopted.add(operation_id)
+            else:
+                votes = history + [ballot]
+                expected = self._arbitration_ballot_state(votes)
+                if ballot["state"] != expected:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_vote ballot state for "
+                        f"{operation_id!r} is inconsistent with its ballots"
+                    )
+                yes = sum(1 for vote in votes if vote["report"])
+                if yes >= policy["quorum"]:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a non-adopted chain_vote "
+                        f"for {operation_id!r} that already reached quorum"
+                    )
+            ballots.setdefault(operation_id, []).append(ballot)
+            ballot_seqs.setdefault(operation_id, []).append(event["seq"])
+        # 反向门控：仲裁配置后该资产 pending 操作的人工提交与链确认报告
+        # 提交在线一律 409；审计里出现即矛盾现场。以提交事件发生时刻
+        # （seq）该资产是否已有仲裁策略为准。
+        vote_policy_seqs: dict[str, list[int]] = {}
+        for event in events:
+            if event.get("type") == audit.TYPE_CHAIN_VOTE:
+                details = event.get("details")
+                if isinstance(details, dict) and set(details) == {
+                    "sources",
+                    "quorum",
+                }:
+                    asset_id, _policy = self._chain_vote_policy_shape(
+                        wallet_id, event
+                    )
+                    vote_policy_seqs.setdefault(asset_id, []).append(
+                        event["seq"]
+                    )
+        for index, event in enumerate(events):
+            if (
+                event.get("type")
+                != audit.TYPE_ASSET_OPERATION_COMMITTED
+            ):
+                continue
+            operation_id = event.get("request_id")
+            record = operations.get(operation_id)
+            if record is None:
+                # 账本 ↔ committed 事件双向对账已覆盖，这里不重复判定
+                continue
+            seqs = vote_policy_seqs.get(record["asset_id"])
+            if not seqs:
+                continue
+            predecessor = events[index - 1] if index > 0 else None
+            if (
+                predecessor is not None
+                and predecessor.get("type") == audit.TYPE_CHAIN_VOTE
+                and predecessor.get("request_id") == operation_id
+            ):
+                # 仲裁票触发的合法提交
+                continue
+            if any(seq < event["seq"] for seq in seqs):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} committed asset operation "
+                    f"{operation_id!r} without an arbitration ballot while "
+                    "an arbitration policy was configured"
+                )
 
     # ---- 批准 / 拒绝 -----------------------------------------------------
 
