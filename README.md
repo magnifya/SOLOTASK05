@@ -381,11 +381,12 @@ quorum 后按既有 commit 契约自动提交。
   `Q={"sources","quorum"}`（含其他键或缺键一律 `400`）。`sources` 为
   ID 升序的 `{安全ID: bool}`（至少一个启用源）；`quorum` 为
   `[2, 启用源数]` 内的非布尔整数（拒绝布尔/0/1/越界/小数）。成功
-  `200` 返回 Q；钱包不存在 `404`。该资产存在未决仲裁
-  （collecting/conflict）时 `PUT` 一律 `409`，策略与票现场均不变。
-  策略仅由 `chain_arbitration` 审计事件持久化（`request_id` 为资产
-  标识，`actor_id`/`reason` 为 `null`，details 即 Q，每个资产取最后
-  一条恢复），**同值更新也记事件**，不写策略状态文件。
+  `200` 返回 Q；钱包不存在 `404`。该资产**只要存在任一 pending 资产
+  操作**（即使尚无任何观察票）`PUT` 一律 `409`，策略、审计与 seq 均
+  不变；无 pending 操作（全部终态或尚无操作）时方可更新。策略仅由
+  **七字段 `chain_vote`** 审计事件持久化（`request_id` 为资产标识，
+  `actor_id`/`reason` 为 `null`，details 键序 `sources,quorum`，每个
+  资产取最后一条恢复），**同值更新也记事件**，不写策略状态文件。
 - `GET .../arbitration`：已配置 `200` 同体，未配置 `404`；钱包不
   存在 `404`。
 - `POST /v1/wallets/{id}/chain/{oid}/observe`：`oid` 为资产操作 id。
@@ -402,17 +403,26 @@ quorum 后按既有 commit 契约自动提交。
   其余未凑齐为 `collecting`；与本票同体的票数（含本票）达到 quorum
   时本票状态为 `adopted`，按既有 commit 契约提交一次（`201`）。
   余额不足等提交失败时票不落盘（`409`，可重试）。
-- 达 quorum 时决定性 `chain_vote` 票、`chain_report`(B) 与紧邻的唯一
-  `asset_operation_committed` 三事件在每钱包事务锁内**同批一次原子
-  落盘**（seq 为 n、n+1、n+2），崩溃窗口内绝无孤票或缺 seq。提交后
-  同源同体仍 `200`（state=adopted），异体或新源票 `409`。
+- 达 quorum 时决定性 `chain_vote` 观察票（details 键序
+  `source,report,state`，state=adopted）、`chain_report`(B) 与紧邻的
+  唯一 `asset_operation_committed` 三事件在每钱包事务锁内**同批一次
+  原子落盘**（seq 为 n、n+1、n+2），崩溃窗口内绝无孤票或缺 seq。
+  提交后同源同体仍 `200`（state=adopted），异体或新源票 `409`。
+- 仲裁策略事件与观察票事件**同为七字段 `chain_vote`**，恢复按 details
+  的**精确键集**区分：`{sources,quorum}` 为策略、
+  `{source,report,state}` 为票；键集两者皆非即损坏。合法旧
+  `chain_arbitration` 策略事件仅**只读兼容**（与新事件一同按 seq 重放，
+  每资产取最后一条；在线 PUT 不再写该类型）。
 - 启用仲裁后 `POST .../chain/{oid}/report` 对该资产 pending 操作一律
   `409`（committed 重放仍 `200`）；仲裁票的 `chain_id` 必须与该资产
   已启用的跨链确认策略链一致。
-- 策略与票仅由审计事件持久化：并发、跨进程、服务重启与灾备恢复后
-  视图与 seq 连续不变；票形状/来源/状态机矛盾、孤 adopted 票等
-  fail-closed（常驻 `503`、`serve` 拒绝就绪），恢复不重报、不提交、
-  不新增审计事件、不改 seq。
+- 策略与票仅由审计事件持久化：启动与持钱包锁访问都重放策略、票、操作
+  和相邻提交事件；未知操作票、畸形票、重复来源、错误 state 或提交关系
+  矛盾均保留现场并抛 `RecoveryError`，审计 JSON 损坏抛
+  `CorruptDataError`、文件系统失败抛 `OSError`——三者 HTTP 均为 JSON
+  `503`、`serve` 拒绝就绪，不新增事件或改状态。并发、跨进程、服务重启
+  与灾备恢复后视图与 seq 连续不变；恢复不重报、不提交、不新增审计事件、
+  不改 seq。
 
 ### 审计事件
 

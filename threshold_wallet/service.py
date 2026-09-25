@@ -215,6 +215,20 @@ class WalletService:
         取最后一条）。"""
         return self._audit.prepared_rotation_events(wallet_id)
 
+    def _reconcile_chain_state_locked(self, wallet_id: str) -> dict:
+        """持钱包事务锁访问链/仲裁状态前的严格只读重放（调用方须持锁）。
+
+        重放跨链确认与多源仲裁的策略、票、操作及相邻提交事件：畸形票、
+        未知操作票、重复来源、错误 state、孤 adopted 票或提交关系矛盾
+        都抛 RecoveryError（fail-closed，保留现场），审计 JSON 损坏抛
+        CorruptDataError，文件系统失败抛 OSError。纯只读，不记事件、
+        不改状态/seq。heal 在账本文件存在时已重放过一遍；账本文件缺失
+        的纯策略/观察路径由本方法补齐，绝不绕过对账。返回经语义校验的
+        账本供调用方复用。"""
+        self._reconcile_chain_events(wallet_id)
+        self._reconcile_chain_arbitration_events(wallet_id)
+        return self._store.check_asset_ledger_semantics(wallet_id)
+
     def _recover_wallet(self, wallet_id: str) -> None:
         """在已持有该钱包事务锁的前提下，恢复轮换现场与未完成的资产提交。
 
@@ -274,8 +288,9 @@ class WalletService:
             # 链确认事件（chain_policy/chain_report）与提交门控对账：
             # 报告状态机逐事件重放，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_events(wallet_id)
-            # 多源仲裁事件（chain_arbitration/chain_vote）与票/报告/提交
-            # 三事件提交点对账：逐事件重放，矛盾/损坏 fail-closed；纯只读。
+            # 多源仲裁事件（chain_vote 策略/票、合法旧 chain_arbitration）
+            # 与票/报告/提交三事件提交点对账：逐事件重放，矛盾/损坏
+            # fail-closed；纯只读。
             self._reconcile_chain_arbitration_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 会话仅由 dkg_stage 事件持久化：严格重建校验即对账，
@@ -1940,6 +1955,16 @@ class WalletService:
         for event in self._audit.events_by_type(
             wallet_id, audit.TYPE_CHAIN_VOTE
         ):
+            # 策略事件（details {sources,quorum}）与观察票共用类型，
+            # 按精确键集跳过策略；键集两者皆非即畸形事件，绝不静默忽略，
+            # 直接 fail-closed（保留现场）。
+            kind = self._chain_vote_event_kind(event)
+            if kind == "policy":
+                continue
+            if kind is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed chain_vote event"
+                )
             past_operation, past = self._vote_shape(wallet_id, event)
             if past_operation == operation_id:
                 history.append(past)
@@ -1962,13 +1987,9 @@ class WalletService:
                 f"wallet {wallet_id!r} vote intent for asset operation "
                 f"{operation_id!r} has no ledger operation"
             )
-        # 策略取该资产最后一条仲裁策略（与在线一致）；逐历史票重放校验。
-        arb_policies: dict[str, dict] = {}
-        for event in self._audit.events_by_type(
-            wallet_id, audit.TYPE_CHAIN_ARBITRATION
-        ):
-            asset_id, policy = self._arbitration_policy_shape(wallet_id, event)
-            arb_policies[asset_id] = policy
+        # 策略取该资产最后一条仲裁策略（与在线一致，合并新旧事件）；
+        # 逐历史票重放校验。
+        arb_policies = self._chain_arbitration_policies(wallet_id)
         chain_policies = self._chain_policies(wallet_id)
         policy = arb_policies.get(record["asset_id"])
         chain_policy = chain_policies.get(record["asset_id"])
@@ -2562,6 +2583,10 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、票、报告、操作与相邻提交事件
+                # （heal 仅在账本文件存在时覆盖）：矛盾现场 fail-closed，
+                # 优先于参数 400/404 判定。
+                self._reconcile_chain_state_locked(wallet_id)
                 self._validate_operation_id(operation_id)
                 self._validate_chain_id(chain_id)
                 self._validate_hex_32(tx_id, "tx_id")
@@ -2776,30 +2801,53 @@ class WalletService:
 
     @staticmethod
     def _arbitration_policy_shape(wallet_id: str, event: dict) -> tuple[str, dict]:
-        """严格校验一条 chain_arbitration 事件，返回 (资产标识, 策略 Q)。
+        """严格校验一条**新形**多源仲裁策略事件，返回 (资产标识, 策略 Q)。
 
-        request_id 为资产标识（安全 id），actor_id/reason 为 null，
-        details 恰含 {sources, quorum}：sources 为 ID 升序的
-        ``{安全ID: bool}``（至少一个启用源），quorum 为 [2, 启用数] 内的
-        非布尔整数。任何畸形都是不可对账现场（RecoveryError，fail-closed）。"""
+        新策略只写七字段 ``chain_vote`` 事件：request_id 为资产标识
+        （安全 id），actor_id/reason 为 null，details 按**精确键集**
+        ``{sources, quorum}`` 与观察票（``{source, report, state}``）
+        区分。sources 为 ID 升序的 ``{安全ID: bool}``（至少一个启用源），
+        quorum 为 [2, 启用数] 内的非布尔整数。任何畸形都是不可对账现场
+        （RecoveryError，fail-closed）。"""
+        return WalletService._arbitration_policy_event_shape(
+            wallet_id, event, "chain_vote policy event"
+        )
+
+    @staticmethod
+    def _legacy_arbitration_policy_shape(
+        wallet_id: str, event: dict
+    ) -> tuple[str, dict]:
+        """严格校验一条**合法旧** ``chain_arbitration`` 策略事件。
+
+        旧事件仅只读兼容：恢复时与新形 chain_vote 策略事件等价参与按
+        seq 的"每资产取最后一条"重放，在线 PUT 不再写此类型。形状规则
+        与新形事件一致（request_id 为资产标识、actor_id/reason 为 null、
+        details 恰含 {sources, quorum}）。"""
+        return WalletService._arbitration_policy_event_shape(
+            wallet_id, event, "chain_arbitration event"
+        )
+
+    @staticmethod
+    def _arbitration_policy_event_shape(
+        wallet_id: str, event: dict, what: str
+    ) -> tuple[str, dict]:
+        """新旧策略事件共用的严格形状校验，返回 (资产标识, 策略 Q)。"""
         if (
             event.get("actor_id") is not None
             or event.get("reason") is not None
         ):
             raise RecoveryError(
-                f"wallet {wallet_id!r} has a chain_arbitration event with "
-                "actor/reason set"
+                f"wallet {wallet_id!r} has a {what} with actor/reason set"
             )
         asset_id = event.get("request_id")
         if not isinstance(asset_id, str) or not ROTATION_ID_RE.match(
             asset_id
         ):
             raise RecoveryError(
-                f"wallet {wallet_id!r} has a chain_arbitration event without "
-                "an asset id"
+                f"wallet {wallet_id!r} has a {what} without an asset id"
             )
         sources, quorum = WalletService._arbitration_details_shape(
-            wallet_id, event.get("details"), "chain_arbitration event"
+            wallet_id, event.get("details"), what
         )
         return asset_id, {"sources": sources, "quorum": quorum}
 
@@ -2905,18 +2953,64 @@ class WalletService:
             "state": state,
         }
 
+    @staticmethod
+    def _chain_vote_event_kind(event: object) -> Optional[str]:
+        """按 details 的**精确键集**区分一条 chain_vote 事件的语义：
+
+        - ``"policy"``：多源仲裁策略事件（details 恰为 {sources,quorum}，
+          request_id 为资产标识）；
+        - ``"vote"``：观察票事件（details 恰为 {source,report,state}，
+          request_id 为资产操作标识）；
+        - ``None``：键集/形状无法归入任一语义的畸形事件。
+
+        两种语义共用 chain_vote 事件类型，仅靠精确键集区分；任何额外键
+        或缺键都不得被猜成其中一种。
+        """
+        if not isinstance(event, dict):
+            return None
+        details = event.get("details")
+        if not isinstance(details, dict):
+            return None
+        keys = set(details)
+        if keys == {"sources", "quorum"}:
+            return "policy"
+        if keys == {"source", "report", "state"}:
+            return "vote"
+        return None
+
     def _chain_arbitration_policies(
         self, wallet_id: str
     ) -> dict[str, dict]:
-        """从 chain_arbitration 事件序列恢复各资产的多源仲裁策略（每资产
-        取最后一条）。策略只由审计事件持久化；畸形事件 fail-closed
-        （RecoveryError）。纯只读，不分配 seq。"""
+        """从审计事件序列恢复各资产的多源仲裁策略（按 seq 升序重放，
+        每资产取最后一条）。
+
+        新策略只写 chain_vote 事件（details 键集 {sources,quorum}）；
+        合法旧 chain_arbitration 事件仅只读兼容，与新事件一同按 seq
+        参与"每资产取最后一条"。策略只由审计事件持久化；畸形事件
+        fail-closed（RecoveryError）。纯只读，不分配 seq。"""
         policies: dict[str, dict] = {}
-        for event in self._audit.events_by_type(
-            wallet_id, audit.TYPE_CHAIN_ARBITRATION
-        ):
-            asset_id, policy = self._arbitration_policy_shape(wallet_id, event)
-            policies[asset_id] = policy
+        for event in self._audit.all_events(wallet_id):
+            etype = event.get("type")
+            if etype == audit.TYPE_CHAIN_ARBITRATION:
+                asset_id, policy = self._legacy_arbitration_policy_shape(
+                    wallet_id, event
+                )
+                policies[asset_id] = policy
+            elif etype == audit.TYPE_CHAIN_VOTE:
+                kind = self._chain_vote_event_kind(event)
+                if kind == "policy":
+                    asset_id, policy = self._arbitration_policy_shape(
+                        wallet_id, event
+                    )
+                    policies[asset_id] = policy
+                elif kind is None:
+                    # 键集既非策略也非票的 chain_vote：畸形事件，绝不
+                    # 静默忽略后继续服务。
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a malformed chain_vote "
+                        "event"
+                    )
+                # 观察票由 _chain_votes 严格校验，这里不解释
         return policies
 
     @staticmethod
@@ -2968,43 +3062,43 @@ class WalletService:
         PUT 仅收 ``Q={sources, quorum}``（键集由 HTTP 边界校验）。
         sources 为 ID 升序的 ``{安全ID: bool}``（至少一个启用源），
         quorum 为 [2, 启用数] 内的非布尔整数；标识/值非法 400，钱包
-        未知 404。该资产操作已有未决仲裁（collecting/conflict 票）时
-        409，策略与票现场均不变。策略仅由 chain_arbitration 审计事件
-        持久化（request_id 为资产标识，actor_id/reason 为 null，
-        details 即 Q，每个资产取最后一条恢复），**同值更新也记事件**，
-        不写策略状态文件。"""
+        未知 404。该资产**只要存在任一 pending 资产操作**即 409——
+        即使尚无任何观察票也不得改策略，且不改变策略、审计或 seq。
+        新策略只写七字段 chain_vote 审计事件（request_id 为资产标识，
+        actor_id/reason 为 null，details 键序 sources,quorum），每个资产
+        取最后一条恢复；观察票同为 chain_vote（details 键序
+        source,report,state），恢复按精确键集区分。**同值更新也记事件**，
+        不写策略状态文件。合法旧 chain_arbitration 事件仅只读兼容。"""
         try:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、票、操作与相邻提交事件：heal 仅在
+                # 账本文件存在时覆盖链/仲裁事件，PUT 不要求账本存在（纯
+                # 策略配置），故在此显式只读重放——账本缺失却残留
+                # report/vote/committed 事件、或既有策略/票畸形矛盾，都
+                # fail-closed（RecoveryError/CorruptDataError/OSError），
+                # 优先于参数 400/409，绝不向不可对账现场追加事件。
+                ledger = self._reconcile_chain_state_locked(wallet_id)
                 self._validate_asset_id(asset_id)
                 normalized_sources, normalized_quorum = (
                     self._validate_arbitration_body(sources, quorum)
                 )
-                # 未决仲裁期间冻结策略：该资产任一操作仍有
-                # collecting/conflict 的票即 409（adopted 已终态）。
-                pending_assets = {
-                    operation_id: self._arbitration_state(op_votes)
-                    for operation_id, op_votes in self._chain_votes(
-                        wallet_id
-                    ).items()
-                }
-                for operation_id, state in pending_assets.items():
-                    if state not in ("collecting", "conflict"):
-                        continue
-                    record = self._store.get_asset_operation(
-                        wallet_id, operation_id
+                # 该资产存在任一 pending 资产操作即冻结策略：即使尚无
+                # 观察票也一律 409（pending 操作的提交门控依赖一个稳定的
+                # 仲裁策略），策略、票现场、审计与 seq 均不变。committed
+                # 操作已是终态，不阻塞策略更新。
+                if any(
+                    record["asset_id"] == asset_id
+                    and record["state"] == "pending"
+                    for record in ledger["operations"].values()
+                ):
+                    raise ServiceError(
+                        409,
+                        f"asset {asset_id!r} has a pending asset operation; "
+                        "arbitration policy is frozen",
                     )
-                    if (
-                        record is not None
-                        and record["asset_id"] == asset_id
-                    ):
-                        raise ServiceError(
-                            409,
-                            f"asset {asset_id!r} has an unresolved "
-                            "arbitration",
-                        )
                 policy = {
                     "sources": normalized_sources,
                     "quorum": normalized_quorum,
@@ -3012,7 +3106,7 @@ class WalletService:
                 self._emit(
                     wallet_id,
                     self._audit_event(
-                        audit.TYPE_CHAIN_ARBITRATION,
+                        audit.TYPE_CHAIN_VOTE,
                         request_id=asset_id,
                         details=policy,
                     ),
@@ -3072,12 +3166,18 @@ class WalletService:
         """读取某资产的多源仲裁策略：已配置 200 同体，未配置 404。
 
         策略纯由事件恢复；损坏/矛盾事件 fail-closed（由 HTTP 边界转
-        503）。钱包不存在 404。"""
+        503）。钱包不存在 404。持锁访问须重放策略、票、操作与相邻提交
+        事件：heal 在账本文件存在时已重放；账本文件缺失（纯策略查询不
+        要求账本）时显式只读重放链/仲裁事件，绝不带矛盾现场返回策略。"""
         try:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
                 # 404 优先：锁内先判定钱包存在，再判定策略是否已配置
                 self._get_wallet_or_404(wallet_id)
+                # 账本文件缺失时 heal 不重放链/仲裁事件：显式只读重放，
+                # 使残留票/报告/提交矛盾与畸形事件同样 fail-closed，
+                # 优先于参数 400/404 判定。
+                self._reconcile_chain_state_locked(wallet_id)
                 self._validate_asset_id(asset_id)
                 policy = self._chain_arbitration_policies(wallet_id).get(
                     asset_id
@@ -3095,14 +3195,25 @@ class WalletService:
         return policy
 
     def _chain_votes(self, wallet_id: str) -> dict[str, list[dict]]:
-        """从 chain_vote 事件序列恢复各操作的票（按 seq 升序的票列表）。
+        """从 chain_vote 事件序列恢复各操作的**观察票**（按 seq 升序的
+        票列表）。
 
-        票只由审计事件持久化；畸形事件 fail-closed（RecoveryError）。
+        chain_vote 事件按 details 精确键集区分语义：只有
+        ``{source, report, state}`` 的是观察票；``{sources, quorum}`` 的
+        是仲裁策略（由 _chain_arbitration_policies 恢复）；键集两者皆非
+        即畸形事件，fail-closed（RecoveryError）。票只由审计事件持久化。
         纯只读，不分配 seq。"""
         votes: dict[str, list[dict]] = {}
         for event in self._audit.events_by_type(
             wallet_id, audit.TYPE_CHAIN_VOTE
         ):
+            kind = self._chain_vote_event_kind(event)
+            if kind == "policy":
+                continue
+            if kind is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed chain_vote event"
+                )
             operation_id, vote = self._vote_shape(wallet_id, event)
             votes.setdefault(operation_id, []).append(vote)
         return votes
@@ -3142,6 +3253,10 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、票、操作与相邻提交事件：账本文件
+                # 缺失时 heal 未覆盖的矛盾现场也在此 fail-closed（503），
+                # 优先于任何参数 400/404 判定，绝不据锁外快照继续。
+                self._reconcile_chain_state_locked(wallet_id)
                 self._validate_operation_id(operation_id)
                 if not isinstance(body, dict) or set(body) != {
                     "source",
@@ -3287,12 +3402,15 @@ class WalletService:
             raise ServiceError(400, "invalid wallet_id")
 
     def _reconcile_chain_arbitration_events(self, wallet_id: str) -> None:
-        """多源仲裁事件（chain_arbitration/chain_vote）与资产提交的严格
-        对账（调用方须持钱包事务锁；意图残留须已先恢复清零）。
+        """多源仲裁事件（chain_vote 策略/票、合法旧 chain_arbitration）与
+        资产提交的严格对账（调用方须持钱包事务锁；意图残留须已先恢复清零）。
 
         按 seq 重放全部事件，逐事件核对在线规则：
 
-        - chain_arbitration/chain_vote 事件形状必须合法；
+        - chain_vote 事件按 details 精确键集区分语义：{sources,quorum}
+          为仲裁策略（request_id 为资产标识），{source,report,state} 为
+          观察票（request_id 为资产操作标识）；键集两者皆非即畸形事件；
+          合法旧 chain_arbitration 事件仅只读兼容为策略；
         - 票必须指向账本中存在的操作，且该资产当时已配置仲裁策略、
           source 在策略中启用，报告链与跨链策略链一致；
         - 同源不重复票（重放不记事件）、不接受改报；终态（adopted/
@@ -3317,11 +3435,24 @@ class WalletService:
                 asset_id, policy = self._chain_policy_shape(wallet_id, event)
                 chain_policies[asset_id] = policy
             elif etype == audit.TYPE_CHAIN_ARBITRATION:
-                asset_id, policy = self._arbitration_policy_shape(
+                # 合法旧策略事件：仅只读兼容，与新形事件一同按 seq 重放
+                asset_id, policy = self._legacy_arbitration_policy_shape(
                     wallet_id, event
                 )
                 arb_policies[asset_id] = policy
             elif etype == audit.TYPE_CHAIN_VOTE:
+                kind = self._chain_vote_event_kind(event)
+                if kind is None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a malformed chain_vote "
+                        "event"
+                    )
+                if kind == "policy":
+                    asset_id, policy = self._arbitration_policy_shape(
+                        wallet_id, event
+                    )
+                    arb_policies[asset_id] = policy
+                    continue
                 operation_id, vote = self._vote_shape(wallet_id, event)
                 record = operations.get(operation_id)
                 if record is None:
@@ -3425,16 +3556,24 @@ class WalletService:
                     and arb_policies.get(record["asset_id"]) is not None
                 ):
                     # 启用仲裁的资产：chain_report 只能作为 adopted 票的
-                    # 紧邻随附报告出现，其前一条必须是同操作 adopted 票。
+                    # 紧邻随附报告出现，其前一条必须是同操作的**观察票**
+                    # chain_vote（details 键集 {source,report,state}，
+                    # state=adopted）；策略形 chain_vote 不算。
                     predecessor = (
                         events[index - 1] if index - 1 >= 0 else None
+                    )
+                    pred_details = (
+                        predecessor.get("details")
+                        if isinstance(predecessor, dict)
+                        else None
                     )
                     if (
                         predecessor is None
                         or predecessor.get("type") != audit.TYPE_CHAIN_VOTE
+                        or self._chain_vote_event_kind(predecessor) != "vote"
                         or predecessor.get("request_id") != operation_id
-                        or predecessor.get("details", {}).get("state")
-                        != "adopted"
+                        or not isinstance(pred_details, dict)
+                        or pred_details.get("state") != "adopted"
                     ):
                         raise RecoveryError(
                             f"wallet {wallet_id!r} has a chain_report event "

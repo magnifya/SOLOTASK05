@@ -122,13 +122,16 @@ _DETAILS_KEY_ORDER = {
         "confirmations",
     ),
     TYPE_CHAIN_ARBITRATION: (
+        # 合法旧链策略事件：仅只读兼容（新 PUT 不再写此类型）
         "sources",
         "quorum",
     ),
+    # chain_vote 事件承担两种语义，按 details 的**精确键集**区分：
+    # 多源仲裁策略（request_id 为资产标识）用 {sources,quorum}；
+    # 观察票（request_id 为资产操作标识）用 {source,report,state}。
     TYPE_CHAIN_VOTE: (
-        "source",
-        "report",
-        "state",
+        ("sources", "quorum"),
+        ("source", "report", "state"),
     ),
 }
 
@@ -137,11 +140,22 @@ def _order_event_details(event: dict) -> None:
     """把既定事件类型的 details 就地重排为 README 既定键序。
 
     仅当 details 键集与既定键序恰好一致时重排；键集不符的现场留给各
-    语义对账路径 fail-closed，绝不在这里猜写。
+    语义对账路径 fail-closed，绝不在这里猜写。chain_vote 事件按精确
+    键集在策略序 {sources,quorum} 与票序 {source,report,state} 间选择
+    （两种语义共用同一事件类型）。
     """
     order = _DETAILS_KEY_ORDER.get(event.get("type"))
     details = event.get("details")
     if order is None or not isinstance(details, dict):
+        return
+    if order and isinstance(order[0], tuple):
+        matched = next(
+            (candidate for candidate in order if set(details) == set(candidate)),
+            None,
+        )
+        if matched is None:
+            return
+        event["details"] = {key: details[key] for key in matched}
         return
     if set(details) != set(order):
         return
