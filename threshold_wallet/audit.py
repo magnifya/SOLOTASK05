@@ -63,6 +63,8 @@ TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
 TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
+TYPE_CHAIN_ARBITRATION = "chain_arbitration"
+TYPE_CHAIN_VOTE = "chain_vote"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -118,6 +120,15 @@ _DETAILS_KEY_ORDER = {
         "block_height",
         "block_hash",
         "confirmations",
+    ),
+    TYPE_CHAIN_ARBITRATION: (
+        "sources",
+        "quorum",
+    ),
+    TYPE_CHAIN_VOTE: (
+        "source",
+        "report",
+        "state",
     ),
 }
 

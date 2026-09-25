@@ -56,6 +56,9 @@ python -m unittest discover -s tests -v
 | PUT  | `/v1/wallets/{id}/chain/{asset_id}` | 跨链确认策略 `{"chain_id","enabled","required_confirmations","reorg_window"}` |
 | GET  | `/v1/wallets/{id}/chain/{asset_id}` | 查询跨链确认策略（未配置 404） |
 | POST | `/v1/wallets/{id}/chain/{oid}/report` | 上报链上确认数 `{"chain_id","tx_id","block_height","block_hash","confirmations"}` |
+| PUT  | `/v1/wallets/{id}/chain/{asset_id}/arbitration` | 多源仲裁策略 `{"sources","quorum"}` |
+| GET  | `/v1/wallets/{id}/chain/{asset_id}/arbitration` | 查询多源仲裁策略（未配置 404） |
+| POST | `/v1/wallets/{id}/chain/{oid}/observe` | 多源观察上报 `{"source","report"}` |
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
@@ -368,6 +371,49 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   恢复后视图与 seq 连续不变；事件损坏/矛盾 fail-closed（常驻 `503`、
   `serve` 拒绝就绪），恢复不新增审计事件。
 
+### 多源仲裁（可选）
+
+按资产配置多源仲裁策略后，该资产的 pending 操作不能人工提交、也不
+接受单条链上确认报告，只能由多个安全数据源各自上报达门槛观察，凑齐
+quorum 后按既有 commit 契约自动提交。
+
+- `PUT /v1/wallets/{id}/chain/{asset_id}/arbitration`：请求体恰为
+  `Q={"sources","quorum"}`（含其他键或缺键一律 `400`）。`sources` 为
+  ID 升序的 `{安全ID: bool}`（至少一个启用源）；`quorum` 为
+  `[2, 启用源数]` 内的非布尔整数（拒绝布尔/0/1/越界/小数）。成功
+  `200` 返回 Q；钱包不存在 `404`。该资产存在未决仲裁
+  （collecting/conflict）时 `PUT` 一律 `409`，策略与票现场均不变。
+  策略仅由 `chain_arbitration` 审计事件持久化（`request_id` 为资产
+  标识，`actor_id`/`reason` 为 `null`，details 即 Q，每个资产取最后
+  一条恢复），**同值更新也记事件**，不写策略状态文件。
+- `GET .../arbitration`：已配置 `200` 同体，未配置 `404`；钱包不
+  存在 `404`。
+- `POST /v1/wallets/{id}/chain/{oid}/observe`：`oid` 为资产操作 id。
+  请求体恰为 `{"source","report"}`，`source` 为安全 ID，`report` 为
+  达门槛链上报告 B（与 chain report 同体五字段
+  `{chain_id,tx_id,block_height,block_hash,confirmations}`，确认数须
+  ≥ 该资产跨链确认策略的 required_confirmations）。键集/值错 `400`；
+  钱包/操作/仲裁策略未知 `404`；源未知或停用、报告链与跨链策略链不
+  符或跨链策略未启用、确认数未达门槛、同源改报、终态后新增票一律
+  `409`。响应体为 `{"state"}`，`state` 为
+  `collecting|conflict|adopted`。
+- 每个源首收一张票 `201`；同源同体重放 `200`（**重放不记事件**），
+  同源改报 `409`。异体报告（B 体不同）的票并存时状态为 `conflict`；
+  其余未凑齐为 `collecting`；与本票同体的票数（含本票）达到 quorum
+  时本票状态为 `adopted`，按既有 commit 契约提交一次（`201`）。
+  余额不足等提交失败时票不落盘（`409`，可重试）。
+- 达 quorum 时决定性 `chain_vote` 票、`chain_report`(B) 与紧邻的唯一
+  `asset_operation_committed` 三事件在每钱包事务锁内**同批一次原子
+  落盘**（seq 为 n、n+1、n+2），崩溃窗口内绝无孤票或缺 seq。提交后
+  同源同体仍 `200`（state=adopted），异体或新源票 `409`。
+- 启用仲裁后 `POST .../chain/{oid}/report` 对该资产 pending 操作一律
+  `409`（committed 重放仍 `200`）；仲裁票的 `chain_id` 必须与该资产
+  已启用的跨链确认策略链一致。
+- 策略与票仅由审计事件持久化：并发、跨进程、服务重启与灾备恢复后
+  视图与 seq 连续不变；票形状/来源/状态机矛盾、孤 adopted 票等
+  fail-closed（常驻 `503`、`serve` 拒绝就绪），恢复不重报、不提交、
+  不新增审计事件、不改 seq。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -382,7 +428,7 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
 `dkg_failover`、`dkg_failover_policy_updated`、`chain_policy`、
-`chain_report`。
+`chain_report`、`chain_arbitration`、`chain_vote`。
 
 ## 多进程与故障恢复（保证）
 

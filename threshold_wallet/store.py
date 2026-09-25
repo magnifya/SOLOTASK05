@@ -189,6 +189,21 @@ def chain_report_shape_ok(report: object) -> bool:
     return _is_plain_int(report["confirmations"]) and report["confirmations"] >= 0
 
 
+def chain_vote_shape_ok(vote: object) -> bool:
+    """多源仲裁票 details 的形状：恰含 source/report/state 三键，source 为
+    安全标识，report 为达门槛链上报告 B（chain_report 同形五字段），
+    state 只能为 collecting/conflict/adopted。"""
+    if not isinstance(vote, dict):
+        return False
+    if set(vote) != {"source", "report", "state"}:
+        return False
+    if not _valid_safe_id(vote["source"]):
+        return False
+    if not chain_report_shape_ok(vote["report"]):
+        return False
+    return vote["state"] in ("collecting", "conflict", "adopted")
+
+
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
     delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
@@ -1121,10 +1136,19 @@ class WalletStore:
             return False
         # 报告触发的提交在意图中随附达门槛报告 B（可选键）：崩溃恢复据此
         # 判定"报告事件 + 提交事件"两事件提交点是否完整。存在即须形状
-        # 合法，否则无法安全对账。
+        # 合法，否则无法安全对账。多源仲裁触发的提交另带 votes（随附
+        # chain_vote 事件列表），存在即须为非空列表且每张票形状合法。
         report = intent.get("report")
         if report is not None and not chain_report_shape_ok(report):
             return False
+        # 多源仲裁达 quorum 触发的提交另带可选键 vote（决定性 adopted 票
+        # {source,report=B,state}）：崩溃恢复据此判定"票 + 报告 + 提交"
+        # 三事件提交点是否完整。存在即须形状合法且为 adopted，否则无法
+        # 安全对账。
+        vote = intent.get("vote")
+        if vote is not None:
+            if not chain_vote_shape_ok(vote) or vote.get("state") != "adopted":
+                return False
         old_balance = old_asset["balance"] if old_asset is not None else 0
         old_version = old_asset["version"] if old_asset is not None else 0
         return (
