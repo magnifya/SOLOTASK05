@@ -22,6 +22,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from threshold_wallet import drbackup
 from threshold_wallet.audit import AuditStore
@@ -687,29 +688,51 @@ class ChainCorruptionTest(unittest.TestCase):
 
 
 class ChainCrashConvergenceTest(unittest.TestCase):
-    """崩溃窗口收敛：孤立报告事件由同体重试补齐唯一提交。"""
+    """崩溃原子性：达门槛报告与提交事件同批原子落盘（seq n、n+1），
+    失败/强杀/重启后只余完整提交或完整回滚；矛盾现场（孤立达门槛
+    报告）保留并拒绝就绪。"""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
 
-    def test_orphan_report_is_completed_by_retry(self):
-        service = make_harness(self.tmpdir).service
+    def _service(self):
+        return make_harness(self.tmpdir).service
+
+    def _setup_wallet(self):
+        service = self._service()
         service.create_wallet("w1", 2)
         service.put_chain_policy("w1", "btc", "bitcoin", True, 2, 1)
         service.create_asset_operation("w1", "op1", "btc", 100)
-        # 模拟崩溃：意图已写、账本已提交、报告事件已落盘、提交事件缺失
-        record = service._store.get_asset_operation("w1", "op1")
+        return service
+
+    def _write_report_intent(self, service, report):
+        """模拟报告触发提交的崩溃残留：含随附报告 B 的提交意图。"""
         intent = {
             "operation_id": "op1",
             "asset_id": "btc",
             "delta": 100,
             "old_asset": None,
-            "pending": record,
+            "pending": {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "state": "pending",
+                "delta": 100,
+                "balance": 0,
+                "version": 0,
+            },
             "new_balance": 100,
             "new_version": 1,
+            "report": report,
         }
         service._store.write_asset_commit_intent("w1", "op1", intent)
+
+    def test_crash_before_paired_append_rolls_back(self):
+        """崩溃于意图+账本已写、两事件未落盘：重启整体回滚为 pending 与
+        原余额/version，无事件、无 seq 缺口，同体报告可重试恰提交一次。"""
+        service = self._setup_wallet()
+        report = _report(confirmations=2)
+        self._write_report_intent(service, report)
         committed = {
             "operation_id": "op1",
             "asset_id": "btc",
@@ -721,19 +744,15 @@ class ChainCrashConvergenceTest(unittest.TestCase):
         service._store.commit_asset_operation(
             "w1", "op1", committed, "btc", {"balance": 100, "version": 1}
         )
-        report = _report(confirmations=2)
-        service._emit(
-            "w1",
-            service._audit_event(
-                "chain_report", request_id="op1", details=report
-            ),
-        )
-        # 重启：提交事件缺失 -> 回滚账本，孤立报告保留
-        service = make_harness(self.tmpdir).service
+        # 重启：两事件均未落盘 -> 整体回滚
+        service = self._service()
         op = service._store.get_asset_operation("w1", "op1")
         self.assertEqual(op["state"], "pending")
         self.assertIsNone(service._store.get_asset("w1", "btc"))
-        # 同体重试：补齐提交（新报告事件与提交事件紧邻），恰一次
+        self.assertEqual(service._store.list_asset_intents("w1"), [])
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual([e["type"] for e in events], ["chain_policy"])
+        # 同体重试：完整提交一次，两事件紧邻 seq n、n+1
         status, body = service.post_chain_report(
             "w1", "op1", "bitcoin", TX, 100, HASH1, 2
         )
@@ -742,21 +761,224 @@ class ChainCrashConvergenceTest(unittest.TestCase):
         asset = service.get_asset("w1", "btc")
         self.assertEqual((asset["balance"], asset["version"]), (100, 1))
         events = service.get_audit_events("w1")["events"]
-        types = [e["type"] for e in events]
-        commit_at = types.index("asset_operation_committed")
-        self.assertEqual(types[commit_at - 1], "chain_report")
         self.assertEqual(
-            len([e for e in events if e["type"] == "asset_operation_committed"]),
-            1,
+            [e["type"] for e in events],
+            ["chain_policy", "chain_report", "asset_operation_committed"],
         )
-        # 再次重启：对账通过，现场不变
-        service = make_harness(self.tmpdir).service
-        asset = service.get_asset("w1", "btc")
-        self.assertEqual((asset["balance"], asset["version"]), (100, 1))
+        self.assertEqual([e["seq"] for e in events], [1, 2, 3])
+        self.assertEqual(events[1]["details"], report)
+        # 再次重启：对账通过，现场不变；同体仅 200 不记事件
+        service = self._service()
         status, _ = service.post_chain_report(
             "w1", "op1", "bitcoin", TX, 100, HASH1, 2
         )
         self.assertEqual(status, 200)
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(len(events), 3)
+
+    def test_crash_after_paired_append_rolls_forward(self):
+        """崩溃于两事件已落盘、意图清理之前：重启按事件前滚补齐账本，
+        不产生孤立/重复报告，同体重放 200、异体 409。"""
+        service = self._setup_wallet()
+        report = _report(confirmations=2)
+        status, _ = service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+        )
+        self.assertEqual(status, 201)
+        before = service.get_audit_events("w1")["events"]
+        # 模拟崩溃于意图清理之前：意图文件残留（含随附报告）
+        self._write_report_intent(service, report)
+        service = self._service()
+        asset = service.get_asset("w1", "btc")
+        self.assertEqual((asset["balance"], asset["version"]), (100, 1))
+        # 意图已清理，事件不增不重、seq 不变
+        self.assertEqual(service._store.list_asset_intents("w1"), [])
+        after = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["seq"] for e in after], [e["seq"] for e in before]
+        )
+        self.assertEqual(len(after), len(before))
+        # 同体重放 200、异体 409
+        status, _ = service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+        )
+        self.assertEqual(status, 200)
+        with self.assertRaises(Exception):
+            service.post_chain_report(
+                "w1", "op1", "bitcoin", TX, 100, HASH1, 3
+            )
+
+    def test_paired_append_failure_rolls_back_without_events(self):
+        """两事件落盘失败（I/O 错误）：整体回滚 pending 与原余额，
+        两事件都不落、无 seq 缺口；重试成功且 seq 连续。"""
+        service = self._setup_wallet()
+        with mock.patch(
+            "threshold_wallet.audit._atomic_write_log",
+            side_effect=OSError("disk full"),
+        ):
+            with self.assertRaises(OSError):
+                service.post_chain_report(
+                    "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+                )
+        op = service._store.get_asset_operation("w1", "op1")
+        self.assertEqual(op["state"], "pending")
+        self.assertIsNone(service._store.get_asset("w1", "btc"))
+        self.assertEqual(service._store.list_asset_intents("w1"), [])
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual([e["type"] for e in events], ["chain_policy"])
+        # 重试成功：两事件紧邻，seq 连续无缺口
+        status, _ = service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+        )
+        self.assertEqual(status, 201)
+        events = service.get_audit_events("w1")["events"]
+        self.assertEqual(
+            [e["type"] for e in events],
+            ["chain_policy", "chain_report", "asset_operation_committed"],
+        )
+        self.assertEqual([e["seq"] for e in events], [1, 2, 3])
+
+    def test_paired_append_failure_returns_503_over_http(self):
+        """常驻请求遇两事件落盘 I/O 失败：503，且保持 pending 与原余额/
+        version，不留两事件或 seq 缺口。"""
+        with http_server(self.tmpdir) as srv:
+            srv.request(
+                "POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2}
+            )
+            srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)
+            srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            with mock.patch(
+                "threshold_wallet.audit._atomic_write_log",
+                side_effect=OSError("disk full"),
+            ):
+                status, _ = srv.request(
+                    "POST",
+                    "/v1/wallets/w1/chain/op1/report",
+                    _report(confirmations=3),
+                )
+                self.assertEqual(status, 503)
+            # 操作仍 pending、账本不变、无 chain_report/提交事件
+            status, op = srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(op["state"], "pending")
+            status, body = srv.request("GET", "/v1/wallets/w1/audit-events")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                [e["type"] for e in body["events"]], ["chain_policy"]
+            )
+            # 恢复后同体重试 201，两事件紧邻、seq 连续
+            status, _ = srv.request(
+                "POST",
+                "/v1/wallets/w1/chain/op1/report",
+                _report(confirmations=3),
+            )
+            self.assertEqual(status, 201)
+            status, body = srv.request("GET", "/v1/wallets/w1/audit-events")
+            events = body["events"]
+            self.assertEqual(
+                [e["type"] for e in events],
+                ["chain_policy", "chain_report", "asset_operation_committed"],
+            )
+            self.assertEqual([e["seq"] for e in events], [1, 2, 3])
+
+    def test_orphan_threshold_report_with_intent_is_contradiction(self):
+        """矛盾现场（意图残留 + 报告事件在而提交事件缺失）：重启
+        fail-closed，现场保留不归一、不删除。"""
+        service = self._setup_wallet()
+        report = _report(confirmations=2)
+        self._write_report_intent(service, report)
+        service._emit(
+            "w1",
+            service._audit_event(
+                "chain_report", request_id="op1", details=report
+            ),
+        )
+        # 重启：孤立达门槛报告无法对账 -> RecoveryError，阻止就绪
+        with self.assertRaises(RecoveryError):
+            self._service()
+        # 现场保留：意图与报告事件都原样还在
+        store = WalletStore(self.tmpdir)
+        self.assertIsNotNone(store.get_asset_commit_intent("w1", "op1"))
+        events = AuditStore(self.tmpdir).list_events("w1")
+        self.assertEqual(
+            [e["type"] for e in events], ["chain_policy", "chain_report"]
+        )
+
+    def test_orphan_threshold_report_without_intent_is_contradiction(self):
+        """日志中孤立的达门槛报告（无意图、无提交事件）：重启与持锁
+        访问一律 fail-closed。"""
+        service = self._setup_wallet()
+        report = _report(confirmations=2)
+        service._emit(
+            "w1",
+            service._audit_event(
+                "chain_report", request_id="op1", details=report
+            ),
+        )
+        with self.assertRaises(RecoveryError):
+            self._service()
+
+    def test_orphan_threshold_report_live_access_503(self):
+        """常驻进程持锁访问遇矛盾现场：一律 503，现场保留。"""
+        with http_server(self.tmpdir) as srv:
+            srv.request(
+                "POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2}
+            )
+            srv.request("PUT", "/v1/wallets/w1/chain/btc", POLICY)
+            srv.request(
+                "POST",
+                "/v1/wallets/w1/asset-operations",
+                {"operation_id": "op1", "asset_id": "btc", "delta": 100},
+            )
+            # 注入矛盾现场：意图 + 孤立达门槛报告事件（无提交事件）
+            service = srv.harness.service
+            report = _report(confirmations=3)
+            self._write_report_intent(service, report)
+            service._emit(
+                "w1",
+                service._audit_event(
+                    "chain_report", request_id="op1", details=report
+                ),
+            )
+            status, _ = srv.request(
+                "POST", "/v1/wallets/w1/chain/op1/report", report
+            )
+            self.assertEqual(status, 503)
+            status, _ = srv.request("GET", "/v1/wallets/w1/assets/btc")
+            self.assertEqual(status, 503)
+            # 现场保留：意图未清理、报告事件未抹除
+            self.assertIsNotNone(
+                service._store.get_asset_commit_intent("w1", "op1")
+            )
+            events = AuditStore(self.tmpdir).list_events("w1")
+            self.assertEqual(
+                [e["type"] for e in events],
+                ["chain_policy", "chain_report"],
+            )
+
+    def test_mismatched_pair_is_contradiction(self):
+        """提交事件在但紧邻报告与意图随附报告不符：矛盾现场，重启
+        fail-closed，绝不任选一条前滚。"""
+        service = self._setup_wallet()
+        status, _ = service.post_chain_report(
+            "w1", "op1", "bitcoin", TX, 100, HASH1, 2
+        )
+        self.assertEqual(status, 201)
+        # 意图残留但随附报告与已落盘报告异体（篡改/半写现场）
+        self._write_report_intent(service, _report(confirmations=3))
+        with self.assertRaises(RecoveryError):
+            self._service()
+        # 现场保留：意图未清理
+        store = WalletStore(self.tmpdir)
+        self.assertIsNotNone(store.get_asset_commit_intent("w1", "op1"))
 
 
 class ChainDrBackupTest(unittest.TestCase):

@@ -154,6 +154,41 @@ def _asset_entry_shape_ok(entry: object) -> bool:
     )
 
 
+def _is_lower_hex_32(value: object) -> bool:
+    """恰为 64 位小写 hex（32 字节）的字符串判定。"""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def chain_report_shape_ok(report: object) -> bool:
+    """链上确认数报告 B 的形状：恰含 chain_id/tx_id/block_height/
+    block_hash/confirmations 五键，chain_id 为安全标识，tx_id 与
+    block_hash 为 64 位小写 hex，block_height/confirmations 为非布尔
+    非负整数。"""
+    if not isinstance(report, dict):
+        return False
+    if set(report) != {
+        "chain_id",
+        "tx_id",
+        "block_height",
+        "block_hash",
+        "confirmations",
+    }:
+        return False
+    if not _valid_safe_id(report["chain_id"]):
+        return False
+    if not _is_lower_hex_32(report["tx_id"]):
+        return False
+    if not _is_lower_hex_32(report["block_hash"]):
+        return False
+    if not _is_plain_int(report["block_height"]) or report["block_height"] < 0:
+        return False
+    return _is_plain_int(report["confirmations"]) and report["confirmations"] >= 0
+
+
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
     delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
@@ -1048,7 +1083,8 @@ class WalletStore:
 
         正常提交写入的意图含 operation_id/asset_id/delta、提交前资产
         快照 old_asset（None 或 {balance,version}）、pending 操作记录、
-        提交结果 new_balance/new_version。任一字段缺失、类型错误、布尔
+        提交结果 new_balance/new_version；报告触发的提交另带可选键
+        report（达门槛报告 B）。任一字段缺失、类型错误、布尔
         冒整、标识不匹配或前后账目不守恒都判定为无效：调用方必须
         fail-closed（保留意图现场，不回滚/前滚/清理），绝不把损坏意图
         当成空意图继续。
@@ -1082,6 +1118,12 @@ class WalletStore:
         if pending["state"] != "pending" or pending["asset_id"] != asset_id:
             return False
         if pending["delta"] != delta:
+            return False
+        # 报告触发的提交在意图中随附达门槛报告 B（可选键）：崩溃恢复据此
+        # 判定"报告事件 + 提交事件"两事件提交点是否完整。存在即须形状
+        # 合法，否则无法安全对账。
+        report = intent.get("report")
+        if report is not None and not chain_report_shape_ok(report):
             return False
         old_balance = old_asset["balance"] if old_asset is not None else 0
         old_version = old_asset["version"] if old_asset is not None else 0

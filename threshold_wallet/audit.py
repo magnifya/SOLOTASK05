@@ -320,23 +320,44 @@ class AuditStore:
         既有日志损坏 / seq 矛盾时抛 CorruptDataError，绝不把历史清空后
         继续写（那会用一条新事件覆盖全部审计历史）。
         """
+        return self.append_events(wallet_id, [event])[0]
+
+    def append_events(self, wallet_id: str, events: list[dict]) -> list[dict]:
+        """原子追加一批事件：一次落盘分配连续 seq（n、n+1、…），返回含
+        seq/at 的记录列表。
+
+        整批要么全部持久化、要么全部不持久化（同目录临时文件 +
+        os.replace 原子替换）：多条事件构成同一提交点（如达门槛
+        chain_report 与紧邻的 asset_operation_committed）时使用，崩溃
+        窗口内绝不出现只落前半截的日志，也不留 seq 缺口。
+
+        语义与单条追加相同：严格加载既有日志（损坏 / seq 矛盾抛
+        CorruptDataError，绝不清空历史后续写），seq 从 1 起连续分配；
+        调用方负责在每钱包事务锁内把状态变更与本调用绑定。
+        """
+        if not events:
+            raise ValueError("events must be a non-empty list")
         path = self._path(wallet_id)
         with self._lock:
             data = self._read_strict(wallet_id)
             if data is None:
                 data = {"wallet_id": wallet_id, "next_seq": 1, "events": []}
-            events = data["events"]
+            existing = data["events"]
             # 严格加载已保证 1..N 连续：下一个 seq 直接取 N+1，
             # 与 next_seq（兼容缺字段的旧文件）一致。
-            next_seq = len(events) + 1
-            stamped = dict(event)
-            stamped["seq"] = next_seq
-            # 既定事件类型的 details 落盘前归一为 README 既定键序
-            _order_event_details(stamped)
-            events.append(stamped)
-            data["next_seq"] = next_seq + 1
+            next_seq = len(existing) + 1
+            stamped_events = []
+            for event in events:
+                stamped = dict(event)
+                stamped["seq"] = next_seq
+                # 既定事件类型的 details 落盘前归一为 README 既定键序
+                _order_event_details(stamped)
+                existing.append(stamped)
+                stamped_events.append(stamped)
+                next_seq += 1
+            data["next_seq"] = next_seq
             _atomic_write_log(path, data)
-            return stamped
+            return stamped_events
 
     def find_event_by_request(
         self,
