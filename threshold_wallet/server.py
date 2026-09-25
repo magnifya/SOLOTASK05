@@ -25,6 +25,7 @@
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/takeover 两阶段接管会话参与方份额
 - POST /v1/dkg/<wallet_id>/<dkg_id>                           推进两方 DKG 一个阶段
 - GET  /v1/dkg/<wallet_id>/<dkg_id>                           查询两方 DKG 会话视图
+- POST /v1/dkg/<wallet_id>/<dkg_id>/failover                  推进一个 DKG 故障轮次（abort/replace）
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -123,7 +124,12 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if dkg is not None:
                     wallet_id, dkg_id = dkg
                     self._send_json(
-                        200, service.get_dkg_session(wallet_id, dkg_id)
+                        200,
+                        service.get_dkg_session(
+                            wallet_id,
+                            dkg_id,
+                            round_param=query.get("round", [None])[0],
+                        ),
                     )
                     return
                 matched = self._split_wallet_path(path)
@@ -176,7 +182,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 self._send_failure(exc)
 
         def do_POST(self) -> None:  # noqa: N802
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
             try:
                 if path == "/v1/wallets":
                     body = self._read_json_body()
@@ -184,6 +192,35 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("wallet_id"), body.get("shares")
                     )
                     self._send_json(201, result)
+                    return
+
+                dkg_failover = self._split_dkg_failover_path(path)
+                if dkg_failover is not None:
+                    wallet_id, dkg_id = dkg_failover
+                    body = self._read_json_body()
+                    # 请求体仅允许 round/action/node/replacement/key 五键
+                    if set(body) != {
+                        "round",
+                        "action",
+                        "node",
+                        "replacement",
+                        "key",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly round, action, node, "
+                            "replacement and key",
+                        )
+                    status, result = service.post_dkg_failover(
+                        wallet_id,
+                        dkg_id,
+                        body.get("round"),
+                        body.get("action"),
+                        body.get("node"),
+                        body.get("replacement"),
+                        body.get("key"),
+                    )
+                    self._send_json(status, result)
                     return
 
                 dkg = self._split_dkg_path(path)
@@ -205,6 +242,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("key"),
                         body.get("hash"),
                         body.get("peer"),
+                        round_param=query.get("round", [None])[0],
                     )
                     self._send_json(status, result)
                     return
@@ -433,6 +471,22 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 return None
             parts = path[len(_DKG_PREFIX):].split("/")
             if len(parts) != 2 or not parts[0] or not parts[1]:
+                return None
+            return parts[0], parts[1]
+
+        @staticmethod
+        def _split_dkg_failover_path(path: str):
+            """/v1/dkg/<wallet_id>/<dkg_id>/failover -> (wallet_id, dkg_id)，
+            否则 None。仅 POST。"""
+            if not path.startswith(_DKG_PREFIX):
+                return None
+            parts = path[len(_DKG_PREFIX):].split("/")
+            if (
+                len(parts) != 3
+                or not parts[0]
+                or not parts[1]
+                or parts[2] != "failover"
+            ):
                 return None
             return parts[0], parts[1]
 

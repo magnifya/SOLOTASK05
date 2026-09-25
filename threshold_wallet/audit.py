@@ -59,6 +59,7 @@ TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
 TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
+TYPE_DKG_FAILOVER = "dkg_failover"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -91,6 +92,15 @@ _DETAILS_KEY_ORDER = {
         "key",
         "hash",
         "peer",
+        "state",
+    ),
+    TYPE_DKG_FAILOVER: (
+        "id",
+        "round",
+        "action",
+        "node",
+        "replacement",
+        "key",
         "state",
     ),
 }
@@ -416,13 +426,73 @@ class AuditStore:
     def dkg_stage_events(
         self, wallet_id: str
     ) -> dict[str, list[dict]]:
-        """返回该钱包全部 dkg_stage 事件，按 request_id（DKG 会话 id）
+        """返回该钱包全部 dkg_stage 事件，按 details.id（DKG 会话 id）
         分组，组内按 seq 升序。
 
-        DKG 会话状态仅由这些事件持久化（事件是唯一提交点）：在线处理与
-        崩溃恢复据此重建各会话的 register/commit/share 推进序列。
-        纯只读，不分配 seq。"""
-        return self._events_grouped_by_request(wallet_id, TYPE_DKG_STAGE)
+        基线轮事件的 request_id 为会话 id；故障派生轮事件的 request_id 为
+        ``<id>/<round>``，因此分组依据 details.id 而非 request_id。DKG 会话
+        状态仅由这些事件持久化（事件是唯一提交点）。纯只读，不分配 seq。"""
+        data = self._read(wallet_id)
+        result: dict[str, list[dict]] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != TYPE_DKG_STAGE:
+                continue
+            details = event.get("details")
+            dkg_id = (
+                details.get("id")
+                if isinstance(details, dict)
+                else None
+            )
+            if not isinstance(dkg_id, str):
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has a dkg_stage "
+                    "event without a session id"
+                )
+            result.setdefault(dkg_id, []).append(dict(event))
+        for events in result.values():
+            events.sort(key=lambda e: e.get("seq", 0))
+        return result
+
+    def dkg_failover_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 dkg_failover 事件，按 details.id（DKG 会话 id）
+        分组，组内按 seq 升序。
+
+        DKG 故障轮次（abort/replace）状态仅由这些事件持久化（事件是唯一
+        提交点）：在线处理与崩溃恢复据此重建各会话的轮次链。每条事件的
+        request_id 为 ``<id>/<round>``，与 details 中的 id/round 一致；
+        不一致属于不可对账现场，由语义重建路径 fail-closed。纯只读，不
+        分配 seq。"""
+        data = self._read(wallet_id)
+        result: dict[str, list[dict]] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != TYPE_DKG_FAILOVER:
+                continue
+            details = event.get("details")
+            dkg_id = (
+                details.get("id")
+                if isinstance(details, dict)
+                else None
+            )
+            if not isinstance(dkg_id, str):
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has a dkg_failover "
+                    "event without a session id"
+                )
+            result.setdefault(dkg_id, []).append(dict(event))
+        for events in result.values():
+            events.sort(key=lambda e: e.get("seq", 0))
+        return result
+
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射

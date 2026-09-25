@@ -100,8 +100,10 @@ class DkgServiceTest(unittest.TestCase):
         view = self.svc.get_dkg_session("w1", "d1")
         self.assertEqual(
             list(view),
-            ["id", "state", "nodes", "committed", "shared", "public_key"],
+            ["id", "round", "state", "nodes", "committed", "shared",
+             "public_key"],
         )
+        self.assertEqual(view["round"], 1)
 
     def test_intermediate_states(self):
         code, view = self._post("d1", "register", "n1", key=KEY_A)
@@ -485,9 +487,10 @@ class DkgHttpTest(unittest.TestCase):
             self.assertEqual(view["public_key"], KEY_A + KEY_B)
             self.assertEqual(
                 list(view),
-                ["id", "state", "nodes", "committed", "shared",
+                ["id", "round", "state", "nodes", "committed", "shared",
                  "public_key"],
             )
+            self.assertEqual(view["round"], 1)
             # 未知会话/钱包 404；未知路径 404
             code, _ = srv.request("GET", "/v1/dkg/w1/nope")
             self.assertEqual(code, 404)

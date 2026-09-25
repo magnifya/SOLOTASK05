@@ -58,6 +58,10 @@ TAKEOVER_STAGES = (1, 2)
 #: 两方 DKG 允许的操作（双方依序推进 register→commit→share→done）
 DKG_OPS = ("register", "commit", "share")
 
+#: DKG 故障轮次 failover 允许的动作：abort 废弃当前轮，replace 替换单节点
+#: 并开启下一轮。
+DKG_FAILOVER_ACTIONS = ("abort", "replace")
+
 
 class ServiceError(Exception):
     """业务错误，携带 HTTP 状态码与错误信息。"""
@@ -4035,183 +4039,473 @@ class WalletService:
         return "register"
 
     @staticmethod
-    def _dkg_view(session: dict) -> dict:
-        """DKG 会话对外视图（GET/POST 同形，键序固定）。
+    def _round_view(round_state: dict) -> dict:
+        """单个 DKG 轮次的对外视图（GET/POST 同形，键序固定）。
 
-        三个数组均按注册序；完成公钥为两份注册 key 按注册序拼接，
-        未完成（非 done）为 null。视图只含标识/公钥/哈希，绝不含私钥
-        或份额正文。"""
-        nodes = session["nodes"]
+        键序为 {id,round,state,nodes,committed,shared,public_key}；三个数组
+        均按该轮注册序；完成（done）公钥为该轮两份注册 key 按注册序拼接，
+        其余（含 aborted）为 null。aborted 轮三数组一律为空。视图只含
+        标识/公钥/哈希，绝不含私钥或份额正文。"""
+        nodes = round_state["nodes"]
         public_key = None
-        if session["state"] == "done":
+        if round_state["state"] == "done":
             public_key = nodes[0][1] + nodes[1][1]
+        if round_state["state"] == "aborted":
+            return {
+                "id": round_state["id"],
+                "round": round_state["round"],
+                "state": "aborted",
+                "nodes": [],
+                "committed": [],
+                "shared": [],
+                "public_key": None,
+            }
         return {
-            "id": session["id"],
-            "state": session["state"],
+            "id": round_state["id"],
+            "round": round_state["round"],
+            "state": round_state["state"],
             "nodes": [node for node, _ in nodes],
             "committed": [
-                node for node, _ in nodes if node in session["commits"]
+                node for node, _ in nodes if node in round_state["commits"]
             ],
             "shared": [
-                node for node, _ in nodes if node in session["shared"]
+                node for node, _ in nodes if node in round_state["shared"]
             ],
             "public_key": public_key,
         }
 
-    def _dkg_sessions(self, wallet_id: str) -> dict[str, dict]:
-        """从 dkg_stage 事件重建并严格校验该钱包全部 DKG 会话。
+    @staticmethod
+    def _dkg_failover_ever(session: dict) -> bool:
+        """该会话是否已经发生过任一故障轮次（abort/replace）。
 
-        dkg_stage 事件是 DKG 状态的唯一持久化与提交点：任何矛盾（形状、
-        字段约束、阶段顺序、承诺不一致、details.state 与重算不符）都抛
-        RecoveryError（fail-closed：常驻 503、serve 拒绝就绪），绝不静默
-        跳过或任取一条。纯只读，不分配 seq、不写任何状态。"""
+        发生过故障轮次后，无参 GET 不再合法（必须以 ?round=R 显式定位
+        当前轮）。"""
+        return bool(session.get("failover_seqs"))
+
+
+    def _dkg_sessions(self, wallet_id: str) -> dict[str, dict]:
+        """从 dkg_stage / dkg_failover 事件重建并严格校验该钱包全部 DKG
+        会话（含故障轮次）。
+
+        两类事件共同构成 DKG 状态的唯一持久化与提交点：按 seq 合并重放。
+        任何矛盾（形状、字段约束、阶段顺序、承诺不一致、failover 轮次
+        不连续、details.state 与重算不符、request_id 与 details 不符等）
+        都抛 RecoveryError（fail-closed：常驻 503、serve 拒绝就绪），绝不
+        静默跳过或任取一条。纯只读，不分配 seq、不写任何状态。"""
+        stage_map = self._audit.dkg_stage_events(wallet_id)
+        failover_map = self._audit.dkg_failover_events(wallet_id)
         sessions: dict[str, dict] = {}
-        for dkg_id, events in self._audit.dkg_stage_events(wallet_id).items():
+        for dkg_id in sorted(set(stage_map) | set(failover_map)):
+            if not ROTATION_ID_RE.match(dkg_id):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a dkg event with a malformed "
+                    "session id"
+                )
+            merged = sorted(
+                [("stage", e) for e in stage_map.get(dkg_id, [])]
+                + [("failover", e) for e in failover_map.get(dkg_id, [])],
+                key=lambda item: item[1].get("seq", 0),
+            )
             sessions[dkg_id] = self._rebuild_dkg_session(
-                wallet_id, dkg_id, events
+                wallet_id, dkg_id, merged
             )
         return sessions
 
+    @staticmethod
+    def _new_round(dkg_id: str, round_no: int) -> dict:
+        return {
+            "id": dkg_id,
+            "round": round_no,
+            "nodes": [],
+            "commits": {},
+            "shared": {},
+            "state": "register",
+        }
+
     def _rebuild_dkg_session(
-        self, wallet_id: str, dkg_id: str, events: list[dict]
+        self, wallet_id: str, dkg_id: str, merged: list[tuple[str, dict]]
     ) -> dict:
-        """按 seq 升序重放某 DKG 会话的 dkg_stage 事件并严格校验。"""
-        if not ROTATION_ID_RE.match(dkg_id):
-            raise RecoveryError(
-                f"wallet {wallet_id!r} has a dkg_stage event with a "
-                "malformed session id"
-            )
-        nodes: list[tuple[str, str]] = []
-        commits: dict[str, str] = {}
-        shared: dict[str, tuple[str, str]] = {}
-        for event in events:
+        """按 seq 升序合并重放某 DKG 会话的 dkg_stage / dkg_failover
+        事件并严格校验，重建其轮次链。"""
+        rounds: dict[int, dict] = {}
+        current = self._new_round(dkg_id, 1)
+        rounds[1] = current
+        # 各故障轮次首提参数（供在线幂等重放比对）：round -> 元组
+        failovers: dict[int, tuple] = {}
+        failover_seqs: list[int] = []
+
+        for kind, event in merged:
             if (
                 event.get("actor_id") is not None
                 or event.get("reason") is not None
             ):
                 raise RecoveryError(
-                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                    "dkg_stage event with actor/reason set"
-                )
-            details = event.get("details")
-            if not isinstance(details, dict) or set(details) != {
-                "id",
-                "op",
-                "node",
-                "key",
-                "hash",
-                "peer",
-                "state",
-            }:
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                    "malformed dkg_stage event"
-                )
-            if details["id"] != dkg_id:
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} dkg_stage event id does not "
-                    "match its request_id"
-                )
-            op = details["op"]
-            node = details["node"]
-            key = details["key"]
-            hash_value = details["hash"]
-            peer = details["peer"]
-            if op not in DKG_OPS:
-                raise RecoveryError(
                     f"wallet {wallet_id!r} dkg session {dkg_id!r} has an "
-                    "unknown op"
+                    "event with actor/reason set"
+                )
+            seq = event.get("seq")
+            if kind == "stage":
+                # stage 事件的 request_id 决定其所属轮次：基线轮必须恰为
+                # 会话 id，派生轮必须恰为 "<id>/<round>"；只允许推进当时的
+                # 当前轮（旧轮永不推进），否则不可对账。
+                request_id = event.get("request_id")
+                if current["round"] == 1:
+                    if request_id != dkg_id:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg session {dkg_id!r} "
+                            "baseline stage event has a wrong request_id"
+                        )
+                else:
+                    expected = f"{dkg_id}/{current['round']}"
+                    if request_id != expected:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg session {dkg_id!r} "
+                            "stage event has a wrong round request_id"
+                        )
+                self._replay_dkg_stage_event(
+                    wallet_id, dkg_id, event, current
+                )
+            else:
+                if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                        "dkg_failover event without a valid seq"
+                    )
+                failover_seqs.append(seq)
+                current = self._replay_dkg_failover_event(
+                    wallet_id, dkg_id, event, rounds, failovers
+                )
+        return {
+            "id": dkg_id,
+            "round": current["round"],
+            "rounds": rounds,
+            "failovers": failovers,
+            "failover_seqs": failover_seqs,
+        }
+
+    def _replay_dkg_stage_event(
+        self,
+        wallet_id: str,
+        dkg_id: str,
+        event: dict,
+        round_state: dict,
+    ) -> None:
+        """把一条 dkg_stage 事件重放进指定轮次并严格校验。
+
+        终态轮次（done/aborted）不得再出现 stage 事件；details.state 必须
+        等于重放后该轮阶段。派生轮以 commit 起步、节点已由 replace 事件
+        预置，故 register 事件在派生轮必为矛盾序列。"""
+        details = event.get("details")
+        if not isinstance(details, dict) or set(details) != {
+            "id",
+            "op",
+            "node",
+            "key",
+            "hash",
+            "peer",
+            "state",
+        }:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                "malformed dkg_stage event"
+            )
+        if details["id"] != dkg_id:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg_stage event id does not match "
+                "its session"
+            )
+        if round_state["state"] in ("done", "aborted"):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} round "
+                f"{round_state['round']} advanced after a terminal state"
+            )
+        op = details["op"]
+        node = details["node"]
+        key = details["key"]
+        hash_value = details["hash"]
+        peer = details["peer"]
+        nodes = round_state["nodes"]
+        commits = round_state["commits"]
+        shared = round_state["shared"]
+        if op not in DKG_OPS:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has an "
+                "unknown op"
+            )
+        if not isinstance(node, str) or not ROTATION_ID_RE.match(node):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                "malformed node"
+            )
+        node_ids = [n for n, _ in nodes]
+        if op == "register":
+            if (
+                not _is_lower_hex_32(key)
+                or hash_value is not None
+                or peer is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "malformed register event"
+                )
+            if node in node_ids or len(nodes) == 2:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "contradictory register sequence"
+                )
+            nodes.append((node, key))
+        elif op == "commit":
+            if (
+                key is not None
+                or not _is_lower_hex_32(hash_value)
+                or peer is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "malformed commit event"
+                )
+            if (
+                len(nodes) != 2
+                or node not in node_ids
+                or node in commits
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "contradictory commit sequence"
+                )
+            commits[node] = hash_value
+        else:  # share
+            if (
+                key is not None
+                or not _is_lower_hex_32(hash_value)
+                or not isinstance(peer, str)
+                or not ROTATION_ID_RE.match(peer)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "malformed share event"
+                )
+            if (
+                len(nodes) != 2
+                or len(commits) != 2
+                or node not in node_ids
+                or node in shared
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "contradictory share sequence"
+                )
+            if peer == node or peer not in node_ids:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} share "
+                    "event has an invalid peer"
+                )
+            if commits[peer] != hash_value:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} share "
+                    "hash does not match the peer commitment"
+                )
+            shared[node] = (hash_value, peer)
+        state = self._dkg_state(nodes, commits, shared)
+        if details["state"] != state:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} event "
+                "state does not match the replayed stage"
+            )
+        round_state["state"] = state
+
+    def _replay_dkg_failover_event(
+        self,
+        wallet_id: str,
+        dkg_id: str,
+        event: dict,
+        rounds: dict[int, dict],
+        failovers: dict[int, tuple],
+    ) -> dict:
+        """把一条 dkg_failover 事件重放进轮次链并严格校验，返回新的当前
+        轮次。
+
+        - 事件轮次必须恰为"当前最新轮 + 1"；
+        - abort：node/replacement/key 三者皆 null，仅允许作用于非终态轮
+          （register/commit/share），目标轮落为 aborted（视图三空数组）；
+        - replace：仅允许作用于 commit/share 轮，把在用 node 的槽位换为
+          replacement（携带其 64 位小写 hex key），目标轮节点已注册、
+          committed/shared 清空、从 commit 阶段重新推进；
+        - request_id 必须等于 "<id>/<round>"，details.state 必须与重算
+          一致。"""
+        details = event.get("details")
+        if not isinstance(details, dict) or set(details) != {
+            "id",
+            "round",
+            "action",
+            "node",
+            "replacement",
+            "key",
+            "state",
+        }:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                "malformed dkg_failover event"
+            )
+        if details["id"] != dkg_id:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg_failover event id does not match "
+                "its session"
+            )
+        round_no = details["round"]
+        if not isinstance(round_no, int) or isinstance(round_no, bool):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                "malformed failover round"
+            )
+        if event.get("request_id") != f"{dkg_id}/{round_no}":
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg_failover event request_id does "
+                "not match its id/round"
+            )
+        action = details["action"]
+        node = details["node"]
+        replacement = details["replacement"]
+        key = details["key"]
+        prev_round_no = max(rounds)
+        if round_no != prev_round_no + 1:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} failover "
+                "round is not consecutive"
+            )
+        prev = rounds[prev_round_no]
+        if prev["state"] not in ("register", "commit", "share"):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} failover "
+                "targets a terminal round"
+            )
+        if action not in DKG_FAILOVER_ACTIONS:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has an unknown "
+                "failover action"
+            )
+        prev_node_ids = [n for n, _ in prev["nodes"]]
+        if action == "abort":
+            # abort：后三值（node/replacement/key）必须全为 null
+            if node is not None or replacement is not None or key is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} abort "
+                    "carries node/replacement/key"
+                )
+            target = self._new_round(dkg_id, round_no)
+            target["state"] = "aborted"
+            if details["state"] != "aborted":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} abort "
+                    "state mismatch"
+                )
+        else:  # replace
+            # replace 仅限 commit/share 两方阶段
+            if prev["state"] not in ("commit", "share"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} replace is "
+                    "only allowed in the commit/share stages"
                 )
             if not isinstance(node, str) or not ROTATION_ID_RE.match(node):
                 raise RecoveryError(
                     f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                    "malformed node"
+                    "malformed failover node"
                 )
-            node_ids = [n for n, _ in nodes]
-            if op == "register":
-                if (
-                    not _is_lower_hex_32(key)
-                    or hash_value is not None
-                    or peer is not None
-                ):
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                        "malformed register event"
-                    )
-                if node in node_ids or len(nodes) == 2:
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                        "contradictory register sequence"
-                    )
-                nodes.append((node, key))
-            elif op == "commit":
-                if (
-                    key is not None
-                    or not _is_lower_hex_32(hash_value)
-                    or peer is not None
-                ):
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                        "malformed commit event"
-                    )
-                if (
-                    len(nodes) != 2
-                    or node not in node_ids
-                    or node in commits
-                ):
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                        "contradictory commit sequence"
-                    )
-                commits[node] = hash_value
-            else:  # share
-                if (
-                    key is not None
-                    or not _is_lower_hex_32(hash_value)
-                    or not isinstance(peer, str)
-                    or not ROTATION_ID_RE.match(peer)
-                ):
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                        "malformed share event"
-                    )
-                if (
-                    len(nodes) != 2
-                    or len(commits) != 2
-                    or node not in node_ids
-                    or node in shared
-                ):
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
-                        "contradictory share sequence"
-                    )
-                if peer == node or peer not in node_ids:
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} share "
-                        "event has an invalid peer"
-                    )
-                if commits[peer] != hash_value:
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} dkg session {dkg_id!r} share "
-                        "hash does not match the peer commitment"
-                    )
-                shared[node] = (hash_value, peer)
-            state = self._dkg_state(nodes, commits, shared)
-            if details["state"] != state:
+            if node not in prev_node_ids:
                 raise RecoveryError(
-                    f"wallet {wallet_id!r} dkg session {dkg_id!r} event "
-                    "state does not match the replayed stage"
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} failover "
+                    "node was not active"
                 )
-        return {
-            "id": dkg_id,
-            "nodes": nodes,
-            "commits": commits,
-            "shared": shared,
-            "state": self._dkg_state(nodes, commits, shared),
-        }
+            if (
+                not isinstance(replacement, str)
+                or not ROTATION_ID_RE.match(replacement)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "malformed replacement"
+                )
+            if replacement in prev_node_ids:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} replacement "
+                    "was not idle"
+                )
+            if not _is_lower_hex_32(key):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "malformed replacement key"
+                )
+            target = self._new_round(dkg_id, round_no)
+            # 换槽：沿用上一轮节点序列，把 node 所在槽位换成
+            # replacement/key；committed/shared 已为空，节点视为已注册，
+            # 目标轮从 commit 阶段重新推进。
+            target["nodes"] = [
+                ((replacement, key) if nid == node else (nid, k))
+                for nid, k in prev["nodes"]
+            ]
+            target["state"] = "commit"
+            if details["state"] != "commit":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} replace "
+                    "state mismatch"
+                )
+        rounds[round_no] = target
+        failovers[round_no] = (action, node, replacement, key)
+        return target
 
-    def get_dkg_session(self, wallet_id: str, dkg_id: str) -> dict:
-        """查询 DKG 会话视图；钱包/会话未知 404，dkg id 非法 400。"""
+
+    @staticmethod
+    def _parse_round_query(value: object) -> int:
+        """?round=R 查询参数必须是十进制正整数（bool/0/负/小数/带空格均
+        拒绝），非法 400。"""
+        if not isinstance(value, str) or not value.isdigit():
+            raise ServiceError(400, "round must be a positive integer")
+        round_no = int(value)
+        if round_no < 1:
+            raise ServiceError(400, "round must be a positive integer")
+        return round_no
+
+    @staticmethod
+    def _parse_round_body(value: object) -> int:
+        """故障轮次请求体 round 必须为非布尔正整数，非法 400。"""
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+        ):
+            raise ServiceError(400, "round must be a positive integer")
+        return value
+
+    def _resolve_dkg_round(
+        self, session: dict, round_param: object
+    ) -> dict:
+        """按 ?round=R 定位要访问的轮次。
+
+        - 发生过故障轮次后无参访问一律 409（必须显式定位当前轮）；
+        - 非法 R 400；旧轮（R 小于当前轮）409；未知轮（R 大于当前轮）
+          404；命中当前轮返回该轮状态。"""
+        current_no = session["round"]
+        if round_param is None:
+            if self._dkg_failover_ever(session):
+                raise ServiceError(
+                    409,
+                    "round query parameter is required after a failover",
+                )
+            return session["rounds"][current_no]
+        round_no = self._parse_round_query(round_param)
+        if round_no < current_no:
+            raise ServiceError(409, "round is not the current round")
+        if round_no > current_no:
+            raise ServiceError(404, "dkg round not found")
+        return session["rounds"][round_no]
+
+    def get_dkg_session(
+        self, wallet_id: str, dkg_id: str, round_param: object = None
+    ) -> dict:
+        """查询 DKG 会话某轮视图。
+
+        钱包未知 404；会话未知 404；dkg id 非法 400。首轮（基线，无故障
+        轮次）可无参访问；故障轮次后必须以 ?round=R 显式定位当前轮：
+        无参/旧轮/未知轮/非法 R 分别 409/409/404/400。"""
         try:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
@@ -4223,7 +4517,8 @@ class WalletService:
                     raise ServiceError(
                         404, f"dkg session {dkg_id!r} not found"
                     )
-                return self._dkg_view(session)
+                round_state = self._resolve_dkg_round(session, round_param)
+                return self._round_view(round_state)
         except CorruptDataError:
             raise
         except ValueError:
@@ -4239,8 +4534,9 @@ class WalletService:
         key: object,
         hash_value: object,
         peer: object,
+        round_param: object = None,
     ) -> tuple[int, dict]:
-        """推进两方 DKG 会话一个阶段，返回 (状态码, 会话视图)。
+        """推进两方 DKG 当前轮一个阶段，返回 (状态码, 该轮视图)。
 
         - 钱包未知 404；非 register 的未知会话 404；参数非法 400；
         - 首提 201；同值重放 200（优先于阶段判定）；异值/错阶段/第三
@@ -4249,7 +4545,11 @@ class WalletService:
           非 null（64 位小写 hex），commit 仅 hash 非 null（64 位小写
           sha256），share 仅 hash/peer 非 null 且 hash 等于 peer 承诺
           （份额链下交换，后端不收正文）；
-        - dkg_stage 事件（details 依次 id,op,node,key,hash,peer,state，
+        - 故障轮次后必须以 ?round=R 定位当前轮（无参 409、旧轮 409、
+          未知轮 404、非法 400）；aborted 轮任何提交一律 409；派生轮
+          register 一律 409，commit/share 沿用旧约（含同值重放 200）；
+        - dkg_stage 事件（request_id 基线轮为会话 id、派生轮为
+          ``<id>/<round>``；details 依次 id,op,node,key,hash,peer,state，
           未用值 null）是唯一持久化与提交点：首提在跨进程事务锁内追加，
           重放不记；事件之外不写任何状态，崩溃后由事件序列重建。
         """
@@ -4295,107 +4595,124 @@ class WalletService:
                     self._validate_dkg_node(peer)
                 sessions = self._dkg_sessions(wallet_id)
                 session = sessions.get(dkg_id)
+                if op == "register" and session is None:
+                    # 基线轮首注册：建立会话（轮次 1）
+                    session = {
+                        "id": dkg_id,
+                        "round": 1,
+                        "rounds": {1: self._new_round(dkg_id, 1)},
+                        "failovers": {},
+                        "failover_seqs": [],
+                    }
+                    sessions[dkg_id] = session
+                elif session is None:
+                    # 非 register 的未知流程 404
+                    raise ServiceError(
+                        404, f"dkg session {dkg_id!r} not found"
+                    )
+                # 定位当前轮：故障轮次后强制 ?round=R 当前轮
+                current = self._resolve_dkg_round(session, round_param)
+                current_no = current["round"]
+                # aborted 轮任何 stage 提交一律 409；派生轮 register 一律
+                # 409（节点已由 replace 预置，无 register 阶段）。
+                if current["state"] == "aborted":
+                    raise ServiceError(
+                        409,
+                        f"dkg session {dkg_id!r} round {current_no} is "
+                        "aborted",
+                    )
+                if op == "register" and current_no > 1:
+                    raise ServiceError(
+                        409,
+                        "register is not accepted in a derived round",
+                    )
+                node_ids = [n for n, _ in current["nodes"]]
                 if op == "register":
-                    if session is not None:
-                        registered = dict(session["nodes"])
-                        if node in registered:
-                            # 同值重放 200 优先；异值 409
-                            if registered[node] != key:
-                                raise ServiceError(
-                                    409,
-                                    f"node {node!r} already registered a "
-                                    "different key",
-                                )
-                            return 200, self._dkg_view(session)
-                        if len(session["nodes"]) >= 2:
-                            # 已有两方后的新注册即第三节点
+                    registered = dict(current["nodes"])
+                    if node in registered:
+                        # 同值重放 200 优先；异值 409
+                        if registered[node] != key:
                             raise ServiceError(
                                 409,
-                                f"dkg session {dkg_id!r} already has "
-                                "two nodes",
+                                f"node {node!r} already registered a "
+                                "different key",
                             )
-                        # 第二方首次注册：落入下方首次提交分支
-                    else:
-                        session = {
-                            "id": dkg_id,
-                            "nodes": [],
-                            "commits": {},
-                            "shared": {},
-                            "state": "register",
-                        }
-                else:
-                    if session is None:
-                        # 非 register 的未知流程 404
+                        return 200, self._round_view(current)
+                    if len(current["nodes"]) >= 2:
+                        # 已有两方后的新注册即第三节点
                         raise ServiceError(
-                            404, f"dkg session {dkg_id!r} not found"
+                            409,
+                            f"dkg session {dkg_id!r} already has two nodes",
                         )
-                    node_ids = [n for n, _ in session["nodes"]]
-                    if op == "commit":
-                        if node in session["commits"]:
-                            # 同值重放 200 优先；异值 409
-                            if session["commits"][node] != hash_value:
-                                raise ServiceError(
-                                    409,
-                                    f"node {node!r} already committed a "
-                                    "different hash",
-                                )
-                            return 200, self._dkg_view(session)
-                        if node not in node_ids:
-                            raise ServiceError(
-                                409, f"node {node!r} is not a participant"
-                            )
-                        if session["state"] != "commit":
+                elif op == "commit":
+                    if node in current["commits"]:
+                        # 同值重放 200 优先；异值 409
+                        if current["commits"][node] != hash_value:
                             raise ServiceError(
                                 409,
-                                f"dkg session {dkg_id!r} is not in the "
-                                "commit stage",
+                                f"node {node!r} already committed a "
+                                "different hash",
                             )
-                    else:  # share
-                        if node in session["shared"]:
-                            # 同值重放 200 优先；异值 409
-                            if session["shared"][node] != (hash_value, peer):
-                                raise ServiceError(
-                                    409,
-                                    f"node {node!r} already shared with "
-                                    "different parameters",
-                                )
-                            return 200, self._dkg_view(session)
-                        if node not in node_ids:
-                            raise ServiceError(
-                                409, f"node {node!r} is not a participant"
-                            )
-                        if session["state"] != "share":
-                            raise ServiceError(
-                                409,
-                                f"dkg session {dkg_id!r} is not in the "
-                                "share stage",
-                            )
-                        if peer == node or peer not in node_ids:
-                            raise ServiceError(
-                                409, f"peer {peer!r} is not the other node"
-                            )
-                        if session["commits"][peer] != hash_value:
+                        return 200, self._round_view(current)
+                    if node not in node_ids:
+                        raise ServiceError(
+                            409, f"node {node!r} is not a participant"
+                        )
+                    if current["state"] != "commit":
+                        raise ServiceError(
+                            409,
+                            f"dkg session {dkg_id!r} is not in the commit "
+                            "stage",
+                        )
+                else:  # share
+                    if node in current["shared"]:
+                        # 同值重放 200 优先；异值 409
+                        if current["shared"][node] != (hash_value, peer):
                             raise ServiceError(
                                 409,
-                                "hash does not match the peer commitment",
+                                f"node {node!r} already shared with "
+                                "different parameters",
                             )
+                        return 200, self._round_view(current)
+                    if node not in node_ids:
+                        raise ServiceError(
+                            409, f"node {node!r} is not a participant"
+                        )
+                    if current["state"] != "share":
+                        raise ServiceError(
+                            409,
+                            f"dkg session {dkg_id!r} is not in the share "
+                            "stage",
+                        )
+                    if peer == node or peer not in node_ids:
+                        raise ServiceError(
+                            409, f"peer {peer!r} is not the other node"
+                        )
+                    if current["commits"][peer] != hash_value:
+                        raise ServiceError(
+                            409,
+                            "hash does not match the peer commitment",
+                        )
                 # 首次提交：应用阶段推进并以 dkg_stage 事件为唯一提交点
                 # （在跨进程事务锁内追加；事件之外无任何状态落盘，崩溃后
                 # 由事件序列重建，无需回滚）。
                 if op == "register":
-                    session["nodes"].append((node, key))
+                    current["nodes"].append((node, key))
                 elif op == "commit":
-                    session["commits"][node] = hash_value
+                    current["commits"][node] = hash_value
                 else:
-                    session["shared"][node] = (hash_value, peer)
-                session["state"] = self._dkg_state(
-                    session["nodes"], session["commits"], session["shared"]
+                    current["shared"][node] = (hash_value, peer)
+                current["state"] = self._dkg_state(
+                    current["nodes"], current["commits"], current["shared"]
+                )
+                stage_request_id = (
+                    dkg_id if current_no == 1 else f"{dkg_id}/{current_no}"
                 )
                 self._emit(
                     wallet_id,
                     self._audit_event(
                         audit.TYPE_DKG_STAGE,
-                        request_id=dkg_id,
+                        request_id=stage_request_id,
                         details={
                             "id": dkg_id,
                             "op": op,
@@ -4403,13 +4720,173 @@ class WalletService:
                             "key": key,
                             "hash": hash_value,
                             "peer": peer,
-                            "state": session["state"],
+                            "state": current["state"],
                         },
                     ),
                 )
-                return 201, self._dkg_view(session)
+                return 201, self._round_view(current)
         except CorruptDataError:
             raise
         except ValueError:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
+
+    def post_dkg_failover(
+        self,
+        wallet_id: str,
+        dkg_id: object,
+        round_no: object,
+        action: object,
+        node: object,
+        replacement: object,
+        key: object,
+    ) -> tuple[int, dict]:
+        """推进一个 DKG 故障轮次（abort/replace），返回 (状态码, 新轮视图)。
+
+        请求体恰含 {round,action,node,replacement,key}：
+
+        - abort：后三值（node/replacement/key）必须全为 null；仅允许作用
+          于非终态轮（register/commit/share），新轮落为 aborted（视图三
+          空数组、public_key null）；
+        - replace：仅限 commit/share 两方阶段；node 为该轮在用节点，
+          replacement 空闲（不在用、且为安全标识），key 为 64 位小写
+          hex。换槽后新轮节点已注册、committed/shared 清空、从 commit
+          阶段重新推进；
+        - round 为新轮轮号（当前轮 + 1，基线为轮 1）：首提 201；同参
+          重放 200（优先）、异参或错轮 409；非法 400；钱包/DKG 会话
+          未知 404；终态轮（done/aborted）再故障一律 409；
+        - dkg_failover 事件（request_id 为 ``<id>/<round>``，details 依次
+          id,round,action,node,replacement,key,state，未用值 null）是唯一
+          提交点：首提在跨进程事务锁内追加，重放不记；崩溃后由事件序列
+          重建轮次链。响应、日志绝不含私钥或份额正文。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：锁内先判定钱包存在性
+                self._get_wallet_or_404(wallet_id)
+                self._validate_dkg_id(dkg_id)
+                round_no = self._parse_round_body(round_no)
+                if action not in DKG_FAILOVER_ACTIONS:
+                    raise ServiceError(
+                        400,
+                        "action must be one of "
+                        + ", ".join(DKG_FAILOVER_ACTIONS),
+                    )
+                if action == "abort":
+                    if node is not None or replacement is not None or key is not None:
+                        raise ServiceError(
+                            400,
+                            "abort accepts only null node, replacement and key",
+                        )
+                else:  # replace
+                    self._validate_dkg_node(node)
+                    if (
+                        not isinstance(replacement, str)
+                        or not ROTATION_ID_RE.match(replacement)
+                    ):
+                        raise ServiceError(
+                            400,
+                            "replacement must match "
+                            "[A-Za-z0-9_-]{1,128}",
+                        )
+                    if not _is_lower_hex_32(key):
+                        raise ServiceError(
+                            400, "key must be 64 lowercase hex characters"
+                        )
+                sessions = self._dkg_sessions(wallet_id)
+                session = sessions.get(dkg_id)
+                if session is None:
+                    raise ServiceError(
+                        404, f"dkg session {dkg_id!r} not found"
+                    )
+                current_no = session["round"]
+                target_no = current_no + 1
+                # 同轮同参重放 200 优先、异参 409（重放判定先于阶段判定）
+                prior = session["failovers"].get(round_no)
+                if prior is not None or round_no <= current_no:
+                    if prior == (action, node, replacement, key):
+                        return 200, self._round_view(
+                            session["rounds"][round_no]
+                        )
+                    raise ServiceError(
+                        409,
+                        "dkg failover round does not match the current round",
+                    )
+                if round_no != target_no:
+                    # 不允许跳轮（round_no > target_no）
+                    raise ServiceError(
+                        409, "dkg failover rounds must be consecutive"
+                    )
+                current = session["rounds"][current_no]
+                if current["state"] not in ("register", "commit", "share"):
+                    # done/aborted 等终态轮不可再故障
+                    raise ServiceError(
+                        409,
+                        f"dkg session {dkg_id!r} round {current_no} is in a "
+                        "terminal state",
+                    )
+                target = self._new_round(dkg_id, target_no)
+                if action == "abort":
+                    target["state"] = "aborted"
+                    new_state = "aborted"
+                else:
+                    # replace 仅限 commit/share
+                    if current["state"] not in ("commit", "share"):
+                        raise ServiceError(
+                            409,
+                            "replace is only allowed in the commit/share "
+                            "stages",
+                        )
+                    prev_node_ids = [n for n, _ in current["nodes"]]
+                    if node not in prev_node_ids:
+                        raise ServiceError(
+                            409, f"node {node!r} is not active in the round"
+                        )
+                    if replacement in prev_node_ids:
+                        raise ServiceError(
+                            409,
+                            f"replacement {replacement!r} is already active",
+                        )
+                    # 换槽：node 所在槽位换成 replacement/key，另一份保留，
+                    # committed/shared 清空，节点视为已注册，从 commit 起步。
+                    target["nodes"] = [
+                        ((replacement, key) if nid == node else (nid, k))
+                        for nid, k in current["nodes"]
+                    ]
+                    target["state"] = "commit"
+                    new_state = "commit"
+                # dkg_failover 事件为唯一提交点（锁内追加，事件之外无任何
+                # 状态落盘）。
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_DKG_FAILOVER,
+                        request_id=f"{dkg_id}/{target_no}",
+                        details={
+                            "id": dkg_id,
+                            "round": target_no,
+                            "action": action,
+                            "node": node,
+                            "replacement": replacement,
+                            "key": key,
+                            "state": new_state,
+                        },
+                    ),
+                )
+                # 事件落盘后前滚内存中的轮次链（仅影响本次响应）。
+                session["rounds"][target_no] = target
+                session["failovers"][target_no] = (
+                    action,
+                    node,
+                    replacement,
+                    key,
+                )
+                session["round"] = target_no
+                return 201, self._round_view(target)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
