@@ -41,6 +41,8 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
 | PUT  | `/v1/wallets/{id}/dkg-failover-policy` | DKG 故障审批开关 `{"enabled":bool}` |
 | GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批开关（缺省 `{"enabled":false}`） |
+| PUT  | `/v1/wallets/{id}/nodes` | DKG 节点健康表 `{"nodes":{ID:{"key","state"}}}` |
+| GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
@@ -294,6 +296,35 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 - 审批检查、事件追加与 DKG 轮次派生全在同一把每钱包跨进程事务锁内
   原子完成，跨进程并发同一轮次只有一个 `201`，审计 seq 连续不重号。
 
+### DKG 节点健康与自动替补
+
+`PUT /v1/wallets/{id}/nodes`：请求体仅收 `Q={"nodes":{...}}`（恰一键，
+多/缺一律 `400`）。`nodes` 为非空对象：键为安全 ID（响应与事件按
+安全 ID 升序），值恰含 `key,state` 两键（键序固定），`key` 为 64 位
+小写 hex（该节点公钥贡献），`state` 为 `up|down|ban`；非法 `400`。
+成功 `200` 返回 Q；`GET` 已配置 `200` 同体、未配置 `404`；钱包不存在
+GET/PUT 均 `404`；PUT 可首建。健康表仅由 `node_state` 审计事件持久化
+（`request_id`/`actor_id`/`reason` 为 `null`，details 即 Q，取最后
+一条恢复），**同值更新不记事件**、变更才记，不写状态文件。事件损坏/
+形状矛盾 fail-closed（常驻 `503`、`serve` 拒绝就绪），重启/灾备恢复
+后健康表与 seq 不变。
+
+自动替补：`POST /v1/dkg/{id}/{did}/failover` 的 `replace` 允许
+`replacement`/`key` 双 `null`（恰一项为 `null` 一律 `400`），即由
+后端按健康表自动选节点。首提须故障审批开关**关闭**、当前轮为
+`commit|share`、`node` 在用且按当前健康表为 `down|ban`；后端按安全
+ID 升序取首个 `up` 非参与节点及其 `key` 实选，无候选或任一违例
+`409`。首提 `201`，跨进程并发只有一个 `201`。auto 的 `dkg_failover`
+事件 details 为旧七键末加 `mode`（`mode="auto"`，`replacement`/`key`
+写实选值）；手工/旧事件仍为旧七键，恢复时只按手工处理。
+
+auto 重放：同 `round`/`action`/`node` 且双 `null` 优先 `200` 视图——
+不复查审批开关、健康表、候选与阶段（审批事后开启亦同）；其余参数
+`409`。恢复以事件前最近一条 `node_state` 核验实选值；矛盾/坏审计
+JSON/审计 I/O 分别抛 `RecoveryError`/`CorruptDataError`/`OSError`
+（HTTP 均为 `503`、`serve` 拒绝就绪），恢复不记事件。响应、日志与
+非份额文件绝不含私钥或份额正文。
+
 ### 份额轮换
 
 - `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
@@ -437,7 +468,7 @@ quorum 后按既有 commit 契约自动提交。
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
-`dkg_failover`、`dkg_failover_policy_updated`、`chain_policy`、
+`dkg_failover`、`dkg_failover_policy_updated`、`node_state`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`。
 
 ## 多进程与故障恢复（保证）

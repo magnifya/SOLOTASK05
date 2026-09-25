@@ -62,6 +62,9 @@ DKG_OPS = ("register", "commit", "share")
 #: DKG 故障轮次允许的动作（abort 中止当前轮并派生空轮；replace 换槽派生新轮）
 DKG_FAILOVER_ACTIONS = ("abort", "replace")
 
+#: DKG 节点健康允许的状态取值
+DKG_NODE_STATES = ("up", "down", "ban")
+
 
 class ServiceError(Exception):
     """业务错误，携带 HTTP 状态码与错误信息。"""
@@ -930,6 +933,161 @@ class WalletService:
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
         return {"enabled": enabled}
+
+    # ---- DKG 节点健康 ---------------------------------------------------
+
+    @staticmethod
+    def _nodes_map_error(nodes: object) -> str | None:
+        """校验节点健康表 Q 的 nodes 映射；合法返回 None，否则返回错误信息。
+
+        nodes 为非空对象：键为安全标识，值恰含 key/state 两键，key 为
+        64 位小写 hex，state 为 up|down|ban。"""
+        if not isinstance(nodes, dict) or not nodes:
+            return "nodes must be a non-empty object"
+        for node_id, entry in nodes.items():
+            if not isinstance(node_id, str) or not ROTATION_ID_RE.match(
+                node_id
+            ):
+                return "node ids must match [A-Za-z0-9_-]{1,128}"
+            if not isinstance(entry, dict) or set(entry) != {"key", "state"}:
+                return "node entries must contain exactly key and state"
+            if not _is_lower_hex_32(entry["key"]):
+                return "node key must be 64 lowercase hex characters"
+            if entry["state"] not in DKG_NODE_STATES:
+                return (
+                    "node state must be one of "
+                    + ", ".join(DKG_NODE_STATES)
+                )
+        return None
+
+    @staticmethod
+    def _normalize_nodes_map(nodes: dict) -> dict:
+        """归一节点健康表：节点按安全 ID 升序，值键序 key,state。"""
+        return {
+            node_id: {
+                "key": nodes[node_id]["key"],
+                "state": nodes[node_id]["state"],
+            }
+            for node_id in sorted(nodes)
+        }
+
+    def _node_state_events(self, wallet_id: str) -> list[dict]:
+        """返回校验后的 node_state 事件序列（seq 升序）。
+
+        节点健康仅由 node_state 审计事件持久化（事件之外不写任何状态
+        文件）：每条事件的 request_id/actor_id/reason 必须为 null，
+        details 恰为 Q={"nodes": ...} 且形状合法；任何畸形/矛盾都是
+        不可对账现场（RecoveryError，fail-closed），绝不静默跳过。
+        纯只读，不分配 seq。"""
+        events: list[dict] = []
+        for event in self._audit.events_by_type(
+            wallet_id, audit.TYPE_NODE_STATE
+        ):
+            if (
+                event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a node_state event with "
+                    "request_id/actor/reason set"
+                )
+            details = event.get("details")
+            if not isinstance(details, dict) or set(details) != {"nodes"}:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed node_state event"
+                )
+            if self._nodes_map_error(details["nodes"]) is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed node_state event"
+                )
+            events.append(
+                {
+                    "seq": event["seq"],
+                    "nodes": self._normalize_nodes_map(details["nodes"]),
+                }
+            )
+        return events
+
+    def _node_health(self, wallet_id: str) -> dict | None:
+        """从 node_state 事件序列恢复当前节点健康表；从未配置返回 None。"""
+        events = self._node_state_events(wallet_id)
+        return events[-1]["nodes"] if events else None
+
+    @staticmethod
+    def _node_health_before(events: list[dict], seq: int) -> dict | None:
+        """返回 seq 之前最近一条 node_state 事件的健康表；无则 None。"""
+        health = None
+        for event in events:
+            if event["seq"] >= seq:
+                break
+            health = event["nodes"]
+        return health
+
+    @staticmethod
+    def _auto_failover_candidate(
+        health: dict, participants: set
+    ) -> tuple[str, str] | None:
+        """按安全 ID 升序取首个 up 非参与节点及其 key；无候选返回 None。"""
+        for node_id in sorted(health):
+            if node_id in participants:
+                continue
+            entry = health[node_id]
+            if entry["state"] == "up":
+                return node_id, entry["key"]
+        return None
+
+    def put_dkg_nodes(self, wallet_id: str, nodes: object) -> dict:
+        """设置 DKG 节点健康表，成功 200 返回 Q={"nodes": ...}。
+
+        PUT 仅收 Q（夹带其他键由 HTTP 边界拦）；nodes 非空、键为安全
+        标识、值恰含 key/state（64 位小写 hex、up|down|ban），非法
+        400；钱包不存在 404；PUT 可首建。健康表仅由 node_state 审计
+        事件持久化（request_id/actor_id/reason 为 null，details 即
+        Q）：**同值更新不记事件**，变更才记；不写任何状态文件。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                error = self._nodes_map_error(nodes)
+                if error is not None:
+                    raise ServiceError(400, error)
+                normalized = self._normalize_nodes_map(nodes)
+                current = self._node_health(wallet_id)
+                if current != normalized:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_NODE_STATE,
+                            details={"nodes": normalized},
+                        ),
+                    )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return {"nodes": normalized}
+
+    def get_dkg_nodes(self, wallet_id: str) -> dict:
+        """读取 DKG 节点健康表：已配置 200 同体，未配置 404，钱包不存在 404。
+
+        健康表纯由 node_state 事件恢复；损坏/矛盾事件 fail-closed
+        （由 HTTP 边界转 503）。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在，再从事件恢复健康表
+                self._get_wallet_or_404(wallet_id)
+                current = self._node_health(wallet_id)
+                if current is None:
+                    raise ServiceError(404, "dkg nodes not configured")
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return {"nodes": current}
 
     @staticmethod
     def _dkg_failover_approval_message(
@@ -5957,9 +6115,13 @@ class WalletService:
         R≥2 轮）由 request_id 为 ``<id>/<R>`` 的唯一 dkg_failover 事件
         从上一轮派生，再由同 request_id 的 dkg_stage 事件推进。任何矛盾
         （形状、字段约束、轮次缺口/重复、阶段顺序、承诺不一致、
-        details.state 与重算不符）都抛 RecoveryError（fail-closed：
-        常驻 503、serve 拒绝就绪），绝不静默跳过或任取一条。纯只读，
-        不分配 seq、不写任何状态。"""
+        details.state 与重算不符、auto 替补与事件前最近 node_state
+        不符）都抛 RecoveryError（fail-closed：常驻 503、serve 拒绝
+        就绪），绝不静默跳过或任取一条。纯只读，不分配 seq、不写任何
+        状态。"""
+        # node_state 事件全员严格校验（即使尚无 DKG 会话）：自动替补的
+        # 恢复核验与节点健康对账都以此为准。
+        node_state_events = self._node_state_events(wallet_id)
         stage_rounds: dict[str, dict[int, list[dict]]] = {}
         for request_id, events in self._audit.dkg_stage_events(
             wallet_id
@@ -5987,6 +6149,7 @@ class WalletService:
                 dkg_id,
                 stage_rounds.get(dkg_id, {}),
                 failover_rounds.get(dkg_id, {}),
+                node_state_events,
             )
         return sessions
 
@@ -5996,6 +6159,7 @@ class WalletService:
         dkg_id: str,
         stage_rounds: dict[int, list[dict]],
         failover_rounds: dict[int, list[dict]],
+        node_state_events: list[dict],
     ) -> dict:
         """按轮次链重建某 DKG 会话并严格校验。
 
@@ -6025,7 +6189,12 @@ class WalletService:
                     "event"
                 )
             new_round, committed = self._apply_dkg_failover(
-                wallet_id, dkg_id, round_no, events[0], rounds[round_no - 1]
+                wallet_id,
+                dkg_id,
+                round_no,
+                events[0],
+                rounds[round_no - 1],
+                node_state_events,
             )
             failovers[round_no] = committed
             rounds[round_no] = self._replay_dkg_round(
@@ -6049,6 +6218,7 @@ class WalletService:
         round_no: int,
         event: dict,
         prev_round: dict,
+        node_state_events: list[dict],
     ) -> tuple[dict, dict]:
         """校验一条 dkg_failover 事件并从上一轮派生新轮次。
 
@@ -6056,7 +6226,11 @@ class WalletService:
         （node/replacement/key）必须为 null，派生出 aborted 空轮；
         replace 仅限两方已注册的 commit|share 轮，key 为 64 位小写
         hex、node 在用、replacement 空闲，换槽并清空后两数组后回到
-        commit。任何矛盾都抛 RecoveryError。"""
+        commit。details 为旧七键时是手工/旧故障（只按手工恢复）；
+        末键追加 mode="auto" 的八键是自动替补：replacement/key 为
+        实选值，必须与事件前最近一条 node_state 健康表按既定规则
+        （node 在用且 down|ban、取首个 up 非参与节点及其 key）重算
+        一致。任何矛盾都抛 RecoveryError。"""
         if (
             event.get("actor_id") is not None
             or event.get("reason") is not None
@@ -6066,7 +6240,7 @@ class WalletService:
                 "dkg_failover event with actor/reason set"
             )
         details = event.get("details")
-        if not isinstance(details, dict) or set(details) != {
+        manual_keys = {
             "id",
             "round",
             "action",
@@ -6074,7 +6248,23 @@ class WalletService:
             "replacement",
             "key",
             "state",
-        }:
+        }
+        if not isinstance(details, dict):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                "malformed dkg_failover event"
+            )
+        detail_keys = set(details)
+        if detail_keys == manual_keys:
+            mode = "manual"
+        elif detail_keys == manual_keys | {"mode"}:
+            if details["mode"] != "auto":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
+                    "dkg_failover event with an unknown mode"
+                )
+            mode = "auto"
+        else:
             raise RecoveryError(
                 f"wallet {wallet_id!r} dkg session {dkg_id!r} has a "
                 "malformed dkg_failover event"
@@ -6104,10 +6294,12 @@ class WalletService:
             "node": node,
             "replacement": replacement,
             "key": key,
+            "mode": mode,
         }
         if action == "abort":
             if (
-                node is not None
+                mode != "manual"
+                or node is not None
                 or replacement is not None
                 or key is not None
             ):
@@ -6167,6 +6359,32 @@ class WalletService:
                     f"wallet {wallet_id!r} dkg session {dkg_id!r} replaces "
                     "with a node that is not free"
                 )
+            if mode == "auto":
+                # 自动替补：以事件前最近一条 node_state 健康表核验实选值——
+                # node 须在用且 down|ban，replacement/key 须恰为按安全 ID
+                # 升序的首个 up 非参与节点及其 key；任何矛盾都不可对账。
+                health = self._node_health_before(
+                    node_state_events, event["seq"]
+                )
+                node_entry = health.get(node) if health is not None else None
+                if node_entry is None or node_entry["state"] not in (
+                    "down",
+                    "ban",
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg session {dkg_id!r} auto "
+                        "failover node was not down/ban in the node state "
+                        "before the event"
+                    )
+                candidate = self._auto_failover_candidate(
+                    health, set(node_ids)
+                )
+                if candidate is None or candidate != (replacement, key):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg session {dkg_id!r} auto "
+                        "failover replacement/key do not match the node "
+                        "state before the event"
+                    )
             new_nodes = [
                 (replacement, key) if n == node else (n, k)
                 for n, k in prev_round["nodes"]
@@ -6673,17 +6891,24 @@ class WalletService:
           派生轮为 aborted 且三数组为空；replace 仅限两方已注册的
           commit|share 轮，key 为 64 位小写 hex、node 在用、
           replacement 空闲，换槽并清空 committed/shared 后回到 commit；
+        - replace 的 replacement/key 双 null 即自动替补（auto；恰一项
+          为 null 400）：首提须审批关、轮次为 commit|share、node 在用
+          且按当前 node_state 健康表为 down|ban，取首个（安全 ID 升序）
+          up 非参与节点及其 key 实选，无候选/违例 409；auto 事件的
+          details 在旧七键末追加 mode="auto" 且 replacement/key 写
+          实选值，手工/旧事件仍为旧七键、只按手工恢复；
         - 故障审批策略（仅由 dkg_failover_policy_updated 事件恢复，缺省
           关闭）：禁用时沿用旧五键；启用时恰收旧五键及安全标识
           approval_request_id，该单须为同钱包既有且 approved 的审批单，
           message 逐字为既定紧凑 JSON（轮次即本次 round）。未知/挂起/
           拒绝/过期/非 approved、message 不符或轮次已变化均 409 且
-          DKG 状态不变；已提交故障的旧五键同参重放优先 200、不复查
-          审批；
+          DKG 状态不变；已提交故障的同参重放优先 200、不复查审批
+          （auto 轮次按同 round/action/node 且双 null 重放，审批事后
+          开启亦同）；
         - dkg_failover 事件（request_id 为 ``<id>/<轮次>``，details
-          依次 id,round,action,node,replacement,key,state，不含审批
-          标识）是唯一持久化与提交点：首提在跨进程事务锁内追加，重放
-          不记；事件之外不写任何状态，崩溃后由事件序列重建。
+          依次 id,round,action,node,replacement,key,state[,mode]，不含
+          审批标识）是唯一持久化与提交点：首提在跨进程事务锁内追加，
+          重放不记；事件之外不写任何状态，崩溃后由事件序列重建。
         """
         try:
             with self._wallet_lock(wallet_id):
@@ -6706,6 +6931,7 @@ class WalletService:
                         + ", ".join(DKG_FAILOVER_ACTIONS),
                     )
                 if action == "abort":
+                    auto = False
                     if (
                         node is not None
                         or replacement is not None
@@ -6718,11 +6944,22 @@ class WalletService:
                         )
                 else:  # replace
                     self._validate_dkg_node(node)
-                    self._validate_dkg_node(replacement)
-                    if not _is_lower_hex_32(key):
+                    # replacement/key 双 null 即自动替补（auto）：由后端按
+                    # 节点健康表实选；恰一项为 null 一律 400。
+                    if (replacement is None) != (key is None):
                         raise ServiceError(
-                            400, "key must be 64 lowercase hex characters"
+                            400,
+                            "replacement and key must both be null (auto) "
+                            "or both be set",
                         )
+                    auto = replacement is None
+                    if not auto:
+                        self._validate_dkg_node(replacement)
+                        if not _is_lower_hex_32(key):
+                            raise ServiceError(
+                                400,
+                                "key must be 64 lowercase hex characters",
+                            )
                 approval_required = self._dkg_failover_policy_enabled(
                     wallet_id
                 )
@@ -6733,13 +6970,24 @@ class WalletService:
                         404, f"dkg session {dkg_id!r} not found"
                     )
                 # 已提交故障轮次的同参重放优先 200 且不复查（不复查审批
-                # 开关、approval_request_id 与审批单现状）；异参 409。
-                # 重放只比对旧五键，approval_request_id 不参与：禁用/启用
-                # 策略切换、审批单事后终态化都不影响已提交故障的幂等重放。
+                # 开关、approval_request_id、审批单现状、节点健康、候选
+                # 与阶段）；异参 409。手工轮次只按旧五键同参重放；auto
+                # 轮次只按同 round/action/node 且双 null 重放（审批事后
+                # 开启亦同），其余一律 409。重放只比对请求参数，
+                # approval_request_id 不参与：禁用/启用策略切换、审批单
+                # 事后终态化都不影响已提交故障的幂等重放。
                 committed = session["failovers"].get(round_no)
                 if committed is not None:
-                    if (
-                        committed["action"] == action
+                    if auto:
+                        if (
+                            committed["mode"] == "auto"
+                            and committed["action"] == action
+                            and committed["node"] == node
+                        ):
+                            return 200, self._dkg_view(session, round_no)
+                    elif (
+                        committed["mode"] == "manual"
+                        and committed["action"] == action
                         and committed["node"] == node
                         and committed["replacement"] == replacement
                         and committed["key"] == key
@@ -6749,6 +6997,14 @@ class WalletService:
                         409,
                         f"round {round_no} already failed over with "
                         "different parameters",
+                    )
+                # 自动替补首提须审批关：开关启用时一律 409（违例），
+                # 不复查审批单。
+                if auto and approval_required:
+                    raise ServiceError(
+                        409,
+                        "auto failover requires the dkg failover approval "
+                        "policy to be disabled",
                     )
                 # 首提路径才按当前策略校验请求体键集：启用时恰收六键
                 # （approval_request_id 为安全标识）；禁用时沿用旧五键。
@@ -6841,7 +7097,33 @@ class WalletService:
                             f"node {node!r} is not active in the "
                             "current round",
                         )
-                    if replacement in node_ids:
+                    if auto:
+                        # 自动替补：node 须在用且按当前健康表为 down|ban；
+                        # 取首个（安全 ID 升序）up 非参与节点及其 key 实选，
+                        # 无候选/违例一律 409。
+                        health = self._node_health(wallet_id)
+                        node_entry = (
+                            health.get(node) if health is not None else None
+                        )
+                        if node_entry is None or node_entry[
+                            "state"
+                        ] not in ("down", "ban"):
+                            raise ServiceError(
+                                409,
+                                f"node {node!r} is not down/ban in the "
+                                "current node state",
+                            )
+                        candidate = self._auto_failover_candidate(
+                            health, set(node_ids)
+                        )
+                        if candidate is None:
+                            raise ServiceError(
+                                409,
+                                "no up non-participant node is available "
+                                "for auto failover",
+                            )
+                        replacement, key = candidate
+                    elif replacement in node_ids:
                         raise ServiceError(
                             409,
                             f"replacement {replacement!r} is not free",
@@ -6858,7 +7140,8 @@ class WalletService:
                     }
                 # 首次提交：应用轮次派生并以 dkg_failover 事件为唯一
                 # 提交点（在跨进程事务锁内追加；事件之外无任何状态落盘，
-                # 崩溃后由事件序列重建，无需回滚）。
+                # 崩溃后由事件序列重建，无需回滚）。auto 事件的 details
+                # 在旧七键末追加 mode="auto"，replacement/key 写实选值。
                 session["rounds"][round_no] = new_round
                 session["current"] = round_no
                 session["failovers"][round_no] = {
@@ -6866,21 +7149,25 @@ class WalletService:
                     "node": node,
                     "replacement": replacement,
                     "key": key,
+                    "mode": "auto" if auto else "manual",
                 }
+                details = {
+                    "id": dkg_id,
+                    "round": round_no,
+                    "action": action,
+                    "node": node,
+                    "replacement": replacement,
+                    "key": key,
+                    "state": new_round["state"],
+                }
+                if auto:
+                    details["mode"] = "auto"
                 self._emit(
                     wallet_id,
                     self._audit_event(
                         audit.TYPE_DKG_FAILOVER,
                         request_id=f"{dkg_id}/{round_no}",
-                        details={
-                            "id": dkg_id,
-                            "round": round_no,
-                            "action": action,
-                            "node": node,
-                            "replacement": replacement,
-                            "key": key,
-                            "state": new_round["state"],
-                        },
+                        details=details,
                     ),
                 )
                 return 201, self._dkg_view(session, round_no)

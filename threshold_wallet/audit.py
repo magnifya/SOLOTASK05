@@ -61,6 +61,7 @@ TYPE_SESSION_TAKEOVER = "session_takeover"
 TYPE_DKG_STAGE = "dkg_stage"
 TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
+TYPE_NODE_STATE = "node_state"
 TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
 TYPE_CHAIN_ARBITRATION = "chain_arbitration"
@@ -100,13 +101,28 @@ _DETAILS_KEY_ORDER = {
         "state",
     ),
     TYPE_DKG_FAILOVER: (
-        "id",
-        "round",
-        "action",
-        "node",
-        "replacement",
-        "key",
-        "state",
+        # 手工/旧故障轮次：旧七键；自动替补（auto）在末键追加 mode="auto"
+        # （replacement/key 写实值），两种语义共用同一事件类型，按精确
+        # 键集区分。
+        (
+            "id",
+            "round",
+            "action",
+            "node",
+            "replacement",
+            "key",
+            "state",
+        ),
+        (
+            "id",
+            "round",
+            "action",
+            "node",
+            "replacement",
+            "key",
+            "state",
+            "mode",
+        ),
     ),
     TYPE_CHAIN_POLICY: (
         "chain_id",
@@ -141,8 +157,9 @@ def _order_event_details(event: dict) -> None:
 
     仅当 details 键集与既定键序恰好一致时重排；键集不符的现场留给各
     语义对账路径 fail-closed，绝不在这里猜写。chain_vote 事件按精确
-    键集在策略序 {sources,quorum} 与票序 {source,report,state} 间选择
-    （两种语义共用同一事件类型）。
+    键集在策略序 {sources,quorum} 与票序 {source,report,state} 间选择，
+    dkg_failover 事件按精确键集在旧七键（手工/旧）与八键（auto 末键
+    mode）间选择（多语义共用同一事件类型）。
     """
     order = _DETAILS_KEY_ORDER.get(event.get("type"))
     details = event.get("details")
