@@ -645,6 +645,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "transaction_policy_updated",
         "session_event",
         "session_participant_replaced",
+        "session_takeover",
     )
 )
 
@@ -868,9 +869,11 @@ def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) 
             raise BackupError(503, "share public keys do not form wallet public_key")
         pubs.append(pub)
     if share_files != expected_share_files:
-        # 会话参与者替换份额（<replacement_id>-share）：必须被包内审计
-        # 中已提交的 session_participant_replaced 事件引用，且逐份密码学
-        # 自洽；每个已提交替换的新份额也必须在包内。否则 503。
+        # 会话参与者替换/接管份额（<replacement_id>-share、
+        # <takeover_id>-<stage>-share）：必须被包内审计中已提交的
+        # session_participant_replaced / session_takeover 事件引用，
+        # 且逐份密码学自洽；每个已提交替换/接管的新份额也必须在包内。
+        # 否则 503。
         replacement_ids = _committed_replacement_share_ids(files, wallet_id)
         for rel in sorted(share_files - expected_share_files):
             share_id = rel[len(share_dir_prefix):-len(".json")]
@@ -913,8 +916,8 @@ def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) 
 def _committed_replacement_share_ids(
     files: dict[str, bytes], wallet_id: str
 ) -> set:
-    """从包内审计日志收集已提交 session_participant_replaced 事件的
-    new_share_id 集合（无审计文件/无事件为空集）。
+    """从包内审计日志收集已提交 session_participant_replaced 与
+    session_takeover 事件的 new_share_id 集合（无审计文件/无事件为空集）。
 
     事件形状本身由 _verify_audit_contract 与线上恢复器严格校验；这里
     只做份额文件 ↔ 提交事件的集合对账。"""
@@ -929,7 +932,10 @@ def _committed_replacement_share_ids(
     for event in events:
         if not isinstance(event, dict):
             continue
-        if event.get("type") != "session_participant_replaced":
+        if event.get("type") not in (
+            "session_participant_replaced",
+            "session_takeover",
+        ):
             continue
         details = event.get("details")
         if isinstance(details, dict) and isinstance(

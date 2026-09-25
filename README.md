@@ -55,6 +55,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/replace` | 替换会话单个参与方份额 `{"replacement_id","offline_share_id"}` |
+| POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
 
 ID（wallet/rotation/operation/asset/session 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -131,9 +132,9 @@ JSON 对象。
 ### 会话单节点参与者替换
 
 `POST /v1/wallets/{id}/sign-sessions/{sid}/participants/replace`，请求体
-仅 `{"replacement_id","offline_share_id"}`：把会话 `sid` 的单个参与方
-份额（`offline_share_id`）下线，生成新份额 `<replacement_id>-share`
-顶替原槽位。既有接口与 CLI 不变。
+**恰含** `{"replacement_id","offline_share_id"}`（多键/缺键 `400`）：
+把会话 `sid` 的单个参与方份额（`offline_share_id`）下线，生成新份额
+`<replacement_id>-share` 顶替原槽位。既有接口与 CLI 不变。
 
 - 两个 ID 均须匹配安全标识，非法 `400`；钱包/会话未知 `404`；会话非
   `collecting|ready`（含到点懒过期）、或 `offline_share_id` 不是该会话
@@ -157,6 +158,29 @@ JSON 对象。
   响应、日志与非份额文件绝不泄露份额私钥。
 - 替换后该会话快照与钱包轮换解耦：其后的份额轮换不再迁移该会话；
   未替换的会话行为不变。
+
+### 会话两阶段参与者接管
+
+`POST /v1/wallets/{id}/sign-sessions/{sid}/participants/takeover`，请求体
+**恰含** `{"takeover_id","stage","offline_share_id"}`（多键/缺键
+`400`）：分两个阶段把会话 `sid` 的两个参与方槽位依次换成新份额
+`<takeover_id>-<stage>-share`。
+
+- 两个 ID（`takeover_id`、`offline_share_id`）均须匹配安全标识，
+  `stage` 须为非布尔整数 `1` 或 `2`；非法 `400`；钱包/会话未知 `404`。
+- 阶段从 1 连续提交（未提交 stage 1 即提交 stage 2 为跳号 `409`），
+  且两阶段替换**不同槽位**。每阶段把 `offline_share_id` 的槽位换成
+  新份额：删除该槽位已投递的签名、保留另一份，返回既有会话视图。
+- 首提 `201`；同阶段同参重放 `200` 当前视图；异参、跳号、终态/到期
+  （含懒过期）、目标非当前份额或 ID 占用均 `409`，已提交重放优先于
+  状态判定。
+- 迁移在每钱包跨进程事务锁内原子提交，`session_takeover` 事件
+  （`request_id` 为会话 id，`actor_id`/`reason` 为 `null`，details
+  恰含有序 `takeover_id,stage,old_share_id,new_share_id`）为唯一提交
+  点：事件落盘前崩溃回滚并删除新份额文件，落盘后前滚迁移会话记录；
+  对账矛盾保留现场、常驻请求 `503` 且 `serve` 拒绝就绪。
+- 新份额私钥只写 `shares/<id>/<takeover_id>-<stage>-share.json`
+  （与替换份额文件同形同约束）；接管后该会话快照同样与钱包轮换解耦。
 
 ### 份额轮换
 
@@ -208,7 +232,7 @@ JSON 对象。
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
-`session_participant_replaced`。
+`session_participant_replaced`、`session_takeover`。
 
 ## 多进程与故障恢复（保证）
 
@@ -347,8 +371,9 @@ python -m threshold_wallet.cli restore --data-dir ./data2 \
 - **磁盘**：钱包元数据与账本/策略/会话/审批单等业务文件不含任何私钥；
   两个份额私钥分文件存放（`shares/<id>/<share_id>.json`），轮换准备期
   新份额私钥分文件暂存于 `rotation-staging/<id>/<rid>/`，会话参与者
-  替换的新份额私钥分文件存放于
-  `shares/<id>/<replacement_id>-share.json`，任何文件至多
+  替换/接管的新份额私钥分文件存放于
+  `shares/<id>/<replacement_id>-share.json` 与
+  `shares/<id>/<takeover_id>-<stage>-share.json`，任何文件至多
   含一个份额私钥，从不存在两者拼接的完整私钥。写入一律临时文件 + 原子
   替换。
 - **日志**：访问日志只记录 `方法 路径 -> 状态码`，绝不读取或记录

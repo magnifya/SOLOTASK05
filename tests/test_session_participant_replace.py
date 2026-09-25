@@ -358,6 +358,11 @@ class ReplaceParticipantTest(unittest.TestCase):
                 "new_share_id": "r1-share",
             },
         )
+        # details 有序：session_id, old_share_id, new_share_id
+        self.assertEqual(
+            list(event["details"]),
+            ["session_id", "old_share_id", "new_share_id"],
+        )
         # 七字段、seq 连续
         self.assertEqual(
             set(event),

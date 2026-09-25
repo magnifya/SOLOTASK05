@@ -26,7 +26,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import threading
 from typing import Optional
 
@@ -55,6 +57,7 @@ TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
+TYPE_SESSION_TAKEOVER = "session_takeover"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -178,6 +181,31 @@ class AuditStore:
     def _read(self, wallet_id: str) -> Optional[dict]:
         return self._read_strict(wallet_id)
 
+    @staticmethod
+    def _atomic_write_ordered(path: str, data: dict) -> None:
+        """临时文件 + 原子替换（与 WalletStore._atomic_write 同崩溃安全
+        语义），但**保留插入键序**：审计事件 details 的键序是契约的一部
+        分（如 session_participant_replaced 的
+        session_id/old_share_id/new_share_id、session_takeover 的
+        takeover_id/stage/old_share_id/new_share_id），落盘与查询响应
+        都必须保持该顺序，不做 sort_keys 重排。"""
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=directory, prefix=".tmp-", suffix=".json"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
     def append_event(self, wallet_id: str, event: dict) -> dict:
         """原子追加一条事件，分配下一个 seq 并持久化，返回含 seq/at 的记录。
 
@@ -196,11 +224,13 @@ class AuditStore:
             # 严格加载已保证 1..N 连续：下一个 seq 直接取 N+1，
             # 与 next_seq（兼容缺字段的旧文件）一致。
             next_seq = len(events) + 1
-            stamped = dict(event)
-            stamped["seq"] = next_seq
+            # 事件七字段按契约顺序 seq,type,at,request_id,actor_id,reason,
+            # details 落盘；details 内部键序由调用方构造时确定（如有序的
+            # session_id/old_share_id/new_share_id），原样保留。
+            stamped = {"seq": next_seq, **event}
             events.append(stamped)
             data["next_seq"] = next_seq + 1
-            WalletStore._atomic_write(path, data)
+            self._atomic_write_ordered(path, data)
             return stamped
 
     def find_event_by_request(
@@ -275,6 +305,30 @@ class AuditStore:
             if not isinstance(event, dict):
                 continue
             if event.get("type") != TYPE_SESSION_PARTICIPANT_REPLACED:
+                continue
+            request_id = event.get("request_id")
+            if isinstance(request_id, str):
+                result.setdefault(request_id, []).append(dict(event))
+        for events in result.values():
+            events.sort(key=lambda e: e.get("seq", 0))
+        return result
+
+    def session_takeover_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 session_takeover 事件，按 request_id（会话 id）
+        分组，组内按 seq 升序。
+
+        会话两阶段参与者接管的崩溃恢复与幂等重放据此判定哪些接管阶段已
+        经提交（事件在则该阶段不可撤回）。纯只读，不分配 seq。"""
+        data = self._read(wallet_id)
+        result: dict[str, list[dict]] = {}
+        if not data:
+            return result
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != TYPE_SESSION_TAKEOVER:
                 continue
             request_id = event.get("request_id")
             if isinstance(request_id, str):

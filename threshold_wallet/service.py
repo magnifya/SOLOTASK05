@@ -49,6 +49,17 @@ ROTATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 #: 会话参与者替换生成的新份额 id：<replacement_id>-share
 REPLACEMENT_SHARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}-share$")
 
+#: 会话两阶段接管生成的新份额 id：<takeover_id>-<stage>-share
+TAKEOVER_SHARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}-[12]-share$")
+
+
+def _is_session_generated_share_id(value: object) -> bool:
+    """会话参与者替换/接管生成的份额 id 形态（公钥从份额文件解析）。"""
+    return isinstance(value, str) and bool(
+        REPLACEMENT_SHARE_ID_RE.match(value)
+        or TAKEOVER_SHARE_ID_RE.match(value)
+    )
+
 
 class ServiceError(Exception):
     """业务错误，携带 HTTP 状态码与错误信息。"""
@@ -2266,11 +2277,12 @@ class WalletService:
                 f"wallet {wallet_id!r} has ambiguous rotation history"
             )
 
-        # 会话参与者替换份额（<replacement_id>-share）：公钥的权威来源是
-        # 其份额文件（shares/<wallet_id>/<share_id>.json），并做完整密码学
-        # 自洽校验；缺失/损坏/矛盾一律 fail-closed。
+        # 会话参与者替换/接管份额（<replacement_id>-share、
+        # <takeover_id>-<stage>-share）：公钥的权威来源是其份额文件
+        # （shares/<wallet_id>/<share_id>.json），并做完整密码学自洽校验；
+        # 缺失/损坏/矛盾一律 fail-closed。
         for sid in share_ids:
-            if sid not in public and REPLACEMENT_SHARE_ID_RE.match(sid):
+            if sid not in public and _is_session_generated_share_id(sid):
                 public[sid] = self._validated_replacement_share(
                     wallet_id, sid
                 )["public_key"]
@@ -2605,11 +2617,11 @@ class WalletService:
                 s["share_id"]: s["public_key"] for s in wallet["shares"]
             }
             session_ids = list(record["share_ids"])
-            # 会话参与者替换份额（<replacement_id>-share）不在钱包元数据
-            # 中：其公钥从份额文件解析（heal 已按替换事件对账，缺失/损坏/
-            # 矛盾在此 fail-closed 为 503）。
+            # 会话参与者替换/接管份额不在钱包元数据
+            # 中：其公钥从份额文件解析（heal 已按替换/接管事件对账，缺失/
+            # 损坏/矛盾在此 fail-closed 为 503）。
             for sid in session_ids:
-                if sid not in share_pub and REPLACEMENT_SHARE_ID_RE.match(
+                if sid not in share_pub and _is_session_generated_share_id(
                     sid
                 ):
                     share_pub[sid] = self._validated_replacement_share(
@@ -2736,10 +2748,13 @@ class WalletService:
         session_id: object,
         replacement_id: object,
         offline_share_id: object,
+        body_keys: object = None,
     ) -> tuple[int, dict]:
         """替换签名会话的单个参与方份额，返回 (状态码, 会话视图)。
 
         - 钱包/会话未知 404；replacement_id/offline_share_id 非法 400；
+          请求体（body_keys 给出时）须恰含 replacement_id 与
+          offline_share_id 两键，否则 400；
         - 会话非 collecting/ready（含到期懒过期）、目标不是该会话当前在
           用份额 409；
         - 生成 <replacement_id>-share 新 Ed25519 份额替换原槽位：移除旧
@@ -2757,6 +2772,15 @@ class WalletService:
                 wallet = self._store.get_wallet(wallet_id)
                 if wallet is None:
                     raise ServiceError(404, f"wallet {wallet_id!r} not found")
+                if body_keys is not None and set(body_keys) != {
+                    "replacement_id",
+                    "offline_share_id",
+                }:
+                    raise ServiceError(
+                        400,
+                        "request body must contain exactly replacement_id "
+                        "and offline_share_id",
+                    )
                 self._validate_session_id(session_id)
                 if not isinstance(
                     replacement_id, str
@@ -2897,6 +2921,258 @@ class WalletService:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
 
+    # -- 会话两阶段参与者接管 ----------------------------------------------
+
+    def _find_takeover_event(
+        self, wallet_id: str, session_id: str, new_share_id: str
+    ) -> dict | None:
+        """查找某会话已提交的、生成指定新份额的接管事件（纯只读）。"""
+        events = self._audit.session_takeover_events(wallet_id)
+        for event in events.get(session_id, []):
+            details = event.get("details")
+            if (
+                isinstance(details, dict)
+                and details.get("new_share_id") == new_share_id
+            ):
+                return event
+        return None
+
+    def takeover_sign_session_participant(
+        self,
+        wallet_id: str,
+        session_id: object,
+        takeover_id: object,
+        stage: object,
+        offline_share_id: object,
+        body_keys: object = None,
+    ) -> tuple[int, dict]:
+        """两阶段接管签名会话的参与方份额，返回 (状态码, 会话视图)。
+
+        - 钱包/会话未知 404；请求体（body_keys 给出时）须恰含
+          takeover_id/stage/offline_share_id 三键，否则 400；两个 ID 须
+          匹配安全标识、stage 须为非布尔整数 1 或 2，非法 400；
+        - 阶段从 1 连续提交（未提交 stage 1 就提交 stage 2 为跳号 409），
+          且两阶段替换不同槽位；每阶段把 offline_share_id 的槽位换成
+          <takeover_id>-<stage>-share 新 Ed25519 份额：移除该槽位已投递
+          签名、保留另一份，返回既有会话视图；
+        - 首次提交 201；同阶段同参重放 200 当前视图；异参、跳号、终态/
+          到期（含懒过期）、目标非当前份额或 ID 占用均 409，已提交重放
+          优先于状态判定；
+        - session_takeover 事件（request_id 为会话 id，actor_id/reason
+          为 null，details 恰含有序 takeover_id/stage/old_share_id/
+          new_share_id）为唯一提交点：事件未落盘则回滚并删除新份额文
+          件，落盘则前滚迁移会话记录。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：锁内先判定钱包存在性
+                wallet = self._store.get_wallet(wallet_id)
+                if wallet is None:
+                    raise ServiceError(404, f"wallet {wallet_id!r} not found")
+                if body_keys is not None and set(body_keys) != {
+                    "takeover_id",
+                    "stage",
+                    "offline_share_id",
+                }:
+                    raise ServiceError(
+                        400,
+                        "request body must contain exactly takeover_id, "
+                        "stage and offline_share_id",
+                    )
+                self._validate_session_id(session_id)
+                if not isinstance(
+                    takeover_id, str
+                ) or not ROTATION_ID_RE.match(takeover_id):
+                    raise ServiceError(
+                        400, "takeover_id must match [A-Za-z0-9_-]{1,128}"
+                    )
+                # bool 是 int 的子类，必须先排除
+                if (
+                    not isinstance(stage, int)
+                    or isinstance(stage, bool)
+                    or stage not in (1, 2)
+                ):
+                    raise ServiceError(400, "stage must be 1 or 2")
+                if not isinstance(
+                    offline_share_id, str
+                ) or not ROTATION_ID_RE.match(offline_share_id):
+                    raise ServiceError(
+                        400, "offline_share_id must match [A-Za-z0-9_-]{1,128}"
+                    )
+                record = self._store.get_sign_session(wallet_id, session_id)
+                if record is None:
+                    raise ServiceError(
+                        404, f"sign session {session_id!r} not found"
+                    )
+                new_share_id = f"{takeover_id}-{stage}-share"
+                # 已提交重放优先：session_takeover 事件是唯一提交点。
+                # 同阶段同参 200、异参 409；takeover_id 被其他会话占用 409。
+                committed = self._audit.session_takeover_events(wallet_id)
+                own_takeover: list[dict] = []
+                for sid, events in committed.items():
+                    for event in events:
+                        details = event.get("details")
+                        if (
+                            not isinstance(details, dict)
+                            or details.get("takeover_id") != takeover_id
+                        ):
+                            continue
+                        if sid != session_id:
+                            raise ServiceError(
+                                409,
+                                f"takeover {takeover_id!r} is already "
+                                "in use",
+                            )
+                        own_takeover.append(event)
+                for event in own_takeover:
+                    if event["details"].get("stage") != stage:
+                        continue
+                    if event["details"].get(
+                        "old_share_id"
+                    ) != offline_share_id:
+                        raise ServiceError(
+                            409,
+                            f"takeover {takeover_id!r} stage {stage} was "
+                            "committed with different parameters",
+                        )
+                    # 同阶段同参重放：原样返回磁盘视图，不触发懒过期、不记事件
+                    return 200, self._session_view(record)
+                # 懒过期：collecting/ready 到点原子转 expired（仅一次事件）
+                record = self._session_expire_if_needed(wallet_id, record)
+                if record["state"] == "expired":
+                    raise ServiceError(
+                        409, f"sign session {session_id!r} has expired"
+                    )
+                if record["state"] not in ("collecting", "ready"):
+                    raise ServiceError(
+                        409,
+                        f"sign session {session_id!r} is not collecting "
+                        "or ready",
+                    )
+                current_ids = list(record["share_ids"])
+                stage1_event = next(
+                    (
+                        event
+                        for event in own_takeover
+                        if event["details"].get("stage") == 1
+                    ),
+                    None,
+                )
+                if stage == 2:
+                    if stage1_event is None:
+                        # 跳号：stage 1 尚未提交
+                        raise ServiceError(
+                            409,
+                            f"takeover {takeover_id!r} stage 1 has not "
+                            "been committed",
+                        )
+                    stage1_new = stage1_event["details"].get("new_share_id")
+                    if stage1_new not in current_ids:
+                        # 两阶段须替换不同槽位：stage 1 换入的槽位已被后续
+                        # 替换/接管改动，无法在不碰该槽位的前提下完成接管
+                        raise ServiceError(
+                            409,
+                            f"takeover {takeover_id!r} stage 1 slot is no "
+                            "longer current",
+                        )
+                    if offline_share_id == stage1_new:
+                        raise ServiceError(
+                            409,
+                            f"takeover {takeover_id!r} stages must replace "
+                            "different slots",
+                        )
+                if offline_share_id not in current_ids:
+                    raise ServiceError(
+                        409,
+                        f"share {offline_share_id!r} is not an in-use share "
+                        f"of sign session {session_id!r}",
+                    )
+                # ID 占用：新份额 id 与已提交替换事件的新份额冲突，或份额
+                # 文件残留（无提交事件的残留应由持锁自愈清理；仍存在即
+                # 占用/矛盾，绝不覆盖来路不明的私钥）。
+                for events in self._audit.session_participant_replaced_events(
+                    wallet_id
+                ).values():
+                    for event in events:
+                        details = event.get("details")
+                        if (
+                            isinstance(details, dict)
+                            and details.get("new_share_id") == new_share_id
+                        ):
+                            raise ServiceError(
+                                409,
+                                f"takeover {takeover_id!r} is already "
+                                "in use",
+                            )
+                if (
+                    self._store.get_share(wallet_id, new_share_id)
+                    is not None
+                ):
+                    raise ServiceError(
+                        409,
+                        f"takeover {takeover_id!r} is already in use",
+                    )
+                # 生成新份额：仅该份额自己的私钥落盘（shares/<W>/<新id>.json，
+                # 恰含 private_key/public_key/share_id，64 位小写 hex），
+                # 系统中不存在完整私钥。
+                key = crypto.generate_share_key(new_share_id)
+                self._store.save_share(
+                    wallet_id,
+                    {
+                        "share_id": new_share_id,
+                        "public_key": key.public_bytes.hex(),
+                        "private_key": key.private_bytes.hex(),
+                    },
+                )
+                # 提交点：session_takeover 事件。事件未落盘则回滚并删除新
+                # 份额文件；落盘（含异常但已落盘）则前滚迁移。
+                try:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_SESSION_TAKEOVER,
+                            request_id=session_id,
+                            details={
+                                "takeover_id": takeover_id,
+                                "stage": stage,
+                                "old_share_id": offline_share_id,
+                                "new_share_id": new_share_id,
+                            },
+                        ),
+                    )
+                except BaseException:
+                    landed = self._find_takeover_event(
+                        wallet_id, session_id, new_share_id
+                    )
+                    if landed is None:
+                        self._store.delete_share(wallet_id, new_share_id)
+                        raise
+                # 事件已落盘：前滚迁移会话记录——新份额替换原槽位、移除旧
+                # 份额已投递签名、保留另一份；份数不足两份回到 collecting。
+                migrated = dict(record)
+                migrated["share_ids"] = [
+                    new_share_id if sid == offline_share_id else sid
+                    for sid in current_ids
+                ]
+                migrated["shares"] = [
+                    entry
+                    for entry in record["shares"]
+                    if entry["share_id"] != offline_share_id
+                ]
+                migrated["state"] = (
+                    "ready" if len(migrated["shares"]) == 2 else "collecting"
+                )
+                self._store.update_sign_session(
+                    wallet_id, session_id, migrated
+                )
+                return 201, self._session_view(migrated)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
     # -- 签名会话严格加载与崩溃恢复 ----------------------------------------
 
     def _rotation_timeline(self, wallet_id: str) -> list[tuple[int, tuple[str, str]]]:
@@ -3007,6 +3283,111 @@ class WalletService:
                 seen_new.add(new)
         return grouped
 
+    def _validated_takeover_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """读取并严格校验该钱包全部 session_takeover 事件。
+
+        每条事件必须：request_id 为会话 id、actor_id/reason 为 null、
+        details 恰含 {takeover_id, stage, old_share_id, new_share_id}
+        四键、takeover_id 为合法标识、stage 为非布尔整数 1/2、old 为合法
+        份额标识、new 恰为 <takeover_id>-<stage>-share 且全钱包唯一。
+        同一 (会话, takeover_id) 的阶段必须自 1 连续（[1] 或 [1,2]，不
+        重复、不跳号），且两阶段替换不同槽位（stage2.old != stage1.new）。
+        任一不符抛 RecoveryError（fail-closed），绝不静默跳过或任取一条。"""
+        grouped = self._audit.session_takeover_events(wallet_id)
+        seen_new: set[str] = set()
+        for session_id, events in grouped.items():
+            by_takeover: dict[str, list[dict]] = {}
+            for event in events:
+                if (
+                    event.get("actor_id") is not None
+                    or event.get("reason") is not None
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has a takeover event with actor/reason set"
+                    )
+                details = event.get("details")
+                if not isinstance(details, dict) or set(details) != {
+                    "takeover_id",
+                    "stage",
+                    "old_share_id",
+                    "new_share_id",
+                }:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "has a malformed takeover event"
+                    )
+                takeover_id = details["takeover_id"]
+                stage = details["stage"]
+                old = details["old_share_id"]
+                new = details["new_share_id"]
+                if not isinstance(
+                    takeover_id, str
+                ) or not ROTATION_ID_RE.match(takeover_id):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "takeover event has a malformed takeover_id"
+                    )
+                if (
+                    not isinstance(stage, int)
+                    or isinstance(stage, bool)
+                    or stage not in (1, 2)
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "takeover event has a malformed stage"
+                    )
+                if not isinstance(old, str) or not _SAFE_SHARE_ID.match(old):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "takeover event has a malformed old_share_id"
+                    )
+                if (
+                    not isinstance(new, str)
+                    or not TAKEOVER_SHARE_ID_RE.match(new)
+                    or new != f"{takeover_id}-{stage}-share"
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "takeover event has a malformed new_share_id"
+                    )
+                if old == new:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "takeover event replaces a share with itself"
+                    )
+                if new in seen_new:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} takeover share {new!r} is "
+                        "committed by more than one event"
+                    )
+                seen_new.add(new)
+                by_takeover.setdefault(takeover_id, []).append(event)
+            for takeover_id, takeover_events in by_takeover.items():
+                # 组内已按 seq 升序：阶段必须自 1 连续、不重复、不跳号
+                stages = [
+                    event["details"]["stage"] for event in takeover_events
+                ]
+                if stages not in ([1], [1, 2]):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        f"takeover {takeover_id!r} has non-consecutive or "
+                        "duplicated stages"
+                    )
+                if (
+                    len(takeover_events) == 2
+                    and takeover_events[1]["details"]["old_share_id"]
+                    == takeover_events[0]["details"]["new_share_id"]
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        f"takeover {takeover_id!r} stages replace the "
+                        "same slot"
+                    )
+        return grouped
+
     def _recover_sign_sessions(self, wallet_id: str) -> None:
         """启动/持锁恢复签名会话崩溃现场（调用方须持钱包事务锁）。
 
@@ -3042,6 +3423,24 @@ class WalletService:
             return
         events_by_session = self._audit.session_events(wallet_id)
         replacement_events = self._validated_replacement_events(wallet_id)
+        takeover_events = self._validated_takeover_events(wallet_id)
+        # 替换与接管的新份额共用 shares/<W>/ 命名空间：跨类型同一名称被两
+        # 条提交事件引用是矛盾现场，fail-closed。
+        replacement_new_ids = {
+            event["details"]["new_share_id"]
+            for events in replacement_events.values()
+            for event in events
+        }
+        takeover_new_ids = {
+            event["details"]["new_share_id"]
+            for events in takeover_events.values()
+            for event in events
+        }
+        if replacement_new_ids & takeover_new_ids:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a share committed by both a "
+                "participant replacement and a takeover event"
+            )
         timeline = self._rotation_timeline(wallet_id)
         wallet = self._store.get_wallet(wallet_id)
         if records and not isinstance(wallet, dict):
@@ -3074,15 +3473,26 @@ class WalletService:
                     "created event but no session record"
                 )
 
-        # 已提交替换事件引用的会话必须存在；其新份额文件必须密码学自洽
-        # （缺失/损坏/矛盾 fail-closed，保留现场）。无事件引用的 *-share
-        # 份额文件是替换提交点（事件）落盘前的崩溃残留：回滚删除。
+        # 已提交替换/接管事件引用的会话必须存在；其新份额文件必须密码学
+        # 自洽（缺失/损坏/矛盾 fail-closed，保留现场）。无事件引用的
+        # *-share 份额文件是替换/接管提交点（事件）落盘前的崩溃残留：
+        # 回滚删除。
         committed_new_share_ids: set[str] = set()
         for session_id, events in replacement_events.items():
             if session_id not in recorded_ids:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} sign session {session_id!r} has a "
                     "participant replacement event but no session record"
+                )
+            for event in events:
+                new_id = event["details"]["new_share_id"]
+                committed_new_share_ids.add(new_id)
+                self._validated_replacement_share(wallet_id, new_id)
+        for session_id, events in takeover_events.items():
+            if session_id not in recorded_ids:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} has a "
+                    "takeover event but no session record"
                 )
             for event in events:
                 new_id = event["details"]["new_share_id"]
@@ -3096,6 +3506,12 @@ class WalletService:
                 self._store.delete_share(wallet_id, share_id)
 
         for record in records:
+            # 替换与接管事件统一构成该会话的换槽序列（按 seq 全序）
+            cuts = sorted(
+                replacement_events.get(record["id"], [])
+                + takeover_events.get(record["id"], []),
+                key=lambda event: event.get("seq", 0),
+            )
             self._recover_one_sign_session(
                 wallet_id,
                 record,
@@ -3103,7 +3519,7 @@ class WalletService:
                 timeline,
                 current_ids,
                 wallet,
-                replacement_events.get(record["id"], []),
+                cuts,
             )
 
     def _recover_one_sign_session(
@@ -3164,9 +3580,9 @@ class WalletService:
                 "event does not match the record"
             )
 
-        # 已提交参与者替换事件：必须发生在创建之后、终态之前；每个替换的
-        # old 必须是该事件时刻会话快照内的在用份额、new 不得已在快照中。
-        # 首个替换之后会话快照与钱包轮换解耦（轮换不再迁移该会话）。
+        # 已提交参与者替换/接管事件：必须发生在创建之后、终态之前；每个
+        # 换槽的 old 必须是该事件时刻会话快照内的在用份额、new 不得已在
+        # 快照中。首个换槽之后会话快照与钱包轮换解耦（轮换不再迁移该会话）。
         replacement_cuts: list[tuple[int, str, str]] = []
         if replacements:
             created_seq = session_events[0].get("seq")
