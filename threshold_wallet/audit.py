@@ -78,57 +78,36 @@ EVENT_TYPES = {
 
 #: details 键序须按 README 既定顺序在落盘/查询/灾备保序的事件类型。
 #: 其余事件类型的 details 仍按 sort_keys 规范序落盘（行为不变）。
-_DETAILS_KEY_ORDER = {
+#:
+#: 同一类型允许多种 details 形状（按精确键集匹配）：``chain_vote`` 既承载
+#: 多源仲裁策略（``{sources, quorum}``）又承载观察票
+#: （``{source, report, state}``），恢复按精确键集把两者严格区分。
+#: 合法旧 ``chain_arbitration`` 事件仅只读兼容，仍按策略形保序。
+_DETAILS_KEY_ORDERS = {
     TYPE_SESSION_PARTICIPANT_REPLACED: (
-        "session_id",
-        "old_share_id",
-        "new_share_id",
+        ("session_id", "old_share_id", "new_share_id"),
     ),
     TYPE_SESSION_TAKEOVER: (
-        "takeover_id",
-        "stage",
-        "old_share_id",
-        "new_share_id",
+        ("takeover_id", "stage", "old_share_id", "new_share_id"),
     ),
     TYPE_DKG_STAGE: (
-        "id",
-        "op",
-        "node",
-        "key",
-        "hash",
-        "peer",
-        "state",
+        ("id", "op", "node", "key", "hash", "peer", "state"),
     ),
     TYPE_DKG_FAILOVER: (
-        "id",
-        "round",
-        "action",
-        "node",
-        "replacement",
-        "key",
-        "state",
+        ("id", "round", "action", "node", "replacement", "key", "state"),
     ),
     TYPE_CHAIN_POLICY: (
-        "chain_id",
-        "enabled",
-        "required_confirmations",
-        "reorg_window",
+        ("chain_id", "enabled", "required_confirmations", "reorg_window"),
     ),
     TYPE_CHAIN_REPORT: (
-        "chain_id",
-        "tx_id",
-        "block_height",
-        "block_hash",
-        "confirmations",
+        ("chain_id", "tx_id", "block_height", "block_hash", "confirmations"),
     ),
     TYPE_CHAIN_ARBITRATION: (
-        "sources",
-        "quorum",
+        ("sources", "quorum"),
     ),
     TYPE_CHAIN_VOTE: (
-        "source",
-        "report",
-        "state",
+        ("sources", "quorum"),
+        ("source", "report", "state"),
     ),
 }
 
@@ -136,16 +115,19 @@ _DETAILS_KEY_ORDER = {
 def _order_event_details(event: dict) -> None:
     """把既定事件类型的 details 就地重排为 README 既定键序。
 
-    仅当 details 键集与既定键序恰好一致时重排；键集不符的现场留给各
-    语义对账路径 fail-closed，绝不在这里猜写。
+    仅当 details 键集与某一既定形状恰好一致时重排；一个类型有多种形状时
+    按精确键集匹配（chain_vote 的策略形 {sources,quorum} 与观察票形
+    {source,report,state} 据此区分）。键集不符任何形状的现场留给各语义
+    对账路径 fail-closed，绝不在这里猜写。
     """
-    order = _DETAILS_KEY_ORDER.get(event.get("type"))
+    orders = _DETAILS_KEY_ORDERS.get(event.get("type"))
     details = event.get("details")
-    if order is None or not isinstance(details, dict):
+    if orders is None or not isinstance(details, dict):
         return
-    if set(details) != set(order):
-        return
-    event["details"] = {key: details[key] for key in order}
+    for order in orders:
+        if set(details) == set(order):
+            event["details"] = {key: details[key] for key in order}
+            return
 
 
 def _canonicalize_sorted(value: object) -> object:
@@ -166,7 +148,7 @@ def _canonical_event(event: object) -> object:
         value = event[key]
         if (
             key == "details"
-            and event.get("type") in _DETAILS_KEY_ORDER
+            and event.get("type") in _DETAILS_KEY_ORDERS
             and isinstance(value, dict)
         ):
             # 保留构造/读取时已归一为 README 既定顺序的 details 键序

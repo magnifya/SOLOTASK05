@@ -56,6 +56,24 @@ def _report(chain_id="bitcoin", tx_id=TX, height=100, block_hash=HASH1,
     }
 
 
+def _is_policy_event(event: dict) -> bool:
+    # 新策略事件：chain_vote 且 details 精确键集 {sources, quorum}
+    return (
+        event.get("type") == "chain_vote"
+        and isinstance(event.get("details"), dict)
+        and set(event["details"]) == {"sources", "quorum"}
+    )
+
+
+def _is_vote_event(event: dict) -> bool:
+    # 观察票事件：chain_vote 且 details 精确键集 {source, report, state}
+    return (
+        event.get("type") == "chain_vote"
+        and isinstance(event.get("details"), dict)
+        and set(event["details"]) == {"source", "report", "state"}
+    )
+
+
 class _HttpBase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -109,6 +127,15 @@ class _HttpBase(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         return body["events"]
+
+    def _policy_events(self, wallet="w1"):
+        return [e for e in self._events(wallet) if _is_policy_event(e)]
+
+    def _vote_events(self, wallet="w1", operation=None):
+        events = [e for e in self._events(wallet) if _is_vote_event(e)]
+        if operation is not None:
+            events = [e for e in events if e["request_id"] == operation]
+        return events
 
 
 class ArbitrationPolicyHttpTest(_HttpBase):
@@ -190,22 +217,41 @@ class ArbitrationPolicyHttpTest(_HttpBase):
         self.assertEqual(
             list(body["sources"].keys()), ["a", "m", "z"]
         )
-        events = [e for e in self._events() if e["type"] == "chain_arbitration"]
+        events = self._policy_events()
         self.assertEqual(
             list(events[0]["details"]["sources"].keys()), ["a", "m", "z"]
+        )
+
+    def test_new_policy_event_is_seven_field_chain_vote(self):
+        self._put_arb(ARBITRATION)
+        events = self._policy_events()
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["type"], "chain_vote")
+        self.assertEqual(set(event), {
+            "seq", "type", "at", "request_id", "actor_id", "reason",
+            "details",
+        })
+        self.assertEqual(event["request_id"], "btc")
+        self.assertIsNone(event["actor_id"])
+        self.assertIsNone(event["reason"])
+        self.assertEqual(list(event["details"]), ["sources", "quorum"])
+        self.assertEqual(event["details"], ARBITRATION)
+        # 系统不再新写 chain_arbitration 类型
+        self.assertFalse(
+            any(e["type"] == "chain_arbitration" for e in self._events())
         )
 
     def test_same_value_put_records_event_each_time(self):
         self._put_arb(ARBITRATION)
         self._put_arb(ARBITRATION)
-        events = [
-            e for e in self._events() if e["type"] == "chain_arbitration"
-        ]
+        events = self._policy_events()
         self.assertEqual(len(events), 2)
         for event in events:
             self.assertEqual(event["request_id"], "btc")
             self.assertIsNone(event["actor_id"])
             self.assertIsNone(event["reason"])
+            self.assertEqual(list(event["details"]), ["sources", "quorum"])
             self.assertEqual(event["details"], ARBITRATION)
 
     def test_put_while_unresolved_arbitration_returns_409(self):
@@ -219,6 +265,53 @@ class ArbitrationPolicyHttpTest(_HttpBase):
         )
         self.assertEqual(status, 409)
         # 另一资产不受影响
+        status, _ = self._put_arb(
+            {"sources": {"s1": True, "s2": True}, "quorum": 2}, asset="eth"
+        )
+        self.assertEqual(status, 200)
+
+    def test_put_with_pending_op_but_no_votes_returns_409(self):
+        # 该资产存在任一 pending 操作即 409，即使尚无任何观察票
+        self._create_op()
+        status, _ = self._put_arb(ARBITRATION)
+        self.assertEqual(status, 409)
+        # 不新增策略/审计事件、seq 不变，GET 仍 404（未配置）
+        self.assertEqual(self._policy_events(), [])
+        status, _ = self._get_arb()
+        self.assertEqual(status, 404)
+
+    def test_pending_409_does_not_change_policy_audit_or_seq(self):
+        # 先合法配置一份策略
+        self._chain_policy()
+        self.assertEqual(self._put_arb(ARBITRATION)[0], 200)
+        before = self._events()
+        # 再出现 pending 操作，尝试覆盖策略 -> 409
+        self._create_op()
+        new_policy = {"sources": {"s1": True, "s2": True}, "quorum": 2}
+        status, _ = self._put_arb(new_policy)
+        self.assertEqual(status, 409)
+        # 策略、审计事件、seq 全部不变
+        after = self._events()
+        self.assertEqual(after, before)
+        status, body = self._get_arb()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, ARBITRATION)
+
+    def test_put_after_all_ops_committed_returns_200(self):
+        # 提交后该资产无 pending 操作：改策略允许（200，各记事件）
+        self._chain_policy()
+        self._put_arb(ARBITRATION)
+        self._create_op()
+        self.assertEqual(self._observe("s1", _report())[0], 201)
+        self.assertEqual(self._observe("s2", _report())[0], 201)
+        new_policy = {"sources": {"s1": True, "s2": True}, "quorum": 2}
+        status, body = self._put_arb(new_policy)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, new_policy)
+
+    def test_pending_op_on_other_asset_does_not_block(self):
+        # btc 有 pending 操作不阻止为 eth 配置策略
+        self._create_op(operation_id="op1", asset_id="btc", delta=10)
         status, _ = self._put_arb(
             {"sources": {"s1": True, "s2": True}, "quorum": 2}, asset="eth"
         )
@@ -290,10 +383,13 @@ class ObserveValidationTest(_HttpBase):
         self.assertEqual(status, 409)
 
     def test_observe_without_chain_policy_returns_409(self):
-        self._create_op("op2", "eth", 10)
-        self._put_arb(
+        # 先在无 pending 操作时配置 eth 仲裁策略（PUT 仲裁本身不要求跨链
+        # 策略已存在），再建 pending 操作；观察时因缺启用的跨链策略 409。
+        status, _ = self._put_arb(
             {"sources": {"s1": True, "s2": True}, "quorum": 2}, asset="eth"
         )
+        self.assertEqual(status, 200)
+        self._create_op("op2", "eth", 10)
         status, _ = self._observe("s1", _report(chain_id="bitcoin"),
                                   operation="op2")
         self.assertEqual(status, 409)
@@ -316,13 +412,14 @@ class ObserveStateMachineTest(_HttpBase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {"state": "collecting"})
         # 重放不记事件
-        votes = [e for e in self._events() if e["type"] == "chain_vote"]
+        votes = self._vote_events()
         self.assertEqual(len(votes), 1)
         self.assertEqual(votes[0]["request_id"], "op1")
         self.assertEqual(
             votes[0]["details"],
             {"source": "s1", "report": _report(), "state": "collecting"},
         )
+        self.assertEqual(list(votes[0]["details"]), ["source", "report", "state"])
         self.assertIsNone(votes[0]["actor_id"])
         self.assertIsNone(votes[0]["reason"])
 
@@ -340,19 +437,19 @@ class ObserveStateMachineTest(_HttpBase):
         self._observe("s1", _report())
         status, _ = self._observe("s1", _report(height=101, block_hash=HASH2))
         self.assertEqual(status, 409)
-        # 现场不改：仍只一张 s1 票
-        votes = [e for e in self._events() if e["type"] == "chain_vote"]
+        # 现场不改：仍只一张 s1 观察票
+        votes = self._vote_events()
         self.assertEqual(len(votes), 1)
 
     def test_conflict_then_third_agreeing_source_adopts(self):
         # 三源 quorum=2：s1 投 X、s2 投 Y -> conflict；s3 投 X 与 s1
-        # 凑齐 quorum -> adopted X。先在无未决票时配置三源策略。
-        self._create_op("op2", "eth", 10)
+        # 凑齐 quorum -> adopted X。先在无未决操作时配置 eth 链/三源策略。
         self._chain_policy({**CHAIN_POLICY, "chain_id": "ethereum"}, asset="eth")
         self._put_arb(
             {"sources": {"s1": True, "s2": True, "s3": True}, "quorum": 2},
             asset="eth",
         )
+        self._create_op("op2", "eth", 10)
         body_x = _report(chain_id="ethereum")
         body_y = _report(
             chain_id="ethereum", height=101, block_hash=HASH2
@@ -374,12 +471,12 @@ class ObserveStateMachineTest(_HttpBase):
         self.assertEqual((asset["balance"], asset["version"]), (10, 1))
 
     def test_quorum_of_three_requires_three_agreeing_votes(self):
-        self._create_op("op2", "eth", 10)
         self._chain_policy(
             {**CHAIN_POLICY, "chain_id": "ethereum"}, asset="eth"
         )
         policy = {"sources": {"s1": True, "s2": True, "s3": True}, "quorum": 3}
         self._put_arb(policy, asset="eth")
+        self._create_op("op2", "eth", 10)
         other = _report(chain_id="ethereum")
         self.assertEqual(
             self._observe("s1", other, operation="op2")[1],
@@ -451,11 +548,7 @@ class QuorumCommitTest(_HttpBase):
         self.assertEqual(self._observe("s1", _report(), operation="op2")[0], 201)
         status, _ = self._observe("s2", _report(), operation="op2")
         self.assertEqual(status, 409)
-        votes = [
-            e
-            for e in self._events()
-            if e["type"] == "chain_vote" and e["request_id"] == "op2"
-        ]
+        votes = self._vote_events(operation="op2")
         self.assertEqual([v["details"]["source"] for v in votes], ["s1"])
         # 先经仲裁提交充值 op1（+100），再重试 op2 s2 即可 adopted
         self._observe("s1", _report())
@@ -495,8 +588,7 @@ class ObserveConcurrencyTest(_HttpBase):
         results = self._run_concurrent(lambda: self._observe("s1", _report()))
         statuses = sorted(status for status, _ in results)
         self.assertEqual(statuses, [200] * 7 + [201])
-        votes = [e for e in self._events() if e["type"] == "chain_vote"]
-        self.assertEqual(len(votes), 1)
+        self.assertEqual(len(self._vote_events()), 1)
 
     def test_concurrent_deciding_votes_commit_exactly_once(self):
         self._observe("s1", _report())
@@ -686,6 +778,180 @@ class ArbitrationCorruptionTest(unittest.TestCase):
             )
         self._expect_503_and_not_ready()
 
+    def test_malformed_new_chain_vote_policy_event(self):
+        # 新策略事件（chain_vote + {sources,quorum}）quorum 越界即矛盾
+        log = self._read_log()
+        log["events"][1]["details"] = {
+            "sources": {"s1": True}, "quorum": 2
+        }
+        self._write_log(log)
+        self._expect_503_and_not_ready()
+
+    def test_chain_vote_with_mixed_key_set_is_contradiction(self):
+        # details 既非策略形也非观察票形（精确键集不匹配）即矛盾
+        log = self._read_log()
+        log["events"][1]["details"] = {"sources": {"s1": True}, "state": "x"}
+        self._write_log(log)
+        self._expect_503_and_not_ready()
+
+    def test_malformed_legacy_chain_arbitration_event(self):
+        # 合法旧 chain_arbitration 仍被严格重放：畸形即 fail-closed
+        log = self._read_log()
+        log["events"][1]["type"] = "chain_arbitration"
+        log["events"][1]["details"] = {"sources": {"s1": True}, "quorum": 9}
+        self._write_log(log)
+        self._expect_503_and_not_ready()
+
+    def test_wrong_vote_state_is_contradiction(self):
+        # 第一张票被篡改为 adopted（未达 quorum）：state 与重算不一致
+        audit = AuditStore(self.tmpdir)
+        audit.append_event(
+            "w1",
+            {
+                "type": "chain_vote",
+                "at": "2026-09-25T00:00:00Z",
+                "request_id": "op1",
+                "actor_id": None,
+                "reason": None,
+                "details": {
+                    "source": "s1",
+                    "report": _report(),
+                    "state": "adopted",
+                },
+            },
+        )
+        self._expect_503_and_not_ready()
+
+    def test_duplicate_source_vote_is_contradiction(self):
+        audit = AuditStore(self.tmpdir)
+        for _ in range(2):
+            audit.append_event(
+                "w1",
+                {
+                    "type": "chain_vote",
+                    "at": "2026-09-25T00:00:00Z",
+                    "request_id": "op1",
+                    "actor_id": None,
+                    "reason": None,
+                    "details": {
+                        "source": "s1",
+                        "report": _report(),
+                        "state": "collecting",
+                    },
+                },
+            )
+        self._expect_503_and_not_ready()
+
+    def test_audit_json_corrupt_is_503_and_not_ready(self):
+        with open(self._audit_path(), "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        # 常驻请求：JSON 503，错误体为 JSON
+        status, body = self.srv.request(
+            "GET", "/v1/wallets/w1/chain/btc/arbitration"
+        )
+        self.assertEqual(status, 503)
+        self.assertIn("error", body)
+        # 启动恢复：CorruptDataError 被统一转成 RecoveryError，拒绝就绪
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.tmpdir))
+
+    def test_audit_filesystem_failure_is_503(self):
+        # 审计路径被替换为目录使读取失败（OSError）：常驻请求 JSON 503
+        path = self._audit_path()
+        os.unlink(path)
+        os.mkdir(path)
+        self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
+        status, body = self.srv.request(
+            "GET", "/v1/wallets/w1/chain/btc/arbitration"
+        )
+        self.assertEqual(status, 503)
+        self.assertIn("error", body)
+
+
+class LegacyChainArbitrationReadOnlyTest(unittest.TestCase):
+    """合法旧 chain_arbitration 事件只读兼容：新链写入用 chain_vote。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _service(self):
+        return make_harness(self.tmpdir).service
+
+    def _legacy_policy_event(self, asset="btc"):
+        return {
+            "type": "chain_arbitration",
+            "at": "2026-09-25T00:00:00Z",
+            "request_id": asset,
+            "actor_id": None,
+            "reason": None,
+            "details": {
+                "sources": {"s1": True, "s2": True},
+                "quorum": 2,
+            },
+        }
+
+    def test_legacy_policy_is_read_back(self):
+        service = self._service()
+        service.create_wallet("w1", 2)
+        AuditStore(self.tmpdir).append_event("w1", self._legacy_policy_event())
+        service = self._service()
+        self.assertEqual(
+            service.get_chain_arbitration("w1", "btc"),
+            {"sources": {"s1": True, "s2": True}, "quorum": 2},
+        )
+
+    def test_new_chain_vote_policy_overrides_legacy_by_seq(self):
+        service = self._service()
+        service.create_wallet("w1", 2)
+        audit = AuditStore(self.tmpdir)
+        audit.append_event("w1", self._legacy_policy_event())
+        # 新链用 chain_vote 覆盖旧策略
+        service.put_chain_arbitration(
+            "w1", "btc", {"s1": True, "s2": True, "s3": True}, 3
+        )
+        service = self._service()
+        self.assertEqual(
+            service.get_chain_arbitration("w1", "btc"),
+            {"sources": {"s1": True, "s2": True, "s3": True}, "quorum": 3},
+        )
+        # 观察按新策略 quorum=3 判定：两票仍 collecting
+        service.put_chain_policy("w1", "btc", "bitcoin", True, 2, 1)
+        service.create_asset_operation("w1", "op1", "btc", 100)
+        status, body = service.observe(
+            "w1", "op1", {"source": "s1", "report": _report(confirmations=2)}
+        )
+        self.assertEqual((status, body), (201, {"state": "collecting"}))
+        status, body = service.observe(
+            "w1", "op1", {"source": "s2", "report": _report(confirmations=2)}
+        )
+        self.assertEqual((status, body), (201, {"state": "collecting"}))
+
+    def test_legacy_policy_supports_observation_votes_and_commit(self):
+        # 纯旧现场（无新 chain_vote 策略）：观察票仍可工作并达 quorum 提交
+        service = self._service()
+        service.create_wallet("w1", 2)
+        service.put_chain_policy("w1", "btc", "bitcoin", True, 2, 1)
+        AuditStore(self.tmpdir).append_event("w1", self._legacy_policy_event())
+        service = self._service()
+        service.create_asset_operation("w1", "op1", "btc", 100)
+        status, body = service.observe(
+            "w1", "op1", {"source": "s1", "report": _report(confirmations=2)}
+        )
+        self.assertEqual((status, body), (201, {"state": "collecting"}))
+        status, body = service.observe(
+            "w1", "op1", {"source": "s2", "report": _report(confirmations=2)}
+        )
+        self.assertEqual((status, body), (201, {"state": "adopted"}))
+        self.assertEqual(
+            service.get_asset("w1", "btc"),
+            {"asset_id": "btc", "balance": 100, "version": 1},
+        )
+        # 不会再新写 chain_arbitration（票与策略均为 chain_vote/旧事件保留）
+        types = [e["type"] for e in service.get_audit_events("w1")["events"]]
+        self.assertEqual(types.count("chain_arbitration"), 1)
+
+
 
 class ArbitrationCrashConvergenceTest(unittest.TestCase):
     """崩溃原子性：决定性票/报告/提交三事件同批落盘。"""
@@ -759,8 +1025,11 @@ class ArbitrationCrashConvergenceTest(unittest.TestCase):
         events = service.get_audit_events("w1")["events"]
         self.assertEqual(
             [e["type"] for e in events],
-            ["chain_policy", "chain_arbitration", "chain_vote"],
+            ["chain_policy", "chain_vote", "chain_vote"],
         )
+        # 第 2 条是策略事件（details {sources,quorum}），第 3 条是 s1 观察票
+        self.assertTrue(_is_policy_event(events[1]))
+        self.assertTrue(_is_vote_event(events[2]))
         # 重试：三事件紧邻一次提交
         status, body = service.observe(
             "w1", "op1", {"source": "s2", "report": _report(confirmations=2)}
@@ -772,13 +1041,19 @@ class ArbitrationCrashConvergenceTest(unittest.TestCase):
             [e["type"] for e in events],
             [
                 "chain_policy",
-                "chain_arbitration",
+                "chain_vote",
                 "chain_vote",
                 "chain_vote",
                 "chain_report",
                 "asset_operation_committed",
             ],
         )
+        # 决定性票（第 4 条）为 adopted 观察票；策略事件只有 1 条
+        self.assertTrue(_is_policy_event(events[1]))
+        self.assertTrue(_is_vote_event(events[2]))
+        self.assertTrue(_is_vote_event(events[3]))
+        self.assertEqual(events[3]["details"]["state"], "adopted")
+        self.assertEqual(len([e for e in events if _is_policy_event(e)]), 1)
 
     def test_triple_append_failure_rolls_back_without_events(self):
         service = self._setup()
@@ -797,8 +1072,11 @@ class ArbitrationCrashConvergenceTest(unittest.TestCase):
         events = service.get_audit_events("w1")["events"]
         self.assertEqual(
             [e["type"] for e in events],
-            ["chain_policy", "chain_arbitration", "chain_vote"],
+            ["chain_policy", "chain_vote", "chain_vote"],
         )
+        # 1 条策略事件 + 1 条 s1 观察票；决定性三事件整批未落盘
+        self.assertEqual(len([e for e in events if _is_policy_event(e)]), 1)
+        self.assertEqual(len([e for e in events if _is_vote_event(e)]), 1)
         # 重试成功
         status, _ = service.observe(
             "w1", "op1", {"source": "s2", "report": _report(confirmations=2)}
