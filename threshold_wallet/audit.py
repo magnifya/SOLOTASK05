@@ -56,6 +56,65 @@ TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
 TYPE_SESSION_TAKEOVER = "session_takeover"
+TYPE_DKG_STAGE = "dkg_stage"
+
+#: 单条审计事件对外/落盘的七字段顺序契约
+EVENT_KEY_ORDER = (
+    "seq",
+    "type",
+    "at",
+    "request_id",
+    "actor_id",
+    "reason",
+    "details",
+)
+
+#: 审计日志顶层三键的顺序契约
+LOG_KEY_ORDER = ("wallet_id", "next_seq", "events")
+
+#: 各事件类型 details 的既定键序契约（落盘/查询/灾备必须保序）。
+#: 未列入的事件类型 details 维持其写入顺序，不做重排。
+DETAILS_KEY_ORDER: dict[str, tuple[str, ...]] = {
+    TYPE_DKG_STAGE: ("id", "op", "node", "key", "hash", "peer", "state"),
+    TYPE_SESSION_PARTICIPANT_REPLACED: (
+        "session_id",
+        "old_share_id",
+        "new_share_id",
+    ),
+    TYPE_SESSION_TAKEOVER: (
+        "takeover_id",
+        "stage",
+        "old_share_id",
+        "new_share_id",
+    ),
+}
+
+
+def _ordered_details(event_type: str, details: dict) -> dict:
+    """按既定契约键序返回 details 副本；契约外的额外键（损坏/矛盾现场，
+    由语义恢复 fail-closed）保留在尾部，绝不静默丢弃。"""
+    order = DETAILS_KEY_ORDER.get(event_type)
+    if order is None:
+        return dict(details)
+    ordered = {key: details[key] for key in order if key in details}
+    for key, value in details.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
+def _normalized_event(event: dict) -> dict:
+    """返回七字段按 EVENT_KEY_ORDER、details 按类型契约保序的事件副本。"""
+    ordered = {key: event[key] for key in EVENT_KEY_ORDER if key in event}
+    for key, value in event.items():
+        if key not in ordered:
+            ordered[key] = value
+    details = ordered.get("details")
+    if isinstance(details, dict):
+        ordered["details"] = _ordered_details(
+            ordered.get("type"), details
+        )
+    return ordered
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -155,7 +214,19 @@ class AuditStore:
                 raise CorruptDataError(
                     f"audit log {path!r} next_seq disagrees with its events"
                 )
-        return data
+        # 纯内存规范化：顶层键与每条事件的七字段/details 按既定契约键序
+        # 排列，使一切查询（list_events/events_by_type/分组查找/灾备对账
+        # 的对外视图）都保序。不触发任何写盘：磁盘字节不变，灾备的字节
+        # 级静止现场校验不受影响；仅在追加新事件整文件重写时，历史事件
+        # 才随既定键序一并纠正。
+        normalized = {
+            key: data[key] for key in LOG_KEY_ORDER if key in data
+        }
+        for key, value in data.items():
+            if key not in normalized:
+                normalized[key] = value
+        normalized["events"] = [_normalized_event(event) for event in events]
+        return normalized
 
     def check_log(self, wallet_id: str) -> None:
         """只读严格校验审计文件；损坏抛 CorruptDataError/OSError。
@@ -199,10 +270,13 @@ class AuditStore:
             next_seq = len(events) + 1
             stamped = dict(event)
             stamped["seq"] = next_seq
+            # 七字段与 details 键序是对外契约：落盘前规范化，并整文件保序
+            # 序列化（不 sort_keys），使磁盘字节本身即按既定键序排列。
+            stamped = _normalized_event(stamped)
             events.append(stamped)
             data["next_seq"] = next_seq + 1
-            WalletStore._atomic_write(path, data)
-            return stamped
+            WalletStore._atomic_write_preserve_order(path, data)
+            return dict(stamped)
 
     def find_event_by_request(
         self,
@@ -304,6 +378,14 @@ class AuditStore:
         return self._events_grouped_by_request(
             wallet_id, TYPE_SESSION_TAKEOVER
         )
+
+    def dkg_stage_events(self, wallet_id: str) -> dict[str, list[dict]]:
+        """返回该钱包全部 dkg_stage 事件，按 request_id（DKG 流程 id）
+        分组，组内按 seq 升序。
+
+        可恢复两方 DKG 的崩溃恢复与幂等重放据此重建 register/commit/share
+        阶段（事件是唯一提交点）。纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(wallet_id, TYPE_DKG_STAGE)
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射

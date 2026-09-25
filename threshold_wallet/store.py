@@ -32,6 +32,10 @@
                                     原文、到期时间、已收份额签名（每份一个
                                     64 字节 Ed25519 签名，绝无私钥）与
                                     signed 时的 128 字节聚合签名
+    dkg/<wallet_id>.json            该钱包的可恢复两方 DKG 流程
+                                    （register/commit/share/done）：
+                                    只含节点公钥/承诺哈希/状态等标识与整数，
+                                    绝不含份额正文或任何私钥材料
 
 关键安全性质：
 - 元数据文件不含任何私钥材料；
@@ -218,6 +222,7 @@ class WalletStore:
             data_dir, "transaction-policies"
         )
         self._sign_sessions_dir = os.path.join(data_dir, "sign-sessions")
+        self._dkg_dir = os.path.join(data_dir, "dkg")
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -229,6 +234,7 @@ class WalletStore:
         os.makedirs(self._asset_intents_dir, exist_ok=True)
         os.makedirs(self._transaction_policies_dir, exist_ok=True)
         os.makedirs(self._sign_sessions_dir, exist_ok=True)
+        os.makedirs(self._dkg_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -262,12 +268,37 @@ class WalletStore:
 
     @staticmethod
     def _atomic_write(path: str, data: dict) -> None:
+        WalletStore._atomic_write_serialized(
+            path, data, sort_keys=True
+        )
+
+    @staticmethod
+    def _atomic_write_preserve_order(path: str, data: dict) -> None:
+        """与 _atomic_write 相同的临时文件 + 原子替换，但保留 dict 的
+        插入键序（``sort_keys=False``）。
+
+        审计日志用它落盘：事件字段顺序（seq/type/at/.../details）与
+        details 内部契约键序（如 dkg_stage 的 id,op,node,key,hash,peer,
+        state）是对外契约，落盘/查询/灾备都必须按既定顺序保序，不能被
+        JSON 序列化重排。"""
+        WalletStore._atomic_write_serialized(
+            path, data, sort_keys=False
+        )
+
+    @staticmethod
+    def _atomic_write_serialized(path: str, data: dict, *, sort_keys: bool) -> None:
         directory = os.path.dirname(path)
         os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dump(
+                    data,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=sort_keys,
+                )
                 f.write("\n")
             os.replace(tmp_path, path)
         except BaseException:
@@ -715,6 +746,214 @@ class WalletStore:
             if session_id not in all_records:
                 return
             del all_records[session_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    # ---- 可恢复两方 DKG ---------------------------------------------------
+
+    def _dkg_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(self._dkg_dir, wallet_id + ".json")
+
+    @staticmethod
+    def _is_lower_hex(length: int, value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == length
+            and all(c in "0123456789abcdef" for c in value)
+        )
+
+    @staticmethod
+    def _dkg_record_shape_ok(key: str, record: object) -> bool:
+        """DKG 流程记录的严格形状校验（损坏文件 fail-closed 用）。
+
+        要求：id 为安全标识且与键一致；state 仅
+        registering/committing/sharing/done；nodes 恰为两个不重复的安全
+        标识（注册序）；keys/hashes/peers 均为对象，键只能取自 nodes；
+        keys/hashes 的值为 64 位小写 hex，peers 的值为另一节点 id。
+
+        阶段不变量（服务只整文件原子覆盖，磁盘上只可能是相邻阶段之一）::
+
+            registering: 1~2 key（按注册序增长）, 0 hash, 0 peer, public=null
+            committing:  2 key, 0~2 hash（第二方注册后即进入，首提前为 0）,
+                         0 peer, public=null
+            sharing:     2 key, 2 hash, 0~1 peer（首提前为 0）, public=null
+            done:        2 key, 2 hash, 2 peer, public_key 为两 key 顺序
+                         拼接的 128 位小写 hex
+
+        registering 的 nodes/keys 长度可以为 1（首个 register 已提交、第二方
+        尚未注册的崩溃/等待现场）；其余阶段双方必已注册齐两份。
+
+        记录只含节点公钥/承诺哈希/状态/对端标识，绝不含份额正文或私钥。
+        """
+        if not isinstance(record, dict):
+            return False
+        if record.get("id") != key or not _valid_safe_id(key):
+            return False
+        state = record.get("state")
+        if state not in ("registering", "committing", "sharing", "done"):
+            return False
+        nodes = record.get("nodes")
+        if (
+            not isinstance(nodes, list)
+            or not 1 <= len(nodes) <= 2
+            or len(set(nodes)) != len(nodes)
+            or not all(_valid_safe_id(node) for node in nodes)
+        ):
+            return False
+        node_set = set(nodes)
+        keys = record.get("keys")
+        hashes = record.get("hashes")
+        peers = record.get("peers")
+        if not (
+            isinstance(keys, dict)
+            and isinstance(hashes, dict)
+            and isinstance(peers, dict)
+        ):
+            return False
+        if not set(keys) <= node_set or not set(hashes) <= node_set:
+            return False
+        if not all(WalletStore._is_lower_hex(64, v) for v in keys.values()):
+            return False
+        if not all(WalletStore._is_lower_hex(64, v) for v in hashes.values()):
+            return False
+        if not set(peers) <= node_set:
+            return False
+        for source, target in peers.items():
+            if not isinstance(target, str) or target not in node_set:
+                return False
+            if target == source:
+                return False
+        public_key = record.get("public_key")
+        if state == "registering":
+            if len(keys) != len(nodes) or not 1 <= len(keys) <= 2:
+                return False
+            if hashes or peers or public_key is not None:
+                return False
+        elif state == "committing":
+            if len(nodes) != 2 or len(keys) != 2:
+                return False
+            if not 0 <= len(hashes) <= 2 or peers or public_key is not None:
+                return False
+        elif state == "sharing":
+            if (
+                len(nodes) != 2
+                or len(keys) != 2
+                or len(hashes) != 2
+                or not 0 <= len(peers) <= 1
+                or public_key is not None
+            ):
+                return False
+        else:  # done
+            if (
+                len(nodes) != 2
+                or len(keys) != 2
+                or len(hashes) != 2
+                or len(peers) != 2
+                or not WalletStore._is_lower_hex(128, public_key)
+            ):
+                return False
+            if public_key != keys[nodes[0]] + keys[nodes[1]]:
+                return False
+        return True
+
+    def _read_dkg(self, wallet_id: str) -> dict:
+        """读取并严格校验该钱包全部 DKG 流程；文件不存在为空映射。
+
+        JSON 损坏、顶层不是对象、键非安全标识或任一记录形状非法时抛
+        CorruptDataError：绝不静默归一为空，保留现场由上层 fail-closed。"""
+        path = self._dkg_path(wallet_id)
+        data = self._read_json(path)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise CorruptDataError(
+                f"dkg file {path!r} top-level value is not an object"
+            )
+        for dkg_id, record in data.items():
+            if not _valid_safe_id(dkg_id) or not self._dkg_record_shape_ok(
+                dkg_id, record
+            ):
+                raise CorruptDataError(
+                    f"dkg file {path!r} has malformed process {dkg_id!r}"
+                )
+        return data
+
+    def check_dkg(self, wallet_id: str) -> None:
+        """只读校验 DKG 文件形状；损坏时抛 CorruptDataError/OSError。
+        文件不存在（尚无流程）视为正常空状态。"""
+        _check_id("wallet_id", wallet_id)
+        self._read_dkg(wallet_id)
+
+    def dkg_file_exists(self, wallet_id: str) -> bool:
+        """该钱包的 DKG 文件是否存在（存在即需与审计对账，哪怕为空）。"""
+        return os.path.exists(self._dkg_path(wallet_id))
+
+    def list_dkg_wallet_ids(self) -> list[str]:
+        """返回存在 DKG 文件的全部 wallet_id（启动恢复扫描用）。"""
+        try:
+            names = os.listdir(self._dkg_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
+
+    def create_dkg(
+        self, wallet_id: str, dkg_id: str, record: dict
+    ) -> Optional[dict]:
+        """原子地创建一条 DKG 流程（调用方须持钱包事务锁并已查重）。
+
+        同 id 已存在则不覆盖、直接返回已有记录；否则写入并返回 None。"""
+        _check_id("dkg_id", dkg_id)
+        path = self._dkg_path(wallet_id)
+        with self._lock:
+            all_records = self._read_dkg(wallet_id)
+            existing = all_records.get(dkg_id)
+            if existing is not None:
+                return existing
+            all_records[dkg_id] = record
+            self._atomic_write(path, all_records)
+            return None
+
+    def get_dkg(self, wallet_id: str, dkg_id: str) -> Optional[dict]:
+        """返回某条 DKG 流程记录（严格校验），不存在返回 None。"""
+        _check_id("dkg_id", dkg_id)
+        return self._read_dkg(wallet_id).get(dkg_id)
+
+    def list_dkg(self, wallet_id: str) -> list[dict]:
+        """返回某钱包全部 DKG 流程记录（严格校验，按 id 排序）。"""
+        records = self._read_dkg(wallet_id)
+        return [dict(records[key]) for key in sorted(records)]
+
+    def update_dkg(
+        self, wallet_id: str, dkg_id: str, record: dict
+    ) -> None:
+        """原子覆盖一条已存在的 DKG 流程（阶段推进用）。"""
+        _check_id("dkg_id", dkg_id)
+        path = self._dkg_path(wallet_id)
+        with self._lock:
+            all_records = self._read_dkg(wallet_id)
+            all_records[dkg_id] = record
+            self._atomic_write(path, all_records)
+
+    def delete_dkg(self, wallet_id: str, dkg_id: str) -> None:
+        """删除一条 DKG 流程（register 事件追加失败回滚用）。"""
+        _check_id("dkg_id", dkg_id)
+        path = self._dkg_path(wallet_id)
+        with self._lock:
+            all_records = self._read_dkg(wallet_id)
+            if dkg_id not in all_records:
+                return
+            del all_records[dkg_id]
             if all_records:
                 self._atomic_write(path, all_records)
             else:

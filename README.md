@@ -56,6 +56,8 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/replace` | 替换会话单个参与方份额 `{"replacement_id","offline_share_id"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
+| GET  | `/v1/dkg/{id}/{dkg_id}` | 查两方 DKG 流程 |
+| POST | `/v1/dkg/{id}/{dkg_id}` | 推进两方 DKG 阶段 `{"op","node","key","hash","peer"}` |
 
 ID（wallet/rotation/operation/asset/session 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -194,6 +196,47 @@ JSON 对象。
 - 接管后该会话快照与钱包轮换解耦（与单节点替换同一规则）；旧份额
   再投递 `400`，新份额沿用 Ed25519 校验与既有审批/hot-cold 门控。
 
+### 可恢复两方 DKG
+
+`GET/POST /v1/dkg/{wallet_id}/{dkg_id}`（wallet_id 与 dkg_id 均沿用
+`[A-Za-z0-9_-]{1,128}` 安全标识）。两个链下节点通过后端协调一次两方
+分布式密钥生成，**后端只中继公钥与承诺哈希，绝不接收份额正文**。
+
+- 请求/响应（`200`）/首提（`201`）体键序同为
+  `{id,state,nodes,committed,shared,public_key}`：`nodes` 按注册序，
+  `committed`/`shared` 为已提交承诺/已确认份额的节点（按注册序）；
+  `public_key` 仅完成（`done`）时为两节点 key 按注册序顺序拼接
+  （128 位小写 hex），否则为 `null`。
+- POST 体恰含 `{op,node,key,hash,peer}`（含其他键或缺键一律 `400`），
+  三个动作严格按序推进 `register → commit → share → done`：
+  - `register`：仅 `key` 非 null 且为 64 位小写 hex（节点公钥），
+    `hash`/`peer` 必须为 null；两个节点各注册一次（注册序确定公钥
+    拼接顺序），第二方注册后进入 `committing`；
+  - `commit`：仅 `hash` 非 null 且为 64 位小写 sha256（链下份额的
+    承诺），`key`/`peer` 必须为 null；双方各提交一次，齐后进入
+    `sharing`；
+  - `share`：仅 `hash`、`peer` 非 null（`key` 必须为 null）：节点
+    确认已收到 `peer` 的链下份额，`hash` 必须**恰等于 peer 已提交的
+    承诺哈希**（后端据此确认，不收份额正文）；双方各确认一次，齐后
+    进入 `done`，公钥为两份 key 按注册序拼接。
+- 未知流程只有 `register` 可首建（`201`）；对未知流程发 commit/share
+  （或钱包不存在）一律 `404`。已提交的同 `(op,node)` 同值重放 `200`
+  原样返回当前视图（**优先于阶段/状态判定**，不记事件）；载荷形状
+  非法 `400`；异值重放、错阶段动作、未注册/第三节点、`peer` 非另一
+  节点、peer 未承诺或 `hash` 与其承诺不符一律 `409`。
+- 状态只由七字段 `dkg_stage` 审计事件持久化，是唯一提交点；首提在每
+  钱包跨进程事务锁内"先写状态再追加事件"，事件未落盘回滚（首建则
+  删除流程），落盘后前滚。details 键序依次为
+  `id,op,node,key,hash,peer,state`，未用值一律为 `null`（`register`
+  的 hash/peer、`commit` 的 key/peer、`share` 的 key 均为 null）。
+  恢复/重放按 seq 严格重放事件重建现场：注册序、阶段顺序、每节点一
+  次、承诺一致性、details.state 与重放状态任一矛盾即 `503` 并拒绝
+  serve 就绪，保留现场不猜写；灾备（backup/restore）后视图与审计
+  seq 不变，恢复不新增事件。
+- 业务文件 `dkg/<wallet_id>.json` 只含标识、节点公钥、承诺哈希、
+  对端节点与状态，**绝不含份额正文或私钥**；响应、日志与非份额文件
+  同样不得含份额正文或私钥。
+
 ### 份额轮换
 
 - `POST share-rotations`：`rotation_id` 非法 `400`，钱包不存在 `404`。
@@ -239,12 +282,17 @@ JSON 对象。
 钱包不存在 `404`。纯只读，不触发懒过期、不分配 seq。
 
 每条事件七字段 `seq,type,at,request_id,actor_id,reason,details`，
-`at` 为 UTC（`...Z`），不适用字段为 `null`。seq 从 1 起、落盘后单调
+`at` 为 UTC（`...Z`），不适用字段为 `null`。七字段顺序与各类型
+details 的既定键序（如 `dkg_stage` 的
+`id,op,node,key,hash,peer,state`、`session_participant_replaced` 的
+`session_id,old_share_id,new_share_id`、`session_takeover` 的
+`takeover_id,stage,old_share_id,new_share_id`）在落盘、查询与灾备
+（backup/restore）中一律保序。seq 从 1 起、落盘后单调
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
-`session_participant_replaced`、`session_takeover`。
+`session_participant_replaced`、`session_takeover`、`dkg_stage`。
 
 ## 多进程与故障恢复（保证）
 
@@ -304,7 +352,7 @@ python -m threshold_wallet.cli restore --data-dir ./data2 \
   恢复），无法对账即失败——**不能对账不出包**。
 - 仅打包该钱包白名单内普通文件：`wallets/W.json`、`shares/W/*`、业务
   目录中的 W 单文件（`audit`/`signatures`/`policies`/`requests`/
-  `rotations`/`assets`/`transaction-policies`/`sign-sessions`）与
+  `rotations`/`assets`/`transaction-policies`/`sign-sessions`/`dkg`）与
   `rotation-staging/W/*`。拒绝绝对路径、`..` 穿越、重复成员、符号链接、
   白名单外额外文件、锁文件、原子写临时文件与激活备份（`*.bak.json`）。
 - 产物为确定性 tar，首项 `manifest.json`（**manifest v1**），含

@@ -23,6 +23,7 @@
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/replace  替换会话单个参与方份额
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/takeover 两阶段接管会话参与方份额
+- GET/POST /v1/dkg/<wallet_id>/<dkg_id>                        查询/推进可恢复两方 DKG 流程
 
 安全：访问日志只记录方法、路径与状态码，绝不读取或记录请求/响应体，
 因此份额私钥不可能进入日志。
@@ -116,6 +117,13 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             path = parsed.path
             query = parse_qs(parsed.query)
             try:
+                dkg_match = self._split_dkg_path(path)
+                if dkg_match is not None:
+                    wallet_id, dkg_id = dkg_match
+                    self._send_json(
+                        200, service.get_dkg(wallet_id, dkg_id)
+                    )
+                    return
                 matched = self._split_wallet_path(path)
                 if matched is None:
                     self._send_error(404, "not found")
@@ -168,6 +176,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
             try:
+                dkg_match = self._split_dkg_path(path)
+                if dkg_match is not None:
+                    wallet_id, dkg_id = dkg_match
+                    body = self._read_json_body()
+                    # 请求体恰含 op/node/key/hash/peer 五键
+                    if set(body) != {"op", "node", "key", "hash", "peer"}:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly op, node, key, hash "
+                            "and peer",
+                        )
+                    status, result = service.submit_dkg_stage(
+                        wallet_id,
+                        dkg_id,
+                        body.get("op"),
+                        body.get("node"),
+                        body.get("key"),
+                        body.get("hash"),
+                        body.get("peer"),
+                    )
+                    self._send_json(status, result)
+                    return
+
                 if path == "/v1/wallets":
                     body = self._read_json_body()
                     result = service.create_wallet(
@@ -382,6 +413,17 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 self._send_failure(exc)
 
         # ---- 路径匹配 ---------------------------------------------------
+
+        @staticmethod
+        def _split_dkg_path(path: str):
+            """/v1/dkg/<wallet_id>/<dkg_id> -> (wallet_id, dkg_id)，否则 None。"""
+            prefix = "/v1/dkg/"
+            if not path.startswith(prefix):
+                return None
+            parts = path[len(prefix):].split("/")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                return None
+            return parts[0], parts[1]
 
         @staticmethod
         def _split_wallet_path(path: str):

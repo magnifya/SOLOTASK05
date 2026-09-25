@@ -163,6 +163,7 @@ class WalletService:
             | set(self._store.list_asset_intent_wallet_ids())
             | set(self._store.list_asset_ledger_wallet_ids())
             | set(self._store.list_sign_session_wallet_ids())
+            | set(self._store.list_dkg_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
             | set(self._list_restore_txn_wallet_ids())
             | set(self._list_restore_records_wallet_ids())
@@ -255,6 +256,7 @@ class WalletService:
             # 对账：提交事件与 committed 操作必须一一对应、details 即 R。
             self._reconcile_asset_committed_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
+            self._recover_dkg(wallet_id, scan_audit_orphans=True)
         except RecoveryError:
             raise
         except (OSError, ValueError) as exc:
@@ -320,6 +322,8 @@ class WalletService:
             # 持有错误的钱包份额，必须先按激活事件前滚/回滚确定在用份额，
             # 再对账会话，避免把会话迁移到未提交轮换的份额上。
             self._store.check_sign_sessions(wallet_id)
+            # DKG 业务文件形状损坏同样 fail-closed，绝不把坏流程当空流程。
+            self._store.check_dkg(wallet_id)
             if self._store.list_asset_intents(wallet_id):
                 self._recover_wallet(wallet_id)
                 return
@@ -379,6 +383,7 @@ class WalletService:
             if self._store.asset_ledger_file_exists(wallet_id):
                 self._reconcile_asset_committed_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
+            self._recover_dkg(wallet_id)
         except RecoveryError:
             raise
         except (OSError, ValueError) as exc:
@@ -3998,3 +4003,603 @@ class WalletService:
             self._store.update_sign_session(
                 wallet_id, session_id, rebuilt
             )
+
+    # -- 可恢复两方 DKG -----------------------------------------------------
+
+    #: DKG 阶段动作（严格按序推进）
+    DKG_OPS = ("register", "commit", "share")
+
+    @staticmethod
+    def _dkg_view(record: dict) -> dict:
+        """DKG 对外视图（键序契约）：
+        {id,state,nodes,committed,shared,public_key}。
+
+        committed/shared 按注册序；public_key 仅 done 时为两 key 顺序拼接，
+        否则 null。视图只含节点公钥/承诺哈希/状态/标识，绝不含份额正文。"""
+        nodes = list(record["nodes"])
+        committed = [node for node in nodes if node in record["hashes"]]
+        shared = [node for node in nodes if node in record["peers"]]
+        return {
+            "id": record["id"],
+            "state": record["state"],
+            "nodes": nodes,
+            "committed": committed,
+            "shared": shared,
+            "public_key": record["public_key"],
+        }
+
+    @staticmethod
+    def _validate_dkg_id(value: object) -> None:
+        if not isinstance(value, str) or not ROTATION_ID_RE.match(value):
+            raise ServiceError(400, "id must match [A-Za-z0-9_-]{1,128}")
+
+    @staticmethod
+    def _validate_dkg_node(value: object) -> None:
+        if not isinstance(value, str) or not ROTATION_ID_RE.match(value):
+            raise ServiceError(400, "node must match [A-Za-z0-9_-]{1,128}")
+
+    @staticmethod
+    def _validate_dkg_hex64_or_null(value: object, name: str) -> None:
+        if value is not None and not _is_lower_hex_32(value):
+            raise ServiceError(
+                400, f"{name} must be null or a 64-character lowercase hex"
+            )
+
+    def get_dkg(self, wallet_id: str, dkg_id: str) -> dict:
+        """查询 DKG 流程视图；钱包不存在 404，流程不存在 404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                self._validate_dkg_id(dkg_id)
+                record = self._store.get_dkg(wallet_id, dkg_id)
+                if (
+                    record is None
+                    and self._store.dkg_file_exists(wallet_id)
+                    and self._audit.dkg_stage_events(wallet_id).get(dkg_id)
+                ):
+                    # 业务文件在而记录缺失但有提交事件：前滚恢复后重读
+                    # （矛盾则 503）；无业务文件的纯钱包直接 404，不读审计。
+                    self._recover_dkg(wallet_id)
+                    record = self._store.get_dkg(wallet_id, dkg_id)
+                if record is None:
+                    raise ServiceError(404, f"dkg process {dkg_id!r} not found")
+                return self._dkg_view(record)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    def submit_dkg_stage(
+        self,
+        wallet_id: str,
+        dkg_id: object,
+        op: object,
+        node: object,
+        key: object,
+        hash_value: object,
+        peer: object,
+    ) -> tuple[int, dict]:
+        """推进两方 DKG 流程的一个阶段，返回 (状态码, 视图)。
+
+        register：仅 key 非 null（64 位小写 hex），两节点按注册序各注册
+        一次；commit：仅 hash 非 null（64 位小写 sha256），双方各提交一次
+        链下份额承诺；share：hash、peer 非 null，确认 peer 的链下份额，
+        hash 必须恰为 peer 的承诺（后端不收份额正文）。register→commit→
+        share→done 严格按序；done 的公钥为两份 key 按注册序拼接。
+
+        未知流程仅 register 可首建（201），其余 404；同值重放 200（优先
+        于状态判定）；载荷非法 400；异值重放/错阶段/第三节点 409。每个
+        首提在跨进程事务锁内以 dkg_stage 事件为唯一提交点原子持久化，
+        重放不记事件。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：钱包存在性在锁内最先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_dkg_id(dkg_id)
+                # 载荷形状（400）先于流程存在性/阶段判定
+                if op not in self.DKG_OPS:
+                    raise ServiceError(
+                        400, "op must be one of register, commit, share"
+                    )
+                self._validate_dkg_node(node)
+                self._validate_dkg_hex64_or_null(key, "key")
+                self._validate_dkg_hex64_or_null(hash_value, "hash")
+                if peer is not None and not ROTATION_ID_RE.match(peer):
+                    raise ServiceError(
+                        400, "peer must match [A-Za-z0-9_-]{1,128}"
+                    )
+                if op == "register":
+                    if key is None or hash_value is not None or peer is not None:
+                        raise ServiceError(
+                            400,
+                            "register accepts only a non-null key; hash and "
+                            "peer must be null",
+                        )
+                elif op == "commit":
+                    if hash_value is None or key is not None or peer is not None:
+                        raise ServiceError(
+                            400,
+                            "commit accepts only a non-null hash; key and "
+                            "peer must be null",
+                        )
+                else:  # share
+                    if (
+                        hash_value is None
+                        or peer is None
+                        or key is not None
+                    ):
+                        raise ServiceError(
+                            400,
+                            "share requires non-null hash and peer; key "
+                            "must be null",
+                        )
+
+                record = self._store.get_dkg(wallet_id, dkg_id)
+                if (
+                    record is None
+                    and self._store.dkg_file_exists(wallet_id)
+                    and self._audit.dkg_stage_events(wallet_id).get(dkg_id)
+                ):
+                    # 业务文件在而记录缺失但有提交事件（外部删除）：前滚
+                    # 恢复后重读，绝不新建覆盖；无业务文件的纯钱包直接按
+                    # 未知流程处理，不读审计（启动恢复兜底整体删除）。
+                    self._recover_dkg(wallet_id)
+                    record = self._store.get_dkg(wallet_id, dkg_id)
+                events: list[dict] = (
+                    self._audit.dkg_stage_events(wallet_id).get(dkg_id, [])
+                    if record is not None
+                    else []
+                )
+                # 未知流程：只有 register 可以首建，其余 404
+                if record is None and op != "register":
+                    raise ServiceError(
+                        404, f"dkg process {dkg_id!r} not found"
+                    )
+
+                # 已提交重放优先：同 (op,node) 且参数同值 200；异值 409。
+                # 重放原样返回磁盘视图，不推进、不记事件。
+                for event in events:
+                    details = event["details"]
+                    if (
+                        details.get("op") == op
+                        and details.get("node") == node
+                    ):
+                        if (
+                            details.get("key") != key
+                            or details.get("hash") != hash_value
+                            or details.get("peer") != peer
+                        ):
+                            raise ServiceError(
+                                409,
+                                f"dkg {op} for node {node!r} was already "
+                                "committed with different parameters",
+                            )
+                        return 200, self._dkg_view(record)
+
+                # 阶段推进（错阶段/异值/第三节点一律 409）
+                if record is None:
+                    # 首个 register：创建流程
+                    updated = {
+                        "id": dkg_id,
+                        "state": "registering",
+                        "nodes": [node],
+                        "keys": {node: key},
+                        "hashes": {},
+                        "peers": {},
+                        "public_key": None,
+                    }
+                    new_state = "registering"
+                else:
+                    updated, new_state = self._advance_dkg(
+                        dkg_id, record, op, node, key, hash_value, peer
+                    )
+
+                # 提交点：先写业务状态，再追加 dkg_stage 事件。事件未落盘
+                # 回滚到旧状态（首建则删除文件）；事件已落盘（含异常但已
+                # 落盘）则按事件前滚。重放不记事件。
+                if record is None:
+                    self._store.create_dkg(wallet_id, dkg_id, updated)
+                else:
+                    self._store.update_dkg(wallet_id, dkg_id, updated)
+                try:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_DKG_STAGE,
+                            request_id=dkg_id,
+                            details={
+                                "id": dkg_id,
+                                "op": op,
+                                "node": node,
+                                "key": key,
+                                "hash": hash_value,
+                                "peer": peer,
+                                "state": new_state,
+                            },
+                        ),
+                    )
+                except BaseException:
+                    landed = next(
+                        (
+                            e
+                            for e in self._audit.dkg_stage_events(
+                                wallet_id
+                            ).get(dkg_id, [])
+                            if e["details"].get("op") == op
+                            and e["details"].get("node") == node
+                        ),
+                        None,
+                    )
+                    if landed is not None:
+                        rebuilt = self._rebuild_dkg_record(
+                            dkg_id,
+                            self._audit.dkg_stage_events(wallet_id)[dkg_id],
+                        )
+                        self._store.update_dkg(wallet_id, dkg_id, rebuilt)
+                    elif record is None:
+                        self._store.delete_dkg(wallet_id, dkg_id)
+                    else:
+                        self._store.update_dkg(wallet_id, dkg_id, record)
+                    raise
+                return 201, self._dkg_view(updated)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _advance_dkg(
+        self,
+        dkg_id: str,
+        record: dict,
+        op: str,
+        node: str,
+        key: object,
+        hash_value: object,
+        peer: object,
+    ) -> tuple[dict, str]:
+        """按状态机把 DKG 记录推进一个阶段，返回 (新记录, 新阶段态)。
+
+        仅在已确认非重放后调用；任何阶段/节点矛盾抛 409。"""
+        nodes = list(record["nodes"])
+        keys = dict(record["keys"])
+        hashes = dict(record["hashes"])
+        peers = dict(record["peers"])
+        state = record["state"]
+
+        if op == "register":
+            if state != "registering":
+                raise ServiceError(
+                    409, f"dkg process {dkg_id!r} is no longer registering"
+                )
+            if node in nodes:
+                # 同节点 register 异值重放在重放分支已判 409；此处防御
+                raise ServiceError(
+                    409, f"node {node!r} already registered"
+                )
+            if len(nodes) >= 2:
+                raise ServiceError(
+                    409, "dkg supports exactly two nodes; third node refused"
+                )
+            nodes.append(node)
+            keys[node] = key
+            new_state = "committing" if len(nodes) == 2 else "registering"
+        elif op == "commit":
+            if state != "committing":
+                raise ServiceError(
+                    409, f"dkg process {dkg_id!r} is not accepting commits"
+                )
+            if node not in nodes:
+                raise ServiceError(
+                    409, f"node {node!r} is not a participant of dkg {dkg_id!r}"
+                )
+            if node in hashes:
+                raise ServiceError(
+                    409, f"node {node!r} already committed"
+                )
+            hashes[node] = hash_value
+            new_state = "sharing" if len(hashes) == 2 else "committing"
+        else:  # share
+            if state != "sharing":
+                raise ServiceError(
+                    409, f"dkg process {dkg_id!r} is not accepting shares"
+                )
+            if node not in nodes:
+                raise ServiceError(
+                    409, f"node {node!r} is not a participant of dkg {dkg_id!r}"
+                )
+            if node in peers:
+                raise ServiceError(
+                    409, f"node {node!r} already shared"
+                )
+            if peer not in nodes or peer == node:
+                raise ServiceError(
+                    409, "share peer must be the other registered node"
+                )
+            if peer not in hashes:
+                raise ServiceError(
+                    409, f"peer {peer!r} has not committed a share hash"
+                )
+            if hash_value != hashes[peer]:
+                raise ServiceError(
+                    409, "share hash does not match the peer's commitment"
+                )
+            peers[node] = peer
+            if len(peers) == 2:
+                new_state = "done"
+            else:
+                new_state = "sharing"
+
+        updated = {
+            "id": dkg_id,
+            "state": new_state,
+            "nodes": nodes,
+            "keys": keys,
+            "hashes": hashes,
+            "peers": peers,
+            "public_key": None,
+        }
+        if new_state == "done":
+            updated["public_key"] = keys[nodes[0]] + keys[nodes[1]]
+        return updated, new_state
+
+    def _validated_dkg_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """读取并严格校验该钱包全部 dkg_stage 事件。
+
+        每条事件必须：request_id 为流程 id 且与 details.id 一致、
+        actor_id/reason 为 null、details 恰含
+        {id,op,node,key,hash,peer,state} 七键、op 为
+        register/commit/share、state 为四个阶段态、node 为安全标识；并按
+        op 强制：register 仅 key 非 null（64 位小写 hex），commit 仅 hash
+        非 null，share 仅 hash/peer 非 null（peer 为安全标识）。
+        阶段序列语义（按序/不重复/第三节点/承诺一致）由 _rebuild_dkg_record
+        重放校验。任一不符抛 RecoveryError（fail-closed）。"""
+        grouped = self._audit.dkg_stage_events(wallet_id)
+        for dkg_id, events in grouped.items():
+            for event in events:
+                if (
+                    event.get("actor_id") is not None
+                    or event.get("reason") is not None
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg {dkg_id!r} has a stage "
+                        "event with actor/reason set"
+                    )
+                details = event.get("details")
+                if not isinstance(details, dict) or set(details) != {
+                    "id",
+                    "op",
+                    "node",
+                    "key",
+                    "hash",
+                    "peer",
+                    "state",
+                }:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg {dkg_id!r} has a malformed "
+                        "stage event"
+                    )
+                if details["id"] != dkg_id:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg stage event id does not "
+                        "match its request_id"
+                    )
+                if details["op"] not in self.DKG_OPS:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg {dkg_id!r} stage event has "
+                        "an unknown op"
+                    )
+                if details["state"] not in (
+                    "registering",
+                    "committing",
+                    "sharing",
+                    "done",
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg {dkg_id!r} stage event has "
+                        "a malformed state"
+                    )
+                op = details["op"]
+                node = details["node"]
+                peer = details["peer"]
+                key_value = details["key"]
+                hash_value = details["hash"]
+                if not isinstance(node, str) or not ROTATION_ID_RE.match(node):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dkg {dkg_id!r} stage event has "
+                        "a malformed node"
+                    )
+                if op == "register":
+                    if not _is_lower_hex_32(key_value):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} register "
+                            "event lacks a valid key"
+                        )
+                    if hash_value is not None or peer is not None:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} register "
+                            "event carries hash/peer"
+                        )
+                elif op == "commit":
+                    if key_value is not None or peer is not None:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} commit "
+                            "event carries key/peer"
+                        )
+                    if not _is_lower_hex_32(hash_value):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} commit "
+                            "event lacks a valid hash"
+                        )
+                else:  # share
+                    if key_value is not None:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} share "
+                            "event carries a key"
+                        )
+                    if not _is_lower_hex_32(hash_value):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} share "
+                            "event lacks a valid hash"
+                        )
+                    if not isinstance(peer, str) or not ROTATION_ID_RE.match(
+                        peer
+                    ):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} dkg {dkg_id!r} share event "
+                            "has a malformed peer"
+                        )
+        return grouped
+
+    def _rebuild_dkg_record(
+        self, dkg_id: str, events: list[dict]
+    ) -> dict:
+        """按 seq 顺序重放某 DKG 流程的全部 dkg_stage 事件，重建唯一记录。
+
+        严格校验：register 按序恰两节点（不重复、无第三节点）；commit 必须
+        在双方注册后、每节点一次；share 必须在双方 commit 后、每节点一次、
+        peer 恰为另一节点且 hash 等于 peer 的承诺；每条事件的 details.state
+        必须等于应用该阶段后的状态。任一矛盾抛 RecoveryError（fail-closed），
+        绝不猜写。"""
+        ordered = sorted(events, key=lambda e: e.get("seq", 0))
+        nodes: list[str] = []
+        keys: dict[str, str] = {}
+        hashes: dict[str, str] = {}
+        peers: dict[str, str] = {}
+        last_seq = 0
+        for event in ordered:
+            seq = event.get("seq")
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or seq <= last_seq
+            ):
+                raise RecoveryError(
+                    f"dkg {dkg_id!r} stage events have an out-of-order seq"
+                )
+            last_seq = seq
+            details = event["details"]
+            op = details["op"]
+            node = details["node"]
+            event_state = details["state"]
+            if op == "register":
+                if node in nodes:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} registers node {node!r} twice"
+                    )
+                if len(nodes) >= 2:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} has a third registered node"
+                    )
+                nodes.append(node)
+                keys[node] = details["key"]
+                expected_state = (
+                    "committing" if len(nodes) == 2 else "registering"
+                )
+            elif op == "commit":
+                if len(nodes) != 2:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} has a commit before both nodes "
+                        "registered"
+                    )
+                if node not in nodes:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} commit from an unregistered node"
+                    )
+                if node in hashes:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} node {node!r} commits twice"
+                    )
+                hashes[node] = details["hash"]
+                expected_state = (
+                    "sharing" if len(hashes) == 2 else "committing"
+                )
+            else:  # share
+                if len(hashes) != 2:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} has a share before both commits"
+                    )
+                if node not in nodes or node in peers:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} has an invalid or duplicate share "
+                        f"from {node!r}"
+                    )
+                peer = details["peer"]
+                if peer not in nodes or peer == node:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} share peer {peer!r} is not the other "
+                        "node"
+                    )
+                if details["hash"] != hashes[peer]:
+                    raise RecoveryError(
+                        f"dkg {dkg_id!r} share hash does not match the peer "
+                        "commitment"
+                    )
+                peers[node] = peer
+                expected_state = "done" if len(peers) == 2 else "sharing"
+            if event_state != expected_state:
+                raise RecoveryError(
+                    f"dkg {dkg_id!r} stage event state {event_state!r} does "
+                    f"not match the replayed state {expected_state!r}"
+                )
+        record = {
+            "id": dkg_id,
+            "state": expected_state if ordered else "registering",
+            "nodes": nodes,
+            "keys": keys,
+            "hashes": hashes,
+            "peers": peers,
+            "public_key": None,
+        }
+        if ordered and expected_state == "done":
+            record["public_key"] = keys[nodes[0]] + keys[nodes[1]]
+        return record
+
+    def _recover_dkg(self, wallet_id: str, *, scan_audit_orphans: bool = False) -> None:
+        """启动/持锁恢复 DKG 崩溃现场（调用方须持钱包事务锁）。
+
+        形状严格校验由存储层完成（损坏即 CorruptDataError -> 503/阻止就绪，
+        保留现场）。以 dkg_stage 事件为唯一提交点重放对账：
+
+        - 无 register 事件的记录：首提未提交，删除残留；
+        - 有事件：按 seq 严格重放重建唯一记录（顺序/阶段/承诺一致性全部
+          校验），磁盘缺失（scan_audit_orphans 时含业务文件整体缺失）则
+          前滚补齐，与磁盘不一致则按事件纠正；事件序列自相矛盾
+          fail-closed，绝不猜写。
+        恢复本身不记事件、不分配 seq。
+
+        常驻 heal 快路径（scan_audit_orphans=False）与签名会话恢复同一边界：
+        无业务文件即返回，使纯钱包/审计无关路由不承担审计读取；事件在而
+        业务文件整体缺失只能来自外部删除，由启动完整恢复（True）fail-closed/
+        前滚，正常崩溃窗口（先写状态后追加事件）不会产生该现场。"""
+        file_exists = self._store.dkg_file_exists(wallet_id)
+        if not file_exists and not scan_audit_orphans:
+            return
+        events_by_id = self._validated_dkg_events(wallet_id)
+        if not file_exists and not events_by_id:
+            return
+        records = self._store.list_dkg(wallet_id)
+        recorded_ids = {record["id"] for record in records}
+        for dkg_id, events in events_by_id.items():
+            if not any(
+                e["details"].get("op") == "register" for e in events
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} dkg {dkg_id!r} has stage events "
+                    "but no register event"
+                )
+            rebuilt = self._rebuild_dkg_record(dkg_id, events)
+            disk = self._store.get_dkg(wallet_id, dkg_id)
+            if disk is None:
+                self._store.create_dkg(wallet_id, dkg_id, rebuilt)
+            elif disk != rebuilt:
+                self._store.update_dkg(wallet_id, dkg_id, rebuilt)
+        for record in records:
+            dkg_id = record["id"]
+            if dkg_id not in events_by_id:
+                # 事件未落盘的首提残留：回滚删除
+                self._store.delete_dkg(wallet_id, dkg_id)

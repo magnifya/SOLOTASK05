@@ -68,6 +68,7 @@ _BUSINESS_FILE_DIRS = (
     "assets",
     "transaction-policies",
     "sign-sessions",
+    "dkg",
 )
 
 
@@ -619,6 +620,11 @@ _APPROVAL_POLICY_KEYS = frozenset(
 )
 _TRANSACTION_POLICY_KEYS = frozenset(("mode", "max_delta", "allowed_assets"))
 
+#: DKG 流程记录允许的契约键（绝不含份额正文/私钥）
+_DKG_RECORD_KEYS = frozenset(
+    ("id", "state", "nodes", "keys", "hashes", "peers", "public_key")
+)
+
 #: 非份额文件中绝不得出现的私钥字段名
 _PRIVATE_KEY_FIELD = "private_key"
 
@@ -646,6 +652,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "session_event",
         "session_participant_replaced",
         "session_takeover",
+        "dkg_stage",
     )
 )
 
@@ -1124,6 +1131,26 @@ def _verify_requests_against_audit(
             raise BackupError(503, "created event has no request record")
 
 
+def _verify_dkg_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
+    """dkg/<W>.json：顶层对象，每键安全标识且等于记录 id；记录只允许
+    DKG 契约键（id/state/nodes/keys/hashes/peers/public_key），阶段形状由
+    线上恢复器严格对账（记录必须与 dkg_stage 事件重放一致）。绝不含份额
+    正文或私钥字段。"""
+    from .store import WalletStore as _WS
+
+    rel = f"dkg/{wallet_id}.json"
+    if rel not in files:
+        return
+    processes = _load_json_object(files[rel], "dkg file")
+    for key, record in processes.items():
+        if not isinstance(key, str) or not _SAFE_ID.match(key):
+            raise BackupError(503, "dkg file has a bad process id")
+        if not isinstance(record, dict) or not set(record) <= _DKG_RECORD_KEYS:
+            raise BackupError(503, "dkg record is malformed")
+        if not _WS._dkg_record_shape_ok(key, record):
+            raise BackupError(503, "dkg record has a bad stage shape")
+
+
 def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
     """对业务文件做严格形状与契约键校验（任何夹带/畸形一律 503）。
 
@@ -1157,6 +1184,7 @@ def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
                 raise BackupError(503, "requests file is malformed")
     _verify_signatures_shapes(wallet_id, files)
     _verify_rotations_shapes(wallet_id, files)
+    _verify_dkg_shapes(wallet_id, files)
 
 
 def _verify_signatures_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
