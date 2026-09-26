@@ -72,6 +72,8 @@ TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
 TYPE_CHAIN_ARBITRATION = "chain_arbitration"
 TYPE_CHAIN_VOTE = "chain_vote"
+#: 跨链派发请求（details 即 V={dispatch_id,operation_id,adapter_id,chain_id,state}）
+TYPE_CHAIN_DISPATCH_REQUESTED = "chain_dispatch_requested"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -178,6 +180,15 @@ _DETAILS_KEY_ORDER = {
         ("sources", "quorum"),
         ("source", "report", "state"),
     ),
+    # chain_dispatch_requested 的 details 即对外视图 V：五键固定序
+    # dispatch_id,operation_id,adapter_id,chain_id,state。
+    TYPE_CHAIN_DISPATCH_REQUESTED: (
+        "dispatch_id",
+        "operation_id",
+        "adapter_id",
+        "chain_id",
+        "state",
+    ),
 }
 
 
@@ -193,6 +204,30 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
     (
         TYPE_NODE_REJOINED,
         TYPE_SHARE_PARTICIPANT_REINSTATED,
+        TYPE_DKG_FAILOVER,
+        TYPE_CHAIN_DISPATCH_REQUESTED,
+    )
+)
+
+
+#: 审计事件落盘的外层七字段规范键序（写盘按 sort_keys，见
+#: _canonical_event）。正常现场恒为此序，任何重排都是外部篡改。
+_OUTER_KEY_ORDER = (
+    "actor_id",
+    "at",
+    "details",
+    "reason",
+    "request_id",
+    "seq",
+    "type",
+)
+
+#: 在归一化前就须按落盘规范序严格核对**外层七字段**键序的事件类型集合。
+#: 读取不重排外层键序，故落盘原序在加载时即可核对：错序即不可对账现场
+#: （RecoveryError），且 _read_strict 是追加写盘前的唯一加载路径，错序
+#: 现场绝不写盘。
+_STRICT_OUTER_ORDER_TYPES = frozenset(
+    (
         TYPE_DKG_FAILOVER,
     )
 )
@@ -397,6 +432,14 @@ class AuditStore:
         # 绝不先归一再校验而把错序静默抹平。审计 JSON 本身解析失败已在
         # WalletStore._read_json 处抛 CorruptDataError。
         for event in events:
+            if event.get("type") in _STRICT_OUTER_ORDER_TYPES and list(
+                event
+            ) != list(_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"audit log {path!r} has a "
+                    f"{event.get('type')} event whose outer fields are out "
+                    "of the canonical order"
+                )
             if (
                 event.get("type") in _STRICT_DETAILS_ORDER_TYPES
                 and not _stored_details_has_canonical_order(event)
@@ -627,6 +670,20 @@ class AuditStore:
         seq。"""
         return self._events_grouped_by_request(
             wallet_id, TYPE_SHARE_PARTICIPANT_REINSTATED
+        )
+
+    def chain_dispatch_requested_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 chain_dispatch_requested 事件，按 request_id
+        （dispatch_id）分组，组内按 seq 升序。
+
+        跨链派发仅由这些事件持久化（事件是唯一提交点）：在线幂等重放与
+        崩溃恢复据此判定每个 dispatch_id 是否已提交及其参数。每个
+        dispatch_id 至多一条有效事件（重复属不可对账现场，由恢复判定）。
+        纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_CHAIN_DISPATCH_REQUESTED
         )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:

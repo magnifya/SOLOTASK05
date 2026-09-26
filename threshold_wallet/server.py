@@ -29,6 +29,7 @@
 - PUT  /v1/wallets/<wallet_id>/chain/<asset_id>/arbitration 设置多源仲裁策略
 - GET  /v1/wallets/<wallet_id>/chain/<asset_id>/arbitration 查询多源仲裁策略
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/observe 多源观察上报
+- POST /v1/wallets/<wallet_id>/chain/<operation_id>/dispatch 请求跨链派发
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
@@ -589,6 +590,34 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         wallet_id,
                         rest[1],
                         body,
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "dispatch"
+                ):
+                    body = self._read_json_body()
+                    # 请求体仅允许 dispatch_id/adapter_id/approval_request_id
+                    # 三键（值类型/取值由 service 校验）
+                    if set(body) != {
+                        "dispatch_id",
+                        "adapter_id",
+                        "approval_request_id",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly dispatch_id, "
+                            "adapter_id and approval_request_id",
+                        )
+                    status, result = service.post_chain_dispatch(
+                        wallet_id,
+                        rest[1],
+                        body.get("dispatch_id"),
+                        body.get("adapter_id"),
+                        body.get("approval_request_id"),
                     )
                     self._send_json(status, result)
                     return

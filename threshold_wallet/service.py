@@ -261,6 +261,7 @@ class WalletService:
         账本供调用方复用。"""
         self._reconcile_chain_events(wallet_id)
         self._reconcile_chain_arbitration_events(wallet_id)
+        self._reconcile_chain_dispatch_events(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
     def _reconcile_dkg_events_locked(self, wallet_id: str) -> None:
@@ -362,6 +363,9 @@ class WalletService:
             # 与票/报告/提交三事件提交点对账：逐事件重放，矛盾/损坏
             # fail-closed；纯只读。
             self._reconcile_chain_arbitration_events(wallet_id)
+            # 跨链派发事件（chain_dispatch_requested）与账本/策略/审批单
+            # 对账：逐事件按提交前现场复核，矛盾/损坏 fail-closed；纯只读。
+            self._reconcile_chain_dispatch_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/
             # rejoin/share-bind）仅由审计事件持久化：按既有 DKG 恢复规则
@@ -498,6 +502,9 @@ class WalletService:
                 # 多源仲裁票/策略事件与三事件提交点同属账本一致性：
                 # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_arbitration_events(wallet_id)
+                # 跨链派发事件与账本/策略/审批单同属账本一致性：账本存在
+                # 时一并按 seq 重放对账，矛盾即 fail-closed。
+                self._reconcile_chain_dispatch_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
@@ -4212,6 +4219,418 @@ class WalletService:
                             )
                     committed.add(operation_id)
             prev = event
+
+    # ---- 跨链派发（dispatch）-------------------------------------------------
+
+    #: dispatch 审批单 message / 事件 details V 的固定键序
+    _DISPATCH_VIEW_KEY_ORDER = (
+        "dispatch_id",
+        "operation_id",
+        "adapter_id",
+        "chain_id",
+        "state",
+    )
+
+    @staticmethod
+    def _dispatch_approval_message(
+        operation_id: str,
+        dispatch_id: str,
+        adapter_id: str,
+        chain_id: str,
+    ) -> str:
+        """审批单 message 必须逐字一致的紧凑 JSON（无空格、键序固定为
+        operation_id,dispatch_id,adapter_id,chain_id）。"""
+        return json.dumps(
+            {
+                "operation_id": operation_id,
+                "dispatch_id": dispatch_id,
+                "adapter_id": adapter_id,
+                "chain_id": chain_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _dispatch_view(
+        self,
+        dispatch_id: str,
+        operation_id: str,
+        adapter_id: str,
+        chain_id: str,
+    ) -> dict:
+        """dispatch 成功/重放响应体 V（键序固定，state 恒为 requested）。"""
+        return {
+            "dispatch_id": dispatch_id,
+            "operation_id": operation_id,
+            "adapter_id": adapter_id,
+            "chain_id": chain_id,
+            "state": "requested",
+        }
+
+    def _dispatch_events_strict(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部 chain_dispatch_requested 事件（按 seq 升序）并
+        逐条严格校验**形状**（外层七字段键序、request_id==dispatch_id、
+        actor_id 为安全标识、reason 为 null、details 恰为五键 V 且键序
+        固定、各值合法）。
+
+        这里只做与现场无关的形状校验；与账本/策略/审批单的语义复核在
+        :meth:`_reconcile_chain_dispatch_events` 按事件 seq 完成。任何
+        形状畸形都是不可对账现场（RecoveryError）。纯只读，不分配 seq。"""
+        # 用 events_by_type 而非按 request_id 分组：后者会丢掉 request_id
+        # 为 null/非字符串的畸形事件，必须让它们也进入严格校验而非被静默
+        # 忽略。
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_REQUESTED
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_requested "
+                    "event whose outer fields are out of the canonical order"
+                )
+            dispatch_id = event.get("request_id")
+            actor_id = event.get("actor_id")
+            if (
+                not isinstance(dispatch_id, str)
+                or not ROTATION_ID_RE.match(dispatch_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_requested "
+                    "event with a malformed dispatch_id"
+                )
+            if dispatch_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"chain_dispatch_requested events for {dispatch_id!r}"
+                )
+            seen.add(dispatch_id)
+            if not (
+                isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{dispatch_id!r} has a malformed approval_request_id"
+                )
+            if event.get("reason") is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{dispatch_id!r} has a non-null reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details) != list(self._DISPATCH_VIEW_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{dispatch_id!r} has malformed details"
+                )
+            if details["dispatch_id"] != dispatch_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{dispatch_id!r} details dispatch_id disagrees with "
+                    "its request_id"
+                )
+            for name in ("operation_id", "adapter_id", "chain_id"):
+                value = details[name]
+                if not isinstance(value, str) or not ROTATION_ID_RE.match(
+                    value
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_requested "
+                        f"{dispatch_id!r} has a malformed {name}"
+                    )
+            if details["state"] != "requested":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{dispatch_id!r} has a state other than requested"
+                )
+        return events
+
+    def _reconcile_chain_dispatch_events(self, wallet_id: str) -> None:
+        """按 seq 严格复核全部 chain_dispatch_requested 事件（调用方须持
+        钱包事务锁）。
+
+        每条事件都以其**提交之前**的现场复核在线首提的全部前置：
+
+        - 操作在账本中存在、提交点之前无该操作的
+          asset_operation_committed（当时为 pending）；
+        - 每个操作至多一条派发事件（同 dispatch_id 重复已在形状校验
+          拦截）；
+        - 事前该资产跨链确认策略（该事件 seq 之前最后一条 chain_policy）
+          已启用且 chain_id 与 details 一致；
+        - 同钱包审批单 actor_id 存在，message 逐字为按
+          operation_id,dispatch_id,adapter_id,chain_id 序的紧凑 JSON，
+          状态为 approved（其后经 /sign 推进为 signed 亦认可）。
+
+        任一不满足都是不可对账现场（RecoveryError，fail-closed，保留
+        现场）。纯只读，不记事件、不改 seq、不写状态。"""
+        events = self._dispatch_events_strict(wallet_id)
+        if not events:
+            return
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        operations = ledger["operations"]
+        # 重放全部事件，取各操作的提交 seq 与各资产的策略历史（seq 升序）。
+        committed_seq: dict[str, int] = {}
+        policy_history: dict[str, list[tuple[int, dict]]] = {}
+        for event in self._audit.all_events(wallet_id):
+            event_type = event.get("type")
+            if event_type == audit.TYPE_CHAIN_POLICY:
+                asset_id, policy = self._chain_policy_shape(wallet_id, event)
+                policy_history.setdefault(asset_id, []).append(
+                    (event["seq"], policy)
+                )
+            elif event_type == audit.TYPE_ASSET_OPERATION_COMMITTED:
+                request_id = event.get("request_id")
+                if isinstance(request_id, str):
+                    committed_seq[request_id] = event["seq"]
+        dispatched_operations: set[str] = set()
+        for event in events:
+            details = event["details"]
+            seq = event["seq"]
+            operation_id = details["operation_id"]
+            record = operations.get(operation_id)
+            if record is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_requested "
+                    f"event for unknown asset operation {operation_id!r}"
+                )
+            if operation_id in dispatched_operations:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"chain_dispatch_requested events for asset operation "
+                    f"{operation_id!r}"
+                )
+            dispatched_operations.add(operation_id)
+            commit_seq = committed_seq.get(operation_id)
+            if commit_seq is not None and commit_seq < seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_requested "
+                    f"event for already committed asset operation "
+                    f"{operation_id!r}"
+                )
+            # 事前策略：该事件 seq 之前最后一条该资产 chain_policy。
+            policy = None
+            for policy_seq, candidate in policy_history.get(
+                record["asset_id"], []
+            ):
+                if policy_seq < seq:
+                    policy = candidate
+            if policy is None or not policy["enabled"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_requested "
+                    f"event for {operation_id!r} without an enabled policy"
+                )
+            if policy["chain_id"] != details["chain_id"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_requested "
+                    f"event for {operation_id!r} on a different chain"
+                )
+            # 按 actor_id 复核同钱包审批单：存在、message 逐字一致、状态
+            # 为 approved（其后经 /sign 推进为 signed 亦认可）。
+            actor_id = event["actor_id"]
+            try:
+                approval = self._store.get_request(wallet_id, actor_id)
+            except CorruptDataError:
+                raise
+            except ValueError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain dispatch approval record "
+                    "is unreadable"
+                ) from exc
+            if not isinstance(approval, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{details['dispatch_id']!r} refers to an unknown "
+                    "approval request"
+                )
+            expected_message = self._dispatch_approval_message(
+                operation_id,
+                details["dispatch_id"],
+                details["adapter_id"],
+                details["chain_id"],
+            )
+            if approval.get("message") != expected_message:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{details['dispatch_id']!r} approval message does not "
+                    "match"
+                )
+            if approval.get("state") not in ("approved", "signed"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_requested "
+                    f"{details['dispatch_id']!r} approval request is not "
+                    "approved"
+                )
+
+    def post_chain_dispatch(
+        self,
+        wallet_id: str,
+        operation_id: object,
+        dispatch_id: object,
+        adapter_id: object,
+        approval_request_id: object,
+    ) -> tuple[int, dict]:
+        """请求把某 pending 资产操作派发到链上适配器，返回
+        (HTTP 状态码, 视图 V={dispatch_id,operation_id,adapter_id,
+        chain_id,state})。
+
+        请求体恰含 dispatch_id,adapter_id,approval_request_id 三键
+        （HTTP 边界拦键集），各值须为安全标识，非法 400；钱包/操作/
+        该资产跨链确认策略/同钱包审批单任一未知 404。首提前置：操作
+        为 pending、策略已启用、审批单经锁内懒过期后为 approved 且
+        message 逐字为按 operation_id,dispatch_id,adapter_id,chain_id
+        序的紧凑 JSON；任一不满足 409 且现场不变。
+
+        首提 201；同 dispatch_id 同参（含路径操作与审批单）重放 200
+        返回同一 V（优先于状态与审批判定，不复查现状）；同 dispatch_id
+        异参、或该操作已有其他 dispatch_id 的派发，一律 409。
+        chain_dispatch_requested 是唯一提交点
+        （request_id=dispatch_id、actor_id=approval_request_id、
+        reason=null、details=V）；锁内并发只有一个 201，失败/重放不记
+        事件。恢复检查、校验、状态判定与事件追加全部在锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、报告、票、派发、操作与相邻提交事件
+                # （heal 仅在账本文件存在时覆盖）：矛盾现场 fail-closed，
+                # 优先于参数 400/404 判定。
+                self._reconcile_chain_state_locked(wallet_id)
+                # 类型/取值校验（400）
+                self._validate_operation_id(operation_id)
+                for name, value in (
+                    ("dispatch_id", dispatch_id),
+                    ("adapter_id", adapter_id),
+                    ("approval_request_id", approval_request_id),
+                ):
+                    if not isinstance(value, str) or not ROTATION_ID_RE.match(
+                        value
+                    ):
+                        raise ServiceError(
+                            400,
+                            f"{name} must match [A-Za-z0-9_-]{{1,128}}",
+                        )
+
+                dispatches = self._audit.chain_dispatch_requested_events(
+                    wallet_id
+                )
+                # 幂等优先于 404/状态判定：已提交的同 dispatch_id 重放。
+                committed_groups = dispatches.get(dispatch_id)
+                if committed_groups:
+                    if len(committed_groups) != 1:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has multiple "
+                            f"chain_dispatch_requested events for "
+                            f"{dispatch_id!r}"
+                        )
+                    committed_event = committed_groups[0]
+                    saved = committed_event["details"]
+                    if (
+                        saved["operation_id"] == operation_id
+                        and saved["adapter_id"] == adapter_id
+                        and committed_event["actor_id"] == approval_request_id
+                    ):
+                        # 同参（含审批单标识）重放：200 同 V，不复查现状
+                        return 200, dict(saved)
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} already exists with "
+                        "different parameters",
+                    )
+
+                # 404：操作 / 该资产跨链确认策略 / 同钱包审批单未知
+                record = self._store.get_asset_operation(
+                    wallet_id, operation_id
+                )
+                if record is None:
+                    raise ServiceError(
+                        404, f"asset operation {operation_id!r} not found"
+                    )
+                policy = self._chain_policies(wallet_id).get(
+                    record["asset_id"]
+                )
+                if policy is None:
+                    raise ServiceError(
+                        404,
+                        f"wallet {wallet_id!r} has no chain confirmation "
+                        f"policy for asset {record['asset_id']!r}",
+                    )
+                approval = self._store.get_request(
+                    wallet_id, approval_request_id
+                )
+                if approval is None:
+                    raise ServiceError(
+                        404,
+                        f"approval request {approval_request_id!r} not found",
+                    )
+
+                # 409：操作非 pending
+                if record["state"] != "pending":
+                    raise ServiceError(
+                        409,
+                        f"asset operation {operation_id!r} is "
+                        f"{record['state']}, not pending",
+                    )
+                # 409：策略停用
+                if not policy["enabled"]:
+                    raise ServiceError(
+                        409,
+                        f"chain confirmation policy for asset "
+                        f"{record['asset_id']!r} is not enabled",
+                    )
+                # 409：该操作已有其他 dispatch_id 的派发
+                for grouped in dispatches.values():
+                    for prior in grouped:
+                        if prior["details"]["operation_id"] == operation_id:
+                            raise ServiceError(
+                                409,
+                                f"asset operation {operation_id!r} already "
+                                "has a dispatch",
+                            )
+
+                # 审批门控：同钱包既有 approved 审批单，message 逐字一致。
+                # 按既有契约懒过期（可能原子记一次 request_expired）。
+                approval = self._expire_if_needed(wallet_id, approval)
+                expected_message = self._dispatch_approval_message(
+                    operation_id, dispatch_id, adapter_id, policy["chain_id"]
+                )
+                if approval["message"] != expected_message:
+                    raise ServiceError(
+                        409,
+                        "approval request message does not match this "
+                        "dispatch",
+                    )
+                if approval["state"] != "approved":
+                    raise ServiceError(
+                        409,
+                        f"approval request {approval_request_id!r} is "
+                        f"{approval['state']}, not approved",
+                    )
+
+                # chain_dispatch_requested 是唯一提交点：在跨进程事务锁内
+                # 追加事件；事件之外不写任何派发状态文件。
+                view = self._dispatch_view(
+                    dispatch_id, operation_id, adapter_id, policy["chain_id"]
+                )
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_DISPATCH_REQUESTED,
+                        request_id=dispatch_id,
+                        actor_id=approval_request_id,
+                        reason=None,
+                        details=view,
+                    ),
+                )
+                return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
 
     # ---- 多源仲裁 ---------------------------------------------------------
 

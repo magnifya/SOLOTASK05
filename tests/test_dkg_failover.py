@@ -554,6 +554,57 @@ class DkgFailoverServiceTest(unittest.TestCase):
         with self.assertRaises(RecoveryError):
             WalletService(self.h.store)
 
+    def test_failover_event_outer_fields_reordered_is_fail_closed(self):
+        # 落盘外层七字段错序（规范序为 actor_id,at,details,reason,
+        # request_id,seq,type）：审计加载在归一化之前即 RecoveryError，
+        # 拒绝就绪、绝不写盘
+        self._register_pair()
+        self._commit_pair()
+        code, _ = self._failover(
+            "d1", 2, "replace", node="n2", replacement="n3", key=KEY_C
+        )
+        self.assertEqual(code, 201)
+        path = os.path.join(self.d, "audit", "w1.json")
+        with open(path, encoding="utf-8") as f:
+            log = json.load(f)
+        for event in log["events"]:
+            if event["type"] == "dkg_failover":
+                # 同键集、外层错序（公开契约序而非落盘规范序）
+                reordered = {
+                    "seq": event["seq"],
+                    "type": event["type"],
+                    "at": event["at"],
+                    "request_id": event["request_id"],
+                    "actor_id": event["actor_id"],
+                    "reason": event["reason"],
+                    "details": event["details"],
+                }
+                event.clear()
+                event.update(reordered)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(log, f)
+        raw_before = open(path, "rb").read()
+        # 读取即 RecoveryError，且不被归一化静默修正
+        with self.assertRaises(RecoveryError):
+            self.svc._audit.dkg_failover_events("w1")
+        # 追加写盘前的加载同样 fail-closed：错序现场绝不写盘
+        with self.assertRaises(RecoveryError):
+            self.svc._audit.append_event(
+                "w1",
+                {
+                    "type": "dkg_stage",
+                    "at": "2026-01-01T00:00:00Z",
+                    "request_id": "d1",
+                    "actor_id": None,
+                    "reason": None,
+                    "details": {},
+                },
+            )
+        self.assertEqual(open(path, "rb").read(), raw_before)
+        # 启动恢复拒绝就绪
+        with self.assertRaises(RecoveryError):
+            WalletService(self.h.store)
+
     def test_missing_failover_event_is_fail_closed(self):
         self._register_pair()
         self._commit_pair()

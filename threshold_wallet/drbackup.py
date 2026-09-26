@@ -656,6 +656,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "chain_report",
         "chain_arbitration",
         "chain_vote",
+        "chain_dispatch_requested",
     )
 )
 
