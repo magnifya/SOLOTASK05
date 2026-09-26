@@ -425,6 +425,13 @@ class DkgFailoverServiceTest(unittest.TestCase):
         self.assertEqual(event["request_id"], "d1/2")
         self.assertIsNone(event["actor_id"])
         self.assertIsNone(event["reason"])
+        # 公开审计查询的外层键序为契约序 seq,type,at,request_id,
+        # actor_id,reason,details（不同于落盘 sort_keys 序）
+        self.assertEqual(
+            list(event),
+            ["seq", "type", "at", "request_id", "actor_id", "reason",
+             "details"],
+        )
         self.assertEqual(
             list(event["details"]),
             ["id", "round", "action", "node", "replacement", "key",
@@ -442,11 +449,30 @@ class DkgFailoverServiceTest(unittest.TestCase):
             log = json.load(f)
         for e in log["events"]:
             if e["type"] == "dkg_failover":
+                # 落盘外层七字段仍是 sort_keys 序，公开键序仅在查询副本
+                # 上重排（查询不写盘）
+                self.assertEqual(
+                    list(e),
+                    ["actor_id", "at", "details", "reason", "request_id",
+                     "seq", "type"],
+                )
                 self.assertEqual(
                     list(e["details"]),
                     ["id", "round", "action", "node", "replacement",
                      "key", "state"],
                 )
+        # 同次查询中的其余事件类型仍保持落盘 sort_keys 外层序（其余契约
+        # 不变）；重复查询结果一致且为独立副本（查询不写盘、不改现场）。
+        stages = self._events("dkg_stage")
+        self.assertTrue(stages)
+        self.assertEqual(
+            list(stages[0]),
+            ["actor_id", "at", "details", "reason", "request_id", "seq",
+             "type"],
+        )
+        again = self._events("dkg_failover")
+        self.assertEqual([dict(e) for e in again], [dict(e) for e in events])
+        self.assertIsNot(again[0], events[0])
 
     def test_abort_event_details(self):
         self._register_pair()

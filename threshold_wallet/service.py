@@ -82,6 +82,20 @@ _AUDIT_OUTER_KEY_ORDER = (
 #: node_state 事件 details 内单个节点条目的固定键序。
 _NODE_STATE_ENTRY_KEY_ORDER = ("key", "state")
 
+#: dkg_failover 事件在**公开审计查询**（get_audit_events / GET
+#: audit-events）中的外层键序。落盘外层仍为 sort_keys 序
+#: （见 _AUDIT_OUTER_KEY_ORDER），查询仅对该类型事件重排**副本**；
+#: 其余事件类型的公开键序维持落盘序不变。
+_DKG_FAILOVER_PUBLIC_KEY_ORDER = (
+    "seq",
+    "type",
+    "at",
+    "request_id",
+    "actor_id",
+    "reason",
+    "details",
+)
+
 
 class ServiceError(Exception):
     """业务错误，携带 HTTP 状态码与错误信息。"""
@@ -2488,6 +2502,21 @@ class WalletService:
     AUDIT_MAX_LIMIT = 1000
 
     @staticmethod
+    def _public_audit_event_view(event: dict) -> dict:
+        """单条事件的公开查询视图（副本）。
+
+        仅 dkg_failover 事件重排外层键序为公开契约序
+        seq,type,at,request_id,actor_id,reason,details；其 details 已在
+        严格加载时归一为既定键序（auto 末键 mode），原样保留。其余事件
+        类型保持落盘外层序（sort_keys 序）不变。只重排副本，绝不写盘
+        或分配 seq。"""
+        if event.get("type") == audit.TYPE_DKG_FAILOVER:
+            return {
+                key: event[key] for key in _DKG_FAILOVER_PUBLIC_KEY_ORDER
+            }
+        return event
+
+    @staticmethod
     def _parse_positive_int(value: object, name: str) -> int:
         """from_seq/limit 必须是正整数（bool/浮点/带符号/缺失均拒绝）。"""
         if isinstance(value, str):
@@ -2549,6 +2578,9 @@ class WalletService:
             # wallet_id 含非法字符（构造锁路径时抛出）；from_seq/limit 的
             # 非法值已在锁内转成 ServiceError(400)
             raise ServiceError(400, "invalid wallet_id")
+        # 仅重排查询副本（dkg_failover 外层为公开契约序），不写盘、
+        # 不分配 seq、不改存储内存现场。
+        events = [self._public_audit_event_view(event) for event in events]
         return {"wallet_id": wallet_id, "events": events}
 
     # ---- 份额轮换 ---------------------------------------------------------

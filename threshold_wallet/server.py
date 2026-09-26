@@ -72,7 +72,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
         # ---- 响应/日志辅助 ----------------------------------------------
 
         def _send_json(self, status: int, body: dict) -> None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self._send_json_bytes(status, body)
+
+        def _send_json_compact(self, status: int, body: dict) -> None:
+            # audit-events 成功体：UTF-8 紧凑 JSON（无空白），非 ASCII
+            # 不转义、无末换行。
+            self._send_json_bytes(
+                status, body, separators=(",", ":")
+            )
+
+        def _send_json_bytes(
+            self,
+            status: int,
+            body: dict,
+            separators=None,
+        ) -> None:
+            # allow_nan=False：禁止输出 NaN/Infinity（非法 JSON）等非有限
+            # 值；审计事件形状已保证仅有 int/null/str/bool（整数十进制）。
+            data = json.dumps(
+                body,
+                ensure_ascii=False,
+                separators=separators,
+                allow_nan=False,
+            ).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -80,7 +102,10 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(data)
 
         def _send_error(self, status: int, message: str) -> None:
-            self._send_json(status, {"error": message})
+            if getattr(self, "_compact_response", False):
+                self._send_json_compact(status, {"error": message})
+            else:
+                self._send_json(status, {"error": message})
 
         def _send_failure(self, exc: BaseException) -> None:
             """把业务/基础设施异常统一映射为 JSON 错误响应。
@@ -131,6 +156,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            # 每次请求重置：仅 audit-events 路由把成功/错误体切到紧凑 JSON，
+            # 绝不经 keep-alive 漏给同连接上的后续请求。
+            self._compact_response = False
             try:
                 dkg = self._split_dkg_path(path)
                 if dkg is not None:
@@ -186,7 +214,10 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 if rest == ["audit-events"]:
-                    self._send_json(
+                    # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
+                    # JSON（非 ASCII 不转义、无末换行）；其余路由不变。
+                    self._compact_response = True
+                    self._send_json_compact(
                         200,
                         service.get_audit_events(
                             wallet_id,
@@ -220,6 +251,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            self._compact_response = False
             try:
                 if path == "/v1/wallets":
                     body = self._read_json_body()
@@ -600,6 +632,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         def do_PUT(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            self._compact_response = False
             try:
                 matched = self._split_wallet_path(path)
                 if matched is not None:

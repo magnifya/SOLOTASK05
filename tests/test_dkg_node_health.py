@@ -337,6 +337,11 @@ class AutoFailoverServiceTest(unittest.TestCase):
         self.assertEqual(code, 201)
         (event,) = self._failover_events()
         self.assertEqual(
+            list(event),
+            ["seq", "type", "at", "request_id", "actor_id", "reason",
+             "details"],
+        )
+        self.assertEqual(
             list(event["details"]),
             ["id", "round", "action", "node", "replacement", "key",
              "state", "mode"],

@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from tests.helpers import http_server, make_harness
@@ -363,6 +366,61 @@ class AuditHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 404)
         self.assertIn("error", body)
+
+    # ---- 线路字节契约 ----------------------------------------------------
+
+    def _raw_get(self, path):
+        req = urllib.request.Request(self.srv.base_url + path)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_wire_is_compact_utf8_no_trailing_newline(self):
+        self.put_policy()
+        status, raw = self._raw_get("/v1/wallets/w1/audit-events")
+        self.assertEqual(status, 200)
+        # 紧凑 JSON：无空白分隔符、无末换行
+        self.assertNotIn(b", ", raw)
+        self.assertNotIn(b": ", raw)
+        self.assertFalse(raw.endswith(b"\n"))
+        self.assertEqual(
+            json.loads(raw.decode("utf-8"))["wallet_id"], "w1"
+        )
+        # 成功体键序 wallet_id,events；事件按 seq 升序
+        self.assertTrue(raw.startswith(b'{"wallet_id":"w1","events":['))
+        seqs = [e["seq"] for e in json.loads(raw)["events"]]
+        self.assertEqual(seqs, sorted(seqs))
+
+    def test_wire_non_ascii_not_escaped(self):
+        self.put_policy()
+        self.create_request()
+        self.reject(reason="拒绝")
+        status, raw = self._raw_get("/v1/wallets/w1/audit-events")
+        self.assertEqual(status, 200)
+        # 非 ASCII 原样 UTF-8，不转义为 \uXXXX
+        self.assertIn("拒绝".encode("utf-8"), raw)
+        self.assertNotIn(b"\\u", raw)
+
+    def test_wire_error_bodies_also_compact(self):
+        self.put_policy()
+        for path, want in (
+            ("/v1/wallets/w1/audit-events?limit=0", 400),
+            ("/v1/wallets/ghost/audit-events", 404),
+        ):
+            status, raw = self._raw_get(path)
+            self.assertEqual(status, want)
+            self.assertNotIn(b": ", raw)
+            self.assertFalse(raw.endswith(b"\n"))
+            self.assertIn(b'"error"', raw)
+
+    def test_other_routes_keep_default_wire_format(self):
+        self.put_policy()
+        # 其余 HTTP 路由的响应字节不变（默认分隔符）
+        status, raw = self._raw_get("/v1/wallets/w1")
+        self.assertEqual(status, 200)
+        self.assertIn(b'": "', raw)
 
 
 class AuditAtomicityTest(unittest.TestCase):
