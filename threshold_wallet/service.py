@@ -2542,9 +2542,12 @@ class WalletService:
 
         纯只读：不触发 pending 审批单懒过期、不写任何状态/事件、不分配
         seq。但与其他所有访问钱包状态的路由一致，必须在该钱包事务锁内
-        先自愈他进程崩溃遗留的轮换/资产提交残留，再读取审计：恢复无法
-        对账（RecoveryError/OSError/CorruptDataError）时由调用方转 503，
-        绝不返回可能半完成的公钥/余额/version 之外的不一致现场。
+        先自愈他进程崩溃遗留的轮换/资产提交残留，并按既有 DKG 恢复规则
+        完整重放一次（轮次链、dkg_failover 状态/上下文、健康表、rejoin、
+        reinstate 审批），再读取审计：恢复无法对账
+        （RecoveryError/OSError/CorruptDataError）时由调用方转 503，
+        绝不返回可能半完成的公钥/余额/version 或包含矛盾 dkg_failover
+        事件的不一致现场/部分结果。
 
         存在性判定、分页参数校验与审计读取全部在锁内：绝不先用锁外
         快照决定 404/400，也读不到并发事务半完成状态。"""
@@ -2553,6 +2556,14 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在，再校验分页参数
                 self._get_wallet_or_404(wallet_id)
+                # 审计查询与启动及其他 DKG 路由一致：持锁按**既有 DKG 恢复
+                # 规则**完整重放一次——轮次链、dkg_failover 的 abort/
+                # replace/reinstate/自动替补状态与上下文、node_state 健康表、
+                # node_rejoined 与 reinstate 审批单全部复核。纯只读：不记
+                # 事件、不分配 seq、不触发懒过期、不写任何状态。合法 JSON
+                # 中任何 dkg_failover 状态/上下文矛盾都在此抛 RecoveryError
+                # （由 HTTP 边界转 503），绝不返回包含矛盾事件的部分结果。
+                self._dkg_sessions(wallet_id)
                 seq = (
                     1
                     if from_seq is None
@@ -7370,6 +7381,32 @@ class WalletService:
             )
         return dkg_id, round_no
 
+    def _failover_events_strict(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部 dkg_failover 事件（按 seq 升序）并逐条严格校验
+        **外层七字段键序**为 README 落盘规范序
+        （actor_id,at,details,reason,request_id,seq,type）。
+
+        details 的形状（手工七键 / 自动替补八键）与键序
+        （id,round,action,node,replacement,key,state，自动末加 mode）已在
+        AuditStore 严格加载时先于归一化核对；这里补齐 dkg_failover 独有的
+        **外层**键序核对（其余语义在 _apply_dkg_failover 随轮次链复核）。
+        读取不重排外层，故现场键序即落盘键序：任何重排都是外部篡改的
+        不可对账现场（RecoveryError），绝不静默按 sort_keys 抹平。
+
+        用 events_by_type 而非按 request_id 分组：后者会丢掉 request_id
+        为 null/非字符串的畸形事件，必须让它们进入严格校验而非被静默忽略。
+        纯只读，不分配 seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_DKG_FAILOVER
+        )
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a dkg_failover event whose "
+                    "outer fields are out of the canonical order"
+                )
+        return events
+
     def _dkg_sessions(
         self, wallet_id: str, until_seq: Optional[int] = None
     ) -> dict[str, dict]:
@@ -7418,9 +7455,23 @@ class WalletService:
                 round_no, []
             ).extend(ev for ev in events if _accepted(ev))
         failover_rounds: dict[str, dict[int, list[dict]]] = {}
-        for request_id, events in self._audit.dkg_failover_events(
-            wallet_id
-        ).items():
+        # 严格校验每条 dkg_failover 的外层键序后再按 request_id 分组
+        # （分组方法会丢掉 request_id 畸形的事件，故先校验扁平列表）。
+        failover_events_grouped: dict[str, list[dict]] = {}
+        for failover_event in self._failover_events_strict(wallet_id):
+            # dkg_failover 的 request_id 必须是 <会话id>/<轮次> 字符串：
+            # null/非字符串属不可对账现场（严格加载只保证其为 null 或
+            # 字符串），显式 RecoveryError，绝不静默丢事件。
+            failover_request_id = failover_event.get("request_id")
+            if not isinstance(failover_request_id, str):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a dkg_failover event with a "
+                    "non-string request_id"
+                )
+            failover_events_grouped.setdefault(
+                failover_request_id, []
+            ).append(failover_event)
+        for request_id, events in failover_events_grouped.items():
             dkg_id, round_no = self._parse_dkg_request_id(
                 wallet_id, request_id, failover=True
             )

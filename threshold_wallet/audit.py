@@ -186,8 +186,17 @@ _DETAILS_KEY_ORDER = {
 #: 若先归一再校验，外部对键序的篡改会被静默抹平，故必须在归一化之前核对
 #: **落盘原序**——错序即不可对账现场（RecoveryError），绝不归一。坏 JSON
 #: 在更上层的 json 解析处即为 CorruptDataError。
+#: dkg_failover 与 node_rejoined/share_participant_reinstated 一样：
+#: details 落盘必须恰为 README 既定键序（手工/旧事件七键
+#: id,round,action,node,replacement,key,state；自动替补末加 mode 八键），
+#: 读取时先核对落盘原序，错序即 RecoveryError，绝不先 _order_event_details
+#: 归一而把外部重排静默抹平。
 _STRICT_DETAILS_ORDER_TYPES = frozenset(
-    (TYPE_NODE_REJOINED, TYPE_SHARE_PARTICIPANT_REINSTATED)
+    (
+        TYPE_NODE_REJOINED,
+        TYPE_SHARE_PARTICIPANT_REINSTATED,
+        TYPE_DKG_FAILOVER,
+    )
 )
 
 
