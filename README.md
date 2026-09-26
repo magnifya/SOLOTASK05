@@ -66,6 +66,8 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/chain/{oid}/dispatch` | 请求跨链派发 `{"dispatch_id","adapter_id","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/result` | 上报跨链派发结果回执 `{"adapter_id","state","tx_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/confirm` | 上报跨链派发确认进展 `{"adapter_id","tx_id","block_height","block_hash","confirmations"}` |
+| GET  | `/v1/wallets/{id}/chain/{did}/finality` | 查询跨链派发最终性 `F` |
+| POST | `/v1/wallets/{id}/chain/{did}/settle` | 结算已最终化的跨链派发（空体） |
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
@@ -770,6 +772,51 @@ quorum 后按既有 commit 契约自动提交。
   账本、不写旁路文件、不重记。恢复不新增事件、不改 seq，响应、日志、
   非份额文件绝不泄露份额私钥或份额正文。
 
+### 跨链派发最终性查询与资产结算（finality / settle）
+
+`GET /v1/wallets/{id}/chain/{did}/finality`（仅 GET），`did` 为已派发的
+`dispatch_id`。成功 `200` 返回
+`F={"operation_id","chain_id","confirmation"}`，键序固定，`confirmation`
+取该派发最后一条确认进展（既有 confirm 七键 V）的 `confirmations`
+（无论 `confirming` 还是 `finalized`）。无 `broadcasted` 结果（尚无结果
+或结果为 `failed`）、或尚无任何确认进展一律 `409`；非法 `did` 为 `400`；
+钱包/派发未知 `404`。**纯只读**：不写任何文件、不记事件、不分配 seq。
+
+`POST /v1/wallets/{id}/chain/{did}/settle`（仅 POST），**请求体必须为
+空**（非空体一律 `400`）：把一笔已最终化（确认进展 V 为 `finalized`）的
+跨链派发按既有 commit 契约结算其 pending 资产操作。
+
+- 非法 `did` 为 `400`；钱包/派发未知 `404`；无 `broadcasted` 结果或尚无
+  确认 `409`。
+- **首提前置**：派发归属（adapter）、tx 与事件链一致（与请求/结果/确认
+  同一套复核）；该派发最后一条确认进展为 `finalized`；资产操作仍为
+  `pending`。确认仍为 `confirming`、余额不足（`balance+delta < 0`）或操作
+  已在别处（达门槛 `chain_report`、多源仲裁等）提交，一律 `409` 且**无任何
+  副作用**（不写意图、不改账本、不记事件，余额不足可重试）。
+- 首提 `201` 返回既有资产操作 committed 视图
+  `R={operation_id,asset_id,delta,state,balance,version}`；同 `did` 重放
+  **优先**返回 `200` 同体（不复查确认/余额/操作现状）；跨进程并发只有一个
+  `201`，其余幂等 `200`。
+- 锁内原子结算，`chain_dispatch_settled` 与紧邻的
+  `asset_operation_committed` **两事件同批一次原子落盘**（seq 为 n、n+1，
+  崩溃窗口内绝无孤事件或 seq 缺口）：前者 `request_id=dispatch_id`、
+  `actor_id=adapter_id`、`reason=null`、details 恰含两键且键序
+  `dispatch_id,operation_id`；后者 details 即 committed 视图 R。两事件俱
+  在前滚、俱无回滚（提交意图随附 `{dispatch_id,operation_id}`，恢复据事件
+  是否落盘前滚补齐或回滚 pending 与提交前余额/版本），否则抛
+  `RecoveryError` 并保留现场。
+- 非法 `W`/`D` 为 `400`，钱包/派发未知 `404`；坏 JSON/I/O 分别抛
+  `CorruptDataError`/`OSError`，语义矛盾抛 `RecoveryError`——三者 HTTP
+  一律 `503` 且 `serve` 拒绝就绪。成功体与错误体均为 UTF-8 紧凑 JSON
+  （沿用 confirm 字节规则，非 ASCII 不转义、无末换行），重放不记事件，
+  响应、日志、非份额文件绝不泄露份额私钥或份额正文。
+- 启动、持锁访问与灾备恢复按 seq 逐条复核每条 `chain_dispatch_settled`：
+  请求与 `broadcasted` 结果必须先于结算提交、归属一致（`actor_id` 同请求
+  adapter、`operation_id` 同请求操作）、结算之前必须存在 `finalized` 确认
+  进展、每个派发至多一条结算、且其下一条事件必须紧邻同操作的
+  `asset_operation_committed`。任一矛盾都 fail-closed（抛
+  `RecoveryError`）；恢复不新增事件、不改 seq。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -787,7 +834,7 @@ quorum 后按既有 commit 契约自动提交。
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`、
 `chain_dispatch_requested`、`chain_dispatch_result`、
-`chain_dispatch_confirmation`。
+`chain_dispatch_confirmation`、`chain_dispatch_settled`。
 
 ## 多进程与故障恢复（保证）
 

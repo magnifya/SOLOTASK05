@@ -204,6 +204,18 @@ def chain_vote_shape_ok(vote: object) -> bool:
     return vote["state"] in ("collecting", "conflict", "adopted")
 
 
+def chain_dispatch_settle_shape_ok(settle: object) -> bool:
+    """跨链派发结算随附标识的形状：恰含 dispatch_id/operation_id 两键，
+    均为安全标识。"""
+    if not isinstance(settle, dict):
+        return False
+    if set(settle) != {"dispatch_id", "operation_id"}:
+        return False
+    return _valid_safe_id(
+        settle["dispatch_id"]
+    ) and _valid_safe_id(settle["operation_id"])
+
+
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
     delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
@@ -1148,6 +1160,16 @@ class WalletStore:
         vote = intent.get("vote")
         if vote is not None:
             if not chain_vote_shape_ok(vote) or vote.get("state") != "adopted":
+                return False
+        # 跨链派发结算触发的提交另带可选键 settle
+        # （{dispatch_id,operation_id}）：崩溃恢复据此判定
+        # "chain_dispatch_settled + asset_operation_committed" 两事件
+        # 提交点是否完整。存在即须形状合法，且 operation_id 与本操作一致。
+        settle = intent.get("settle")
+        if settle is not None:
+            if not chain_dispatch_settle_shape_ok(settle):
+                return False
+            if settle["operation_id"] != operation_id:
                 return False
         old_balance = old_asset["balance"] if old_asset is not None else 0
         old_version = old_asset["version"] if old_asset is not None else 0
