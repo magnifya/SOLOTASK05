@@ -72,6 +72,10 @@ TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
 TYPE_CHAIN_ARBITRATION = "chain_arbitration"
 TYPE_CHAIN_VOTE = "chain_vote"
+#: 跨链派发请求（details 即 V={dispatch_id,operation_id,adapter_id,
+#: chain_id,state}；request_id=dispatch_id、actor_id=approval_request_id、
+#: reason 恒为 null）
+TYPE_CHAIN_DISPATCH_REQUESTED = "chain_dispatch_requested"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -178,6 +182,15 @@ _DETAILS_KEY_ORDER = {
         ("sources", "quorum"),
         ("source", "report", "state"),
     ),
+    # chain_dispatch_requested 的 details 即对外视图 V：五键固定序
+    # dispatch_id,operation_id,adapter_id,chain_id,state。
+    TYPE_CHAIN_DISPATCH_REQUESTED: (
+        "dispatch_id",
+        "operation_id",
+        "adapter_id",
+        "chain_id",
+        "state",
+    ),
 }
 
 
@@ -193,6 +206,29 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
     (
         TYPE_NODE_REJOINED,
         TYPE_SHARE_PARTICIPANT_REINSTATED,
+        TYPE_DKG_FAILOVER,
+    )
+)
+
+
+#: 审计事件落盘的外层七字段规范键序（_canonical_event 按 sort_keys 写盘，
+#: 正常现场恒为此序；任何重排都是外部篡改）。
+_AUDIT_OUTER_KEY_ORDER = (
+    "actor_id",
+    "at",
+    "details",
+    "reason",
+    "request_id",
+    "seq",
+    "type",
+)
+
+#: 在归一化前就须按落盘原序严格核对**外层七字段键序**的事件类型集合。
+#: 与 details 键序同理：若先归一再校验，外部对外层键序的篡改会被静默
+#: 抹平，故必须在归一化之前核对落盘原序——错序即不可对账现场
+#: （RecoveryError），加载路径纯只读、绝不写盘。
+_STRICT_OUTER_ORDER_TYPES = frozenset(
+    (
         TYPE_DKG_FAILOVER,
     )
 )
@@ -393,9 +429,10 @@ class AuditStore:
         # 使查询/重建/重写（落盘与灾备）都按该顺序保序。
         #
         # 但归一化会就地重排键序，必须**先**对落盘原序严格的类型核对其
-        # 落盘 details 键序：错序即外部篡改/不可对账（RecoveryError），
-        # 绝不先归一再校验而把错序静默抹平。审计 JSON 本身解析失败已在
-        # WalletStore._read_json 处抛 CorruptDataError。
+        # 落盘 details 键序（及既定类型的外层七字段键序）：错序即外部
+        # 篡改/不可对账（RecoveryError），绝不先归一再校验而把错序静默
+        # 抹平；加载路径纯只读，错序现场绝不写盘。审计 JSON 本身解析失败
+        # 已在 WalletStore._read_json 处抛 CorruptDataError。
         for event in events:
             if (
                 event.get("type") in _STRICT_DETAILS_ORDER_TYPES
@@ -405,6 +442,15 @@ class AuditStore:
                     f"audit log {path!r} has a "
                     f"{event.get('type')} event whose details are out of "
                     "the canonical order"
+                )
+            if (
+                event.get("type") in _STRICT_OUTER_ORDER_TYPES
+                and list(event) != list(_AUDIT_OUTER_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"audit log {path!r} has a "
+                    f"{event.get('type')} event whose outer fields are out "
+                    "of the canonical order"
                 )
         for event in events:
             _order_event_details(event)

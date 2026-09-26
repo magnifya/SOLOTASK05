@@ -554,6 +554,37 @@ class DkgFailoverServiceTest(unittest.TestCase):
         with self.assertRaises(RecoveryError):
             WalletService(self.h.store)
 
+    def test_reordered_failover_outer_fields_is_fail_closed(self):
+        # 落盘外层七字段须为规范序 actor_id,at,details,reason,request_id,
+        # seq,type：加载在归一化之前核对落盘原序，错序即 RecoveryError
+        # 且绝不写盘（乱序现场原样保留）。
+        self._register_pair()
+        self._commit_pair()
+        code, _ = self._failover(
+            "d1", 2, "replace", node="n2", replacement="n3", key=KEY_C
+        )
+        self.assertEqual(code, 201)
+        path = os.path.join(self.d, "audit", "w1.json")
+        with open(path, encoding="utf-8") as f:
+            log = json.load(f)
+        for i, event in enumerate(log["events"]):
+            if event["type"] == "dkg_failover":
+                # 篡改：重排落盘外层七字段（值不变，仅键序非规范序）
+                reordered = {"type": event["type"]}
+                for key, value in event.items():
+                    if key != "type":
+                        reordered[key] = value
+                log["events"][i] = reordered
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(log, f)
+        with open(path, "rb") as f:
+            before = f.read()
+        with self.assertRaises(RecoveryError):
+            WalletService(self.h.store)
+        # 加载 fail-closed 且绝不写盘：乱序现场原样保留
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_missing_failover_event_is_fail_closed(self):
         self._register_pair()
         self._commit_pair()

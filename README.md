@@ -63,6 +63,7 @@ python -m unittest discover -s tests -v
 | PUT  | `/v1/wallets/{id}/chain/{asset_id}/arbitration` | 多源仲裁策略 `{"sources","quorum"}` |
 | GET  | `/v1/wallets/{id}/chain/{asset_id}/arbitration` | 查询多源仲裁策略（未配置 404） |
 | POST | `/v1/wallets/{id}/chain/{oid}/observe` | 多源观察上报 `{"source","report"}` |
+| POST | `/v1/wallets/{id}/chain/{oid}/dispatch` | 跨链派发请求 `{"dispatch_id","adapter_id","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
@@ -280,6 +281,9 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   `request_id` 为 `<会话id>/<轮次>`，`reason` 恒为 `null`；手工/旧事件
   details 依次 `id,round,action,node,replacement,key,state`（K 原位
   展开）；自动替补事件为既有七键加末键 `mode`（`mode=auto`））。
+  **加载时在归一化之前核对落盘外层七字段键序与 details 既定键序，
+  错序即不可对账现场（`RecoveryError`），且加载路径纯只读、绝不
+  写盘。**
   **`abort`/`replace`（含自动替补）的 `actor_id` 为 `null`、details
   不含审批标识；唯独 `reinstate` 的 `actor_id=approval_request_id` 非
   null、details 仍为同样七键、`state=commit`。** 首提在每钱包跨进程
@@ -648,6 +652,42 @@ quorum 后按既有 commit 契约自动提交。
   与灾备恢复后视图与 seq 连续不变；恢复不重报、不提交、不新增审计事件、
   不改 seq。
 
+### 跨链派发（可选）
+
+按资产配置链确认策略后，可为该资产的 `pending` 操作提交一次跨链
+派发请求（把资产操作派发给链下适配器执行）。
+
+`POST /v1/wallets/{id}/chain/{oid}/dispatch`（仅 POST），`oid` 为
+资产操作 id。请求体 B 恰含
+`{"dispatch_id","adapter_id","approval_request_id"}` 三键（含其他键
+或缺键一律 `400`）：三者均为安全标识
+`[A-Za-z0-9_-]{1,128}`，值非安全 ID 一律 `400`；钱包、操作、该
+资产的链确认策略、同钱包审批单任一未知 `404`。
+
+- **首提前置**：操作仍为 `pending`、该资产链策略已启用
+  （`enabled:true`）、审批单经锁内懒过期后为 `approved`，且其
+  `message` 与紧凑 JSON **逐字一致**（无空格、键序固定为
+  `operation_id,dispatch_id,adapter_id,chain_id`）：
+  `{"operation_id":"O","dispatch_id":"D","adapter_id":"A","chain_id":"C"}`，
+  其中 `chain_id` 取策略链。任一不满足 `409`，现场不变、不记事件。
+- 首提 `201` 返回
+  `V={dispatch_id,operation_id,adapter_id,chain_id,state=requested}`
+  （键序如列，`state` 恒为 `requested`）。同 `dispatch_id` 同参
+  重放 `200` 同 V（**优先于状态与审批复查**）；同 `dispatch_id`
+  异参、或该操作已有派发一律 `409`。
+- `chain_dispatch_requested` 审计事件是唯一提交点：
+  `request_id=dispatch_id`、`actor_id=approval_request_id`、
+  `reason=null`、details 即 V（五键既定序落盘，落盘外层七字段为
+  规范序）；事件在每钱包跨进程事务锁内追加，事件之外不写任何
+  状态文件，跨进程并发只有一个 `201`，失败/重放不记该事件。
+- 恢复按 seq 重放并逐条复核：事件外层七字段为落盘规范序、
+  details 五键既定序、`state=requested`、同一 `dispatch_id`/同一
+  操作不重复、操作在事件提交前未达终态、当时策略已启用且链一致、
+  同钱包审批单存在、message 逐字一致且状态 approved/signed。
+  矛盾/损坏/I/O 失败一律 fail-closed（`RecoveryError`/
+  `CorruptDataError`/`OSError` → 常驻 `503`、`serve` 拒绝就绪），
+  恢复不新增事件、不改 seq，响应与日志绝不泄露份额私钥。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -663,7 +703,8 @@ quorum 后按既有 commit 契约自动提交。
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
-`chain_report`、`chain_arbitration`、`chain_vote`。
+`chain_report`、`chain_arbitration`、`chain_vote`、
+`chain_dispatch_requested`。
 
 ## 多进程与故障恢复（保证）
 
