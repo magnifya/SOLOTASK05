@@ -31,6 +31,7 @@
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/observe 多源观察上报
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/dispatch 请求跨链派发
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/result 上报跨链派发结果回执
+- POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/confirm 上报跨链派发链上确认
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
@@ -618,6 +619,41 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("adapter_id"),
                         body.get("state"),
                         body.get("tx_id"),
+                    )
+                    self._send_json_compact(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "confirm"
+                ):
+                    # 派发链上确认：成功体与错误体均为 UTF-8 紧凑 JSON
+                    # （非 ASCII 不转义、无末换行），同 result。
+                    self._compact_response = True
+                    body = self._read_json_body()
+                    # 请求体仅允许 adapter_id/tx_id/block_height/block_hash/
+                    # confirmations 五键（值类型/取值由 service 校验）
+                    if set(body) != {
+                        "adapter_id",
+                        "tx_id",
+                        "block_height",
+                        "block_hash",
+                        "confirmations",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly adapter_id, tx_id, "
+                            "block_height, block_hash and confirmations",
+                        )
+                    status, result = service.post_chain_dispatch_confirmation(
+                        wallet_id,
+                        rest[1],
+                        body.get("adapter_id"),
+                        body.get("tx_id"),
+                        body.get("block_height"),
+                        body.get("block_hash"),
+                        body.get("confirmations"),
                     )
                     self._send_json_compact(status, result)
                     return
