@@ -69,7 +69,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
 | POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
 | GET  | `/v1/dkg/{id}/{did}` | 查询两方 DKG 会话视图 |
-| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}`（启用故障审批时另加 `approval_request_id`） |
+| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}`（启用故障审批或 `reinstate` 时另加 `approval_request_id`） |
 
 ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -241,10 +241,12 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
 `POST /v1/dkg/{id}/{did}/failover`（仅 POST）。DKG 故障审批开关缺省
 **关闭**（见下文「DKG 故障审批」）：关闭时请求体恰含
 `{"round","action","node","replacement","key"}` 五键（含其他键或缺键
-一律 `400`）。当某方节点故障时，从当前轮派生下一轮（`round` 必须恰为
-当前轮 +1）——首轮故障基于基线轮（第 1 轮），后续故障基于当前轮。
-`node`/`replacement` 为安全标识。开关启用时请求体在旧五键之外恰增
-`approval_request_id` 一键，其余契约不变。
+一律 `400`），**`reinstate` 例外——恒须另加 `approval_request_id`
+一键（见下文「DKG 故障节点复职（reinstate）」）**。当某方节点故障时，
+从当前轮派生下一轮（`round` 必须恰为当前轮 +1）——首轮故障基于基线轮
+（第 1 轮），后续故障基于当前轮。`node`/`replacement` 为安全标识。
+开关启用时请求体在旧五键之外恰增 `approval_request_id` 一键，其余契约
+不变（`reinstate` 无论开关都恰为这六键）。
 
 - `abort`：仅限非终态轮（非 `done`/`aborted`），`node`/`replacement`/
   `key` 必须全为 `null`；派生轮 `state` 为 `aborted`，三数组为空。
@@ -254,23 +256,41 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   `shared` 两数组清空，回到 `commit` 阶段。非法 `400`、冲突 `409`。
   另支持 `replacement`/`key` 双 `null` 的**自动替补**（见下文
   「DKG 节点健康与自动替补」）；一项 `null` 另一项非 `null` 为 `400`。
+- `reinstate`：请求体恰含旧五键及 `approval_request_id` 六键（审批
+  开关**不豁免**，开关关闭同样强制）。沿用 `replace` 的换槽派生契约，
+  但 `replacement` 额外须为**已提交 `node_rejoined` 事件对应**、且在
+  当前生效健康表中为 `up` 的空闲（非当前轮参与）节点，`key` 须与其
+  健康表公钥一致；`node` 仍须为当前轮在用节点。详见下文「DKG 故障
+  节点复职（reinstate）」。非法 `400`、冲突/未批准 `409`。
 - 首提 `201`；已提交轮次的旧五键同参重放 `200`（**优先于状态与审批
   判定，不复查审批单**）；同 `round` 异参 `409`；`round` 不等于
   当前轮 +1 `409`；钱包/会话未知 `404`。自动替补（双 `null`）的重放
-  规则见下文「DKG 节点健康与自动替补」。
+  规则见下文「DKG 节点健康与自动替补」。**`reinstate` 须六字段
+  （旧五键及 `approval_request_id`）全同方按重放 `200`；更换审批单
+  或任一值一律 `409`。**
 - 无任何故障轮次时，`/v1/dkg/{id}/{did}` 无需参照轮次（行为与旧版
   一致）；存在故障轮次后必须带 `?round=R` 当前轮：缺参 `409`、旧轮
   `409`、未知轮 `404`、非法 R `400`；GET 成功 `200`，POST 体仍为旧
   五键。`aborted` 轮一律 `409`；派生轮不接受 `register`（`409`），
   `commit`/`share` 沿用旧约。
-- 故障轮次仅由 `dkg_failover` 审计事件持久化（`request_id` 为
-  `<会话id>/<轮次>`，`actor_id`/`reason` 为 `null`，手工/旧事件
-  details 依次 `id,round,action,node,replacement,key,state`；自动替补
-  事件为既有七键加末键 `mode`（`mode=auto`），**不含审批标识**）：
-  首提在每钱包跨进程事务锁内追加，事件为唯一提交点，跨进程并发只有
-  一个 `201`，重放不记。矛盾/损坏现场 fail-closed（常驻 `503`、
-  `serve` 拒绝就绪），重启/灾备恢复后轮次与 seq 不变。响应、日志、
-  非份额文件绝不含私钥或份额正文。
+- 故障轮次仅由 `dkg_failover` 审计事件持久化（逻辑键序
+  `seq,type,at,request_id,actor_id,reason,details`，落盘外层七字段为
+  规范序 `actor_id,at,details,reason,request_id,seq,type`；
+  `request_id` 为 `<会话id>/<轮次>`，`reason` 恒为 `null`；手工/旧事件
+  details 依次 `id,round,action,node,replacement,key,state`（K 原位
+  展开）；自动替补事件为既有七键加末键 `mode`（`mode=auto`））。
+  **`abort`/`replace`（含自动替补）的 `actor_id` 为 `null`、details
+  不含审批标识；唯独 `reinstate` 的 `actor_id=approval_request_id` 非
+  null、details 仍为同样七键、`state=commit`。** 首提在每钱包跨进程
+  事务锁内追加，事件为唯一提交点，跨进程并发只有一个 `201`，重放不记。
+  恢复对 `reinstate` 按 `actor_id` 复核同钱包审批单（存在、message
+  逐字为 dkg_id 后接 K 的紧凑 JSON、状态 approved/signed），并核验
+  replacement 在事件提交之前的生效健康表（最近 `node_state` 快照折叠
+  其间更早 rejoin 翻转）中为 up 空闲节点、key 一致、且有更早提交的
+  `node_rejoined` 对应；abort/replace 仍按旧契约（`actor_id` 必须为
+  null）。矛盾/损坏现场 fail-closed（常驻 `503`、`serve` 拒绝就绪），
+  重启/灾备恢复后轮次与 seq 不变。响应、日志、非份额文件绝不含私钥或
+  份额正文。
 
 ### DKG 节点健康与自动替补（可选）
 
@@ -358,10 +378,52 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   `commit|share`、N 不占槽；同钱包审批单存在且 message 逐字一致、状态
   为 `approved`（其后经 `/sign` 推进为 `signed` 亦认可）。重复
   `rejoin_id`、事前无快照或任何矛盾都 fail-closed（抛
-  `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件 I/O
-  失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。恢复不
-  新增事件、不改 seq，响应、日志、非份额文件绝不泄露份额私钥或份额
-  正文。
+  `RecoveryError`）；`node_rejoined` 的 details 键序在审计读取归一化
+  **之前**校验（落盘必须恰为 `rejoin_id,dkg_id,round,node,key,state`，
+  错序即 `RecoveryError`，绝不先归一而抹平重排）；审计 JSON 损坏抛
+  `CorruptDataError`、审计文件 I/O 失败抛 `OSError`——三者 HTTP 一律
+  `503`、`serve` 拒绝就绪。恢复不新增事件、不改 seq，响应、日志、非
+  份额文件绝不泄露份额私钥或份额正文。
+
+### DKG 故障节点复职（reinstate）
+
+`POST /v1/dkg/{id}/{did}/failover` 的 `action="reinstate"`：把一个经
+rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（与 `replace`
+一样派生下一轮、清空 `committed`/`shared` 回到 `commit`）。请求体恰含
+`{"round","action","node","replacement","key","approval_request_id"}`
+六键（K 即前五字段；含其他键或缺键一律 `400`），**DKG 故障审批开关不
+豁免**——开关关闭时 `reinstate` 仍强制带 `approval_request_id`（五键
+提交 `400`）。
+
+- 取值与 `replace` 一致：`round` 须恰为当前轮 +1，`node`/`replacement`
+  为安全标识，`key` 为 64 位小写 hex，`node` 须为当前轮在用节点、
+  `replacement` 须空闲。额外前置：`replacement` 必须是某条**已提交
+  `node_rejoined` 事件对应**的节点、且在当前生效健康表（最后
+  `node_state` 快照折叠其后 rejoin 翻转）中为 `up`，提交 `key` 须与其
+  健康表公钥一致。无健康表、节点未 rejoin、当前非 up、key 不符、阶段/
+  槽位不满足，一律 `409` 且不落事件、DKG 现场不变。
+- **审批**：`approval_request_id` 必须指向**同一钱包**既有且为
+  `approved` 的审批单（操作前按既有契约懒过期）；其 `message` 必须与
+  紧凑 JSON **逐字一致**（无空格、键序固定，dkg_id 后接 K）：
+  `{"dkg_id":"D","round":R,"action":"reinstate","node":N,"replacement":X,"key":K}`。
+  审批单未知、非 approved、message 不符一律 `409`。
+- 首提 `201` 返回派生轮视图。**重放须六字段（K 及
+  `approval_request_id`）全同才 `200`（优先于状态与审批判定，不复查
+  审批单现状）；更换审批单或 K 中任一值一律 `409`。**
+- 提交点为唯一 `dkg_failover` 事件：`request_id=<dkg_id>/<round>`、
+  `actor_id=approval_request_id`（**非 null**）、`reason=null`，
+  details 仍依次 `id,round,action,node,replacement,key,state`
+  （`state=commit`，K 原位展开），不含 mode。**仅 reinstate 的
+  actor_id 非 null；abort/replace 仍为 null，其余契约不变。**
+- 重启/灾备恢复时按 `actor_id` 复核：同钱包审批单存在、message 逐字
+  一致、状态 approved（其后推进为 signed 亦认可）；replacement 在该
+  事件提交之前的生效健康表（最近快照折叠其间更早 rejoin 翻转）中为
+  up 空闲节点、key 一致，且有一条更早提交的 `node_rejoined` 与之
+  对应。审批单缺失/未批准/message 不符、事前无快照、replacement 当时
+  非 up/key 不符/占槽、无更早 rejoin 或任何矛盾都 fail-closed（抛
+  `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、I/O 失败抛
+  `OSError`——HTTP 一律 `503`、`serve` 拒绝就绪。恢复不新增事件、不改
+  seq。
 
 ### DKG 故障审批（可选）
 
@@ -376,19 +438,23 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   拒绝就绪），重启/灾备恢复后开关与 seq 不变。
 - 开关启用时 `POST .../failover` 请求体恰收旧五键及
   `approval_request_id`（匹配安全标识，非法/缺失 `400`）；关闭时
-  夹带该键一律 `400`。
+  夹带该键一律 `400`。**`action="reinstate"` 不受开关影响：无论开关
+  开关都恰收六键（恒须 `approval_request_id`），见「DKG 故障节点
+  复职（reinstate）」。**
 - `approval_request_id` 必须指向**同一钱包**既有审批单；审批工作流
   沿用 sign-requests 契约（须先配置审批策略、建单并批准）。审批单
   `message` 必须与紧凑 JSON **逐字一致**（无空格、键序固定）：
   `{"dkg_id":"D","round":R,"action":"A","node":N,"replacement":X,"key":K}`，
-  其中 N/X/K 按旧五键约定为字符串或 `null`。
+  其中 N/X/K 按旧五键约定为字符串或 `null`（`reinstate` 三值均为
+  字符串）。
 - 审批单为 `approved` 且提交轮次恰为当前轮 +1 时故障方可执行
   （`201`）；审批单未知、`pending`、`rejected`、`expired`（操作前
   按既有契约懒过期）、message 不符，或审批通过但轮次已变化，一律
   `409` 且不追加事件、DKG 现场不变。
 - 已提交轮次的旧五键同参重放优先返回 `200`，不再复查开关与审批单
   现状（审批单事后被拒绝/过期、开关切换都不影响幂等重放）；异参仍
-  `409`。
+  `409`。**`reinstate` 的重放须六字段（含 `approval_request_id`）
+  全同才 `200`，更换审批单或任一值 `409`。**
 - 审批检查、事件追加与 DKG 轮次派生全在同一把每钱包跨进程事务锁内
   原子完成，跨进程并发同一轮次只有一个 `201`，审计 seq 连续不重号。
 

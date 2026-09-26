@@ -34,6 +34,7 @@ from typing import Optional
 
 from .store import (
     CorruptDataError,
+    RecoveryError,
     WalletStore,
     _check_id,
     _SAFE_ID,
@@ -168,6 +169,33 @@ _DETAILS_KEY_ORDER = {
         ("source", "report", "state"),
     ),
 }
+
+
+#: 在归一化前就须按 README 既定键序严格核对 details 的事件类型集合。
+#: 这些事件的 details 落盘保序、读取时由 _order_event_details 就地重排；
+#: 若先归一再校验，外部对键序的篡改会被静默抹平，故必须在归一化之前核对
+#: **落盘原序**——错序即不可对账现场（RecoveryError），绝不归一。坏 JSON
+#: 在更上层的 json 解析处即为 CorruptDataError。
+_STRICT_DETAILS_ORDER_TYPES = frozenset((TYPE_NODE_REJOINED,))
+
+
+def _stored_details_has_canonical_order(event: dict) -> bool:
+    """判定一条落盘事件的 details 是否恰为 README 既定键序（归一化之前）。
+
+    仅用于 :data:`_STRICT_DETAILS_ORDER_TYPES` 中的类型。对带多种精确
+    键集的类型，details 键集须恰等于其中某一种既定键序；否则即视为错序。
+    """
+    order = _DETAILS_KEY_ORDER.get(event.get("type"))
+    details = event.get("details")
+    if order is None or not isinstance(details, dict):
+        return True
+    if order and isinstance(order[0], tuple):
+        return any(
+            list(details) == list(candidate)
+            for candidate in order
+            if set(details) == set(candidate)
+        )
+    return list(details) == list(order)
 
 
 def _order_event_details(event: dict) -> None:
@@ -344,6 +372,21 @@ class AuditStore:
                 )
         # 既定事件类型的 details 在内存视图中归一为 README 既定键序，
         # 使查询/重建/重写（落盘与灾备）都按该顺序保序。
+        #
+        # 但归一化会就地重排键序，必须**先**对落盘原序严格的类型核对其
+        # 落盘 details 键序：错序即外部篡改/不可对账（RecoveryError），
+        # 绝不先归一再校验而把错序静默抹平。审计 JSON 本身解析失败已在
+        # WalletStore._read_json 处抛 CorruptDataError。
+        for event in events:
+            if (
+                event.get("type") in _STRICT_DETAILS_ORDER_TYPES
+                and not _stored_details_has_canonical_order(event)
+            ):
+                raise RecoveryError(
+                    f"audit log {path!r} has a "
+                    f"{event.get('type')} event whose details are out of "
+                    "the canonical order"
+                )
         for event in events:
             _order_event_details(event)
         return data
