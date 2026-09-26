@@ -64,6 +64,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/chain/{asset_id}/arbitration` | 查询多源仲裁策略（未配置 404） |
 | POST | `/v1/wallets/{id}/chain/{oid}/observe` | 多源观察上报 `{"source","report"}` |
 | POST | `/v1/wallets/{id}/chain/{oid}/dispatch` | 请求跨链派发 `{"dispatch_id","adapter_id","approval_request_id"}` |
+| POST | `/v1/wallets/{id}/chain/{did}/result` | 上报跨链派发结果回执 `{"adapter_id","state","tx_id"}` |
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
@@ -695,6 +696,38 @@ quorum 后按既有 commit 契约自动提交。
   `503`、`serve` 拒绝就绪。恢复不新增事件、不改 seq，响应、日志、非
   份额文件绝不泄露份额私钥或份额正文。
 
+### 跨链派发结果回执（result）
+
+`POST /v1/wallets/{id}/chain/{did}/result`（仅 POST），`did` 为已派发
+的 `dispatch_id`。请求体 B 恰含 `{"adapter_id","state","tx_id"}` 三键
+（含其他键或缺键一律 `400`）：链上适配器回执一笔跨链派发的最终
+结果。
+
+- `did`/`adapter_id` 均须匹配安全标识 `[A-Za-z0-9_-]{1,128}`；
+  `state` 为 `broadcasted` 或 `failed`；`state=broadcasted` 时 `tx_id`
+  为 64 位小写 hex，`state=failed` 时 `tx_id` 为 `null`。键集/类型/
+  值错一律 `400`；钱包或派发未知 `404`；`adapter_id` 与派发归属不符、
+  或同 `dispatch_id` 异参重报一律 `409`。
+- 成功 `201` 返回
+  `V={"dispatch_id","operation_id","adapter_id","chain_id","state","tx_id"}`，
+  键序固定（`operation_id`/`chain_id` 取自派发请求）。同 `dispatch_id`
+  **同参**（`adapter_id`/`state`/`tx_id` 全同）重放 `200` 返回同一 V
+  （优先于一切现状判定）；同 `dispatch_id` **异参** `409`。
+- 结果仅由审计事件持久化：`chain_dispatch_result` 是唯一提交点
+  （`request_id=dispatch_id`、`actor_id=adapter_id`、`reason=null`、
+  details 即 V，键序
+  `dispatch_id,operation_id,adapter_id,chain_id,state,tx_id`），不另写
+  结果状态文件。首提在每钱包跨进程事务锁内追加，跨进程并发只有一个
+  `201`（其余同参 `200`），审计 seq 连续不重号，重放不记事件。
+- 启动及持锁访问按 seq 逐条复核每条 `chain_dispatch_result`：请求
+  （同一 `dispatch_id` 的 `chain_dispatch_requested`）必须**先于**
+  结果提交、归属一致（`operation_id`/`adapter_id`/`chain_id` 与请求
+  相同）、每个派发至多一条结果。任一矛盾都 fail-closed（抛
+  `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件
+  I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪，
+  保留现场、不增 seq。恢复不新增事件、不改 seq，响应、日志、非
+  份额文件绝不泄露份额私钥或份额正文。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -711,7 +744,7 @@ quorum 后按既有 commit 契约自动提交。
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`、
-`chain_dispatch_requested`。
+`chain_dispatch_requested`、`chain_dispatch_result`。
 
 ## 多进程与故障恢复（保证）
 

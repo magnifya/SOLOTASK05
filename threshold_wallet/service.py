@@ -66,6 +66,10 @@ DKG_FAILOVER_ACTIONS = ("abort", "replace", "reinstate")
 #: DKG 节点健康状态：up 在用可用、down 离线、ban 封禁
 DKG_NODE_STATES = ("up", "down", "ban")
 
+#: 跨链派发结果回执 state 取值：broadcasted 已播链（带 tx_id）、failed
+#: 失败（tx_id 为 null）
+DISPATCH_RESULT_STATES = ("broadcasted", "failed")
+
 #: 审计事件落盘的外层七字段规范键序（audit 写盘按 sort_keys，惟既定
 #: 类型 details 保序）。恢复据此核对事件**外层**未被重排：正常现场恒为
 #: 此序，任何重排都是外部篡改，按不可对账现场 fail-closed。
@@ -262,6 +266,7 @@ class WalletService:
         self._reconcile_chain_events(wallet_id)
         self._reconcile_chain_arbitration_events(wallet_id)
         self._reconcile_chain_dispatch_events(wallet_id)
+        self._reconcile_chain_dispatch_result_events(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
     def _reconcile_dkg_events_locked(self, wallet_id: str) -> None:
@@ -366,6 +371,10 @@ class WalletService:
             # 跨链派发事件（chain_dispatch_requested）与账本/策略/审批单
             # 对账：逐事件按提交前现场复核，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_dispatch_events(wallet_id)
+            # 跨链派发结果回执（chain_dispatch_result）与派发请求对账：
+            # 请求先于结果、归属一致、每派发至多一结果，矛盾/损坏
+            # fail-closed；纯只读。
+            self._reconcile_chain_dispatch_result_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/
             # rejoin/share-bind）仅由审计事件持久化：按既有 DKG 恢复规则
@@ -505,6 +514,9 @@ class WalletService:
                 # 跨链派发事件与账本/策略/审批单同属账本一致性：账本存在
                 # 时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_dispatch_events(wallet_id)
+                # 派发结果回执与派发请求的先后/归属同属账本一致性：账本
+                # 存在时一并按 seq 重放对账，矛盾即 fail-closed。
+                self._reconcile_chain_dispatch_result_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
@@ -4231,6 +4243,17 @@ class WalletService:
         "state",
     )
 
+    #: dispatch 结果回执视图 V / chain_dispatch_result 事件 details 的固定
+    #: 键序
+    _DISPATCH_RESULT_VIEW_KEY_ORDER = (
+        "dispatch_id",
+        "operation_id",
+        "adapter_id",
+        "chain_id",
+        "state",
+        "tx_id",
+    )
+
     @staticmethod
     def _dispatch_approval_message(
         operation_id: str,
@@ -4621,6 +4644,310 @@ class WalletService:
                         audit.TYPE_CHAIN_DISPATCH_REQUESTED,
                         request_id=dispatch_id,
                         actor_id=approval_request_id,
+                        reason=None,
+                        details=view,
+                    ),
+                )
+                return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    # ---- 跨链派发结果回执 -------------------------------------------------
+
+    def _dispatch_result_view(
+        self,
+        dispatch_id: str,
+        operation_id: str,
+        adapter_id: str,
+        chain_id: str,
+        state: str,
+        tx_id,
+    ) -> dict:
+        """dispatch 结果回执成功/重放响应体 V（六键固定序）。"""
+        return {
+            "dispatch_id": dispatch_id,
+            "operation_id": operation_id,
+            "adapter_id": adapter_id,
+            "chain_id": chain_id,
+            "state": state,
+            "tx_id": tx_id,
+        }
+
+    def _dispatch_result_events_strict(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部 chain_dispatch_result 事件（按 seq 升序）并逐条
+        严格校验**形状**（外层七字段键序、request_id==dispatch_id、
+        actor_id 为安全标识且与 details.adapter_id 一致、reason 为 null、
+        details 恰为六键 V 且键序固定、state/tx_id 取值合法）。
+
+        与请求事件一致，这里只做与现场无关的形状校验；与派发请求的归属/
+        先后语义复核在 :meth:`_reconcile_chain_dispatch_result_events` 按
+        事件 seq 完成。任何形状畸形都是不可对账现场（RecoveryError）。纯
+        只读，不分配 seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_RESULT
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_result "
+                    "event whose outer fields are out of the canonical order"
+                )
+            dispatch_id = event.get("request_id")
+            actor_id = event.get("actor_id")
+            if (
+                not isinstance(dispatch_id, str)
+                or not ROTATION_ID_RE.match(dispatch_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_result "
+                    "event with a malformed dispatch_id"
+                )
+            if dispatch_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"chain_dispatch_result events for {dispatch_id!r}"
+                )
+            seen.add(dispatch_id)
+            if not (
+                isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} has a malformed adapter_id"
+                )
+            if event.get("reason") is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} has a non-null reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details)
+                != list(self._DISPATCH_RESULT_VIEW_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} has malformed details"
+                )
+            if details["dispatch_id"] != dispatch_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} details dispatch_id disagrees with "
+                    "its request_id"
+                )
+            for name in ("operation_id", "adapter_id", "chain_id"):
+                value = details[name]
+                if not isinstance(value, str) or not ROTATION_ID_RE.match(
+                    value
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_result "
+                        f"{dispatch_id!r} has a malformed {name}"
+                    )
+            if details["adapter_id"] != actor_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} details adapter_id disagrees with its "
+                    "actor_id"
+                )
+            state = details["state"]
+            tx_id = details["tx_id"]
+            if state == "broadcasted":
+                if not _is_lower_hex_32(tx_id):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_result "
+                        f"{dispatch_id!r} broadcasted result has a malformed "
+                        "tx_id"
+                    )
+            elif state == "failed":
+                if tx_id is not None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_result "
+                        f"{dispatch_id!r} failed result has a non-null tx_id"
+                    )
+            else:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} has an invalid state"
+                )
+        return events
+
+    def _reconcile_chain_dispatch_result_events(
+        self, wallet_id: str
+    ) -> None:
+        """按 seq 严格复核全部 chain_dispatch_result 事件（调用方须持钱包
+        事务锁）。
+
+        每条结果都以其**提交之前**的现场复核：
+
+        - 存在同一 dispatch_id 的 chain_dispatch_requested，且其 seq 严格
+          早于结果事件（请求先于结果）；
+        - 归属一致：结果的 operation_id/adapter_id/chain_id 与请求 V 完全
+          相同；
+        - 每个派发至多一条结果（同 dispatch_id 重复已在形状校验拦截）。
+
+        任一不满足都是不可对账现场（RecoveryError，fail-closed，保留
+        现场）。纯只读，不记事件、不改 seq、不写状态。"""
+        events = self._dispatch_result_events_strict(wallet_id)
+        if not events:
+            return
+        requests = self._dispatch_events_strict(wallet_id)
+        request_by_dispatch: dict[str, dict] = {}
+        for event in requests:
+            # 重复 dispatch_id 已在 _dispatch_events_strict 拦截。
+            request_by_dispatch[event["request_id"]] = event
+        for event in events:
+            details = event["details"]
+            dispatch_id = details["dispatch_id"]
+            request = request_by_dispatch.get(dispatch_id)
+            if request is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_result "
+                    f"event for {dispatch_id!r} without a preceding dispatch "
+                    "request"
+                )
+            if request["seq"] >= event["seq"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_result "
+                    f"{dispatch_id!r} does not follow its dispatch request"
+                )
+            saved = request["details"]
+            for name in ("operation_id", "adapter_id", "chain_id"):
+                if details[name] != saved[name]:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_result "
+                        f"{dispatch_id!r} {name} disagrees with its dispatch "
+                        "request"
+                    )
+
+    def post_chain_dispatch_result(
+        self,
+        wallet_id: str,
+        dispatch_id: object,
+        adapter_id: object,
+        state: object,
+        tx_id: object,
+    ) -> tuple[int, dict]:
+        """上报跨链派发结果回执，返回 (HTTP 状态码, 视图
+        V={dispatch_id,operation_id,adapter_id,chain_id,state,tx_id})。
+
+        请求体恰含 adapter_id,state,tx_id 三键（HTTP 边界拦键集）；路径
+        D 与 adapter_id 须为安全标识；state=broadcasted 时 tx_id 为 64 位
+        小写 hex，state=failed 时 tx_id 为 null；键集/类型/值错 400；钱包
+        /派发未知 404；adapter 与派发不符、或同 dispatch_id 异参重报 409。
+
+        首提 201；同参（adapter_id/state/tx_id 全同）重放 200 返回同一 V
+        （优先于一切现状判定）。chain_dispatch_result 是唯一提交点
+        （request_id=dispatch_id、actor_id=adapter_id、reason=null、
+        details=V）；锁内并发只有一个 201，重放不记事件。恢复检查、校验、
+        状态判定与事件追加全部在锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、报告、票、派发请求/结果、操作与相邻
+                # 提交事件：矛盾现场 fail-closed，优先于参数 400/404 判定。
+                self._reconcile_chain_state_locked(wallet_id)
+                # 类型/取值校验（400）
+                for name, value in (
+                    ("dispatch_id", dispatch_id),
+                    ("adapter_id", adapter_id),
+                ):
+                    if not isinstance(value, str) or not ROTATION_ID_RE.match(
+                        value
+                    ):
+                        raise ServiceError(
+                            400,
+                            f"{name} must match [A-Za-z0-9_-]{{1,128}}",
+                        )
+                if state not in DISPATCH_RESULT_STATES:
+                    raise ServiceError(
+                        400,
+                        "state must be broadcasted or failed",
+                    )
+                if state == "broadcasted":
+                    if not _is_lower_hex_32(tx_id):
+                        raise ServiceError(
+                            400,
+                            "tx_id must be 64 lowercase hex characters when "
+                            "state is broadcasted",
+                        )
+                elif tx_id is not None:
+                    raise ServiceError(
+                        400,
+                        "tx_id must be null when state is failed",
+                    )
+
+                results = self._audit.chain_dispatch_result_events(wallet_id)
+                # 幂等/异参冲突优先于派发存在性判定：已提交的结果只按全参
+                # 比较回放，不复查请求/现场现状。
+                committed = results.get(dispatch_id)
+                if committed:
+                    if len(committed) != 1:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has multiple "
+                            f"chain_dispatch_result events for "
+                            f"{dispatch_id!r}"
+                        )
+                    saved = committed[0]["details"]
+                    if (
+                        saved["adapter_id"] == adapter_id
+                        and saved["state"] == state
+                        and saved["tx_id"] == tx_id
+                    ):
+                        return 200, dict(saved)
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} already has a result with "
+                        "different parameters",
+                    )
+
+                # 404：派发请求未知
+                requests = self._audit.chain_dispatch_requested_events(
+                    wallet_id
+                )
+                grouped = requests.get(dispatch_id)
+                if not grouped:
+                    raise ServiceError(
+                        404, f"dispatch {dispatch_id!r} not found"
+                    )
+                if len(grouped) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple "
+                        f"chain_dispatch_requested events for "
+                        f"{dispatch_id!r}"
+                    )
+                request_details = grouped[0]["details"]
+
+                # 409：上报方适配器与派发归属不符
+                if request_details["adapter_id"] != adapter_id:
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} belongs to another adapter",
+                    )
+
+                view = self._dispatch_result_view(
+                    dispatch_id,
+                    request_details["operation_id"],
+                    request_details["adapter_id"],
+                    request_details["chain_id"],
+                    state,
+                    tx_id,
+                )
+                # chain_dispatch_result 是唯一提交点：在跨进程事务锁内追加
+                # 事件；事件之外不写任何派发结果状态文件。
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_DISPATCH_RESULT,
+                        request_id=dispatch_id,
+                        actor_id=adapter_id,
                         reason=None,
                         details=view,
                     ),

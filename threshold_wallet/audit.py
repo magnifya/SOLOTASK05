@@ -74,6 +74,9 @@ TYPE_CHAIN_ARBITRATION = "chain_arbitration"
 TYPE_CHAIN_VOTE = "chain_vote"
 #: 跨链派发请求（details 即 V={dispatch_id,operation_id,adapter_id,chain_id,state}）
 TYPE_CHAIN_DISPATCH_REQUESTED = "chain_dispatch_requested"
+#: 跨链派发结果回执（details 即
+#: V={dispatch_id,operation_id,adapter_id,chain_id,state,tx_id}）
+TYPE_CHAIN_DISPATCH_RESULT = "chain_dispatch_result"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -189,6 +192,16 @@ _DETAILS_KEY_ORDER = {
         "chain_id",
         "state",
     ),
+    # chain_dispatch_result 的 details 即对外视图 V：六键固定序
+    # dispatch_id,operation_id,adapter_id,chain_id,state,tx_id。
+    TYPE_CHAIN_DISPATCH_RESULT: (
+        "dispatch_id",
+        "operation_id",
+        "adapter_id",
+        "chain_id",
+        "state",
+        "tx_id",
+    ),
 }
 
 
@@ -206,6 +219,7 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
         TYPE_SHARE_PARTICIPANT_REINSTATED,
         TYPE_DKG_FAILOVER,
         TYPE_CHAIN_DISPATCH_REQUESTED,
+        TYPE_CHAIN_DISPATCH_RESULT,
     )
 )
 
@@ -684,6 +698,20 @@ class AuditStore:
         纯只读，不分配 seq。"""
         return self._events_grouped_by_request(
             wallet_id, TYPE_CHAIN_DISPATCH_REQUESTED
+        )
+
+    def chain_dispatch_result_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 chain_dispatch_result 事件，按 request_id
+        （dispatch_id）分组，组内按 seq 升序。
+
+        跨链派发结果回执仅由这些事件持久化（事件是唯一提交点）：在线幂等
+        重放与崩溃恢复据此判定每个 dispatch_id 是否已有结果及其参数。每个
+        dispatch_id 至多一条有效结果（重复属不可对账现场，由恢复判定）。
+        纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_CHAIN_DISPATCH_RESULT
         )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
