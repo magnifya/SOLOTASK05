@@ -44,6 +44,7 @@ python -m unittest discover -s tests -v
 | PUT  | `/v1/wallets/{id}/nodes` | 设置 DKG 节点健康表 `{"nodes":{...}}` |
 | GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
 | POST | `/v1/wallets/{id}/nodes/{node}/rejoin` | 故障节点重新加入 `{"rejoin_id","dkg_id","round","key","approval_request_id"}` |
+| POST | `/v1/wallets/{id}/share-bind` | 绑定 reinstate 换入节点与轮换份额槽位 `{"id","rotation","dkg","round","node","slot","approval"}` |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
@@ -425,6 +426,52 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   `OSError`——HTTP 一律 `503`、`serve` 拒绝就绪。恢复不新增事件、不改
   seq。
 
+### 份额绑定（share-bind）
+
+`POST /v1/wallets/{id}/share-bind`（仅 POST），请求体 B 恰含
+`{"id","rotation","dkg","round","node","slot","approval"}` 七键（含其他
+键或缺键一律 `400`）：把经 reinstate 换入当前 done 轮的 up 节点与一次
+prepared 份额轮换的某个槽位绑定，为激活后的签名会话份额投递引入节点
+归属约束。
+
+- `id`/`rotation`/`dkg`/`node`/`approval` 沿用安全标识
+  `[A-Za-z0-9_-]{1,128}`；`round` 为非布尔正整数；`slot` 为非布尔
+  `1|2`。B 的键集/类型/值错 `400`；钱包、轮换、DKG 会话、节点（不在
+  健康表）、审批单（含跨钱包审批）未知一律 `404`。
+- **首提前置**：轮换 `rotation` 为 `prepared`；`round` 恰为该 DKG
+  **当前**且已 `done` 的轮次；`node` 为该轮 reinstate 换入的、当前
+  生效健康表中为 `up` 的节点；`approval` 指向**同一钱包**既有且为
+  `approved` 的审批单（操作前按既有契约懒过期），其 `message` 与紧凑
+  JSON **逐字一致**（无空格、键序固定，即 B 去 `approval` 后）：
+  `{"id":"I","rotation":"R","dkg":"D","round":N,"node":"M","slot":S}`；
+  该槽位未被其他绑定占用。任一不满足 `409`，现场不变。
+- 成功 `201` 返回 `V={"id","node","slot","share_id"}`（键序固定），
+  `share_id` 为该轮换的 `share_ids[slot-1]`。同 `id` **同参**（含
+  `approval`）重放 `200` 返回同一 V（优先于状态判定，不复查现状）；
+  同 `id` **异参** `409`。
+- 绑定仅由审计事件持久化：`share_participant_reinstated` 是唯一提交点
+  （`request_id=id`、`actor_id=approval`、`reason=null`、details 即 V，
+  键序 `id,node,slot,share_id`），不另写状态文件。首提在每钱包跨进程
+  事务锁内追加，跨进程并发只有一个 `201`（其余同参 `200`），审计 seq
+  连续不重号，重放不记事件。
+- **激活后绑定仅约束签名会话 `/shares`**：轮换激活后，投递绑定
+  `share_id` 的请求体恰为 `{"node","share_id","signature"}`——`node`
+  与绑定节点不符 `409`，键集/签名错 `400`，其余沿用 `/shares` 契约；
+  未绑定份额、`/sign`、`share-sign` 行为不变。
+- 重启/灾备恢复时，每条 `share_participant_reinstated` 都按其**提交
+  之前**的现场逐条复核：审批单存在且 message 逐字自洽（id/node/slot
+  与 details 一致）、状态为 `approved`（其后推进为 `signed` 亦认可）；
+  轮换记录存在且 `share_ids[slot-1]` 恰为 `details.share_id`；事前 DKG
+  （按 seq 前缀重建）当前轮恰为 `round` 且已 `done`、该轮由 reinstate
+  派生且换入节点即 `details.node`；事前生效健康表中该节点为 `up`；
+  同一槽位全钱包至多一条绑定。重复 `id`、槽位重复或任何矛盾都
+  fail-closed（抛 `RecoveryError`）；details 键序在审计读取归一化
+  **之前**校验（落盘必须恰为 `id,node,slot,share_id`，错序即
+  `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件
+  I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。
+  恢复不新增事件、不改 seq，响应、日志、非份额文件绝不泄露份额私钥
+  或份额正文。
+
 ### DKG 故障审批（可选）
 
 - `PUT /v1/wallets/{id}/dkg-failover-policy`：请求体仅收
@@ -602,7 +649,7 @@ quorum 后按既有 commit 契约自动提交。
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
-`node_rejoined`、`chain_policy`、
+`node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`。
 
 ## 多进程与故障恢复（保证）

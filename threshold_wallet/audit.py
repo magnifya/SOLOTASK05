@@ -66,6 +66,9 @@ TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
 TYPE_NODE_STATE = "node_state"
 #: DKG 故障节点重新加入（details 即 V={rejoin_id,dkg_id,round,node,key,state}）
 TYPE_NODE_REJOINED = "node_rejoined"
+#: 份额绑定：reinstate 换入节点与 prepared 轮换的份额槽位绑定
+#: （details 即 V={id,node,slot,share_id}）
+TYPE_SHARE_PARTICIPANT_REINSTATED = "share_participant_reinstated"
 TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
 TYPE_CHAIN_ARBITRATION = "chain_arbitration"
@@ -119,6 +122,14 @@ _DETAILS_KEY_ORDER = {
         "node",
         "key",
         "state",
+    ),
+    # share_participant_reinstated 的 details 即对外视图 V：四键固定序
+    # id,node,slot,share_id。
+    TYPE_SHARE_PARTICIPANT_REINSTATED: (
+        "id",
+        "node",
+        "slot",
+        "share_id",
     ),
     TYPE_DKG_FAILOVER: (
         # 手工/旧事件为既有七键；auto 替补事件为既有七键加末键 mode
@@ -176,7 +187,9 @@ _DETAILS_KEY_ORDER = {
 #: 若先归一再校验，外部对键序的篡改会被静默抹平，故必须在归一化之前核对
 #: **落盘原序**——错序即不可对账现场（RecoveryError），绝不归一。坏 JSON
 #: 在更上层的 json 解析处即为 CorruptDataError。
-_STRICT_DETAILS_ORDER_TYPES = frozenset((TYPE_NODE_REJOINED,))
+_STRICT_DETAILS_ORDER_TYPES = frozenset(
+    (TYPE_NODE_REJOINED, TYPE_SHARE_PARTICIPANT_REINSTATED)
+)
 
 
 def _stored_details_has_canonical_order(event: dict) -> bool:
@@ -595,6 +608,19 @@ class AuditStore:
         rejoin_id 至多一条有效事件（重复属不可对账现场，由恢复判定）。
         纯只读，不分配 seq。"""
         return self._events_grouped_by_request(wallet_id, TYPE_NODE_REJOINED)
+
+    def share_participant_reinstated_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 share_participant_reinstated 事件，按
+        request_id（绑定 id）分组，组内按 seq 升序。
+
+        份额绑定仅由这些事件持久化（事件是唯一提交点）：在线幂等重放、
+        槽位占用判定与崩溃恢复据此重建绑定表。每个绑定 id 至多一条有效
+        事件（重复属不可对账现场，由恢复判定）。纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_SHARE_PARTICIPANT_REINSTATED
+        )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射
