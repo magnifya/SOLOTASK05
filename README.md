@@ -65,6 +65,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/chain/{oid}/observe` | 多源观察上报 `{"source","report"}` |
 | POST | `/v1/wallets/{id}/chain/{oid}/dispatch` | 请求跨链派发 `{"dispatch_id","adapter_id","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/result` | 上报跨链派发结果回执 `{"adapter_id","state","tx_id"}` |
+| POST | `/v1/wallets/{id}/chain/{did}/confirm` | 上报跨链派发确认进展 `{"adapter_id","tx_id","block_height","block_hash","confirmations"}` |
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
@@ -728,6 +729,47 @@ quorum 后按既有 commit 契约自动提交。
   保留现场、不增 seq。恢复不新增事件、不改 seq，响应、日志、非
   份额文件绝不泄露份额私钥或份额正文。
 
+### 跨链派发确认进展（confirm）
+
+`POST /v1/wallets/{id}/chain/{did}/confirm`（仅 POST），`did` 为已派发
+的 `dispatch_id`。请求体 B 恰含
+`{"adapter_id","tx_id","block_height","block_hash","confirmations"}`
+五键（含其他键或缺键一律 `400`）：链上适配器上报一笔已播链派发的
+确认进展。
+
+- `did`/`adapter_id` 均须匹配安全标识 `[A-Za-z0-9_-]{1,128}`；
+  `tx_id`/`block_hash` 为 64 位小写 hex；`block_height`/`confirmations`
+  为非布尔非负整数。键集/类型/值错一律 `400`；钱包或派发未知 `404`；
+  无 `broadcasted` 结果（尚无结果或结果为 `failed`）、`adapter_id` 或
+  `tx_id` 与派发归属（请求适配器 / 播链交易）不符、或迁移冲突一律
+  `409`。
+- 阈值/窗口取**派发请求提交之前**该资产已启用策略的
+  `required_confirmations`/`reorg_window`：同块（高度与哈希均同）
+  确认数只增不减；换块（迁移）仅限确认中且
+  `0 ≤ 旧高度 − 新高度 ≤ reorg_window`；确认数达
+  `required_confirmations` 即转 `finalized`（终态），终态仅许历史
+  同体重放，新进展一律 `409`。
+- 新进展 `201` 返回
+  `V={"dispatch_id","adapter_id","tx_id","block_height","block_hash","confirmations","state"}`，
+  键序固定，`state` 为 `confirming|finalized`。历史同体（B 五键全同）
+  重放**优先**返回 `200` 与原 V（含原 state），不复查现状；同
+  `dispatch_id` 异体新进展按状态机判定。
+- 确认进展仅由审计事件持久化：`chain_dispatch_confirmation` 是唯一
+  提交点（`request_id=dispatch_id`、`actor_id=adapter_id`、
+  `reason=null`、details 即 V，键序
+  `dispatch_id,adapter_id,tx_id,block_height,block_hash,confirmations,state`），
+  不另写确认状态文件。首提在每钱包跨进程事务锁内追加，跨进程并发只有
+  一个 `201`（其余同体 `200`），审计 seq 连续不重号，重放不记事件。
+- 启动、持锁访问与灾备恢复按 seq 逐条复核每条
+  `chain_dispatch_confirmation`：请求与 `broadcasted` 结果必须**先于**
+  确认提交、归属一致（`adapter_id` 同请求、`tx_id` 同结果）、迁移状态机
+  （同块不降、换块窗口、达门槛即 finalized、终态后无新进展、无同体
+  重复事件）逐条成立。任一矛盾都 fail-closed（抛 `RecoveryError`）；
+  审计 JSON 损坏抛 `CorruptDataError`、审计文件 I/O 失败抛
+  `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪，保留现场、不改
+  账本、不写旁路文件、不重记。恢复不新增事件、不改 seq，响应、日志、
+  非份额文件绝不泄露份额私钥或份额正文。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -744,7 +786,8 @@ quorum 后按既有 commit 契约自动提交。
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`、
-`chain_dispatch_requested`、`chain_dispatch_result`。
+`chain_dispatch_requested`、`chain_dispatch_result`、
+`chain_dispatch_confirmation`。
 
 ## 多进程与故障恢复（保证）
 
