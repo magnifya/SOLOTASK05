@@ -34,6 +34,7 @@
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/replace  替换会话单个参与方份额
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/takeover 两阶段接管会话参与方份额
+- POST /v1/wallets/<wallet_id>/share-bind                      绑定 DKG 复职节点到轮换份额槽位
 - POST /v1/dkg/<wallet_id>/<dkg_id>                           推进两方 DKG 一个阶段
 - GET  /v1/dkg/<wallet_id>/<dkg_id>                           查询两方 DKG 会话视图
 - POST /v1/dkg/<wallet_id>/<dkg_id>/failover                  提交 DKG 故障轮次
@@ -360,6 +361,37 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(status, result)
                     return
 
+                if rest == ["share-bind"]:
+                    body = self._read_json_body()
+                    # 请求体恰含 id/rotation/dkg/round/node/slot/approval
+                    # 七键（值类型/取值由 service 校验）
+                    if set(body) != {
+                        "id",
+                        "rotation",
+                        "dkg",
+                        "round",
+                        "node",
+                        "slot",
+                        "approval",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly id, rotation, dkg, "
+                            "round, node, slot and approval",
+                        )
+                    status, result = service.post_share_bind(
+                        wallet_id,
+                        body.get("id"),
+                        body.get("rotation"),
+                        body.get("dkg"),
+                        body.get("round"),
+                        body.get("node"),
+                        body.get("slot"),
+                        body.get("approval"),
+                    )
+                    self._send_json(status, result)
+                    return
+
                 if rest == ["sign-sessions"]:
                     body = self._read_json_body()
                     status, result = service.create_sign_session(
@@ -377,11 +409,28 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     and rest[2] == "shares"
                 ):
                     body = self._read_json_body()
+                    # 未绑定份额体恰含 share_id/signature 两键；份额槽位绑定
+                    # 激活后，被绑定份额的体恰含 node/share_id/signature
+                    # 三键（node 是否必填由 service 按绑定现场判定，HTTP 层
+                    # 不读绑定状态）。
+                    body_keys = set(body)
+                    two_keys = {"share_id", "signature"}
+                    if body_keys != two_keys and body_keys != two_keys | {
+                        "node"
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly share_id and "
+                            "signature (bound shares also require node)",
+                        )
                     status, result = service.submit_sign_session_share(
                         wallet_id,
                         rest[1],
                         body.get("share_id"),
                         body.get("signature"),
+                        body.get(
+                            "node", WalletService._NO_NODE
+                        ),
                     )
                     self._send_json(status, result)
                     return

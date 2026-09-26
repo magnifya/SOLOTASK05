@@ -331,6 +331,12 @@ class WalletService:
             # 轮、不占槽、审批单未批准/message 不符）fail-closed；恢复不
             # 写任何状态、不记事件、不改 seq。
             self._reconcile_node_rejoins(wallet_id)
+            # share_participant_reinstated 绑定事件按其提交之前的轮换/DKG/
+            # 健康表/审批单逐条复核：rotation 当时 prepared、round 为当前
+            # done 轮、node 为该轮 reinstate 换入且当前 up、槽位未占用、
+            # share_id 为当时在用份额；任何矛盾 fail-closed，恢复不写状态、
+            # 不记事件、不改 seq。
+            self._reconcile_share_bindings(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
             raise
@@ -878,6 +884,7 @@ class WalletService:
 
     #: approval_request_id 缺省哨兵：区别于显式传入 None
     _NO_APPROVAL = object()
+    _NO_NODE = object()
 
     def _dkg_failover_policy_enabled(self, wallet_id: str) -> bool:
         """从 dkg_failover_policy_updated 事件序列恢复 DKG 故障审批开关。
@@ -1658,6 +1665,644 @@ class WalletService:
                     self._audit_event(
                         audit.TYPE_NODE_REJOINED,
                         request_id=rejoin_id,
+                        actor_id=approval_request_id,
+                        reason=None,
+                        details=view,
+                    ),
+                )
+                return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    # ---- DKG 复职节点份额槽位绑定（share-bind）----------------------------
+
+    #: share-bind 审批单 message / 事件 details V 的固定键序
+    _SHARE_BIND_VIEW_KEY_ORDER = ("id", "node", "slot", "share_id")
+
+    @staticmethod
+    def _share_bind_approval_message(
+        bind_id: str,
+        rotation_id: str,
+        dkg_id: str,
+        round_no: int,
+        node: str,
+        slot: int,
+    ) -> str:
+        """share-bind 审批单 message 必须逐字一致的紧凑 JSON（无空格、键序
+        固定为 id,rotation,dkg,round,node,slot——即请求体去掉
+        approval_request_id）。"""
+        return json.dumps(
+            {
+                "id": bind_id,
+                "rotation": rotation_id,
+                "dkg": dkg_id,
+                "round": round_no,
+                "node": node,
+                "slot": slot,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _share_bind_view(
+        self, bind_id: str, node: str, slot: int, share_id: str
+    ) -> dict:
+        """share-bind 成功/重放响应体 V（键序固定 id,node,slot,share_id）。"""
+        return {
+            "id": bind_id,
+            "node": node,
+            "slot": slot,
+            "share_id": share_id,
+        }
+
+    def _share_bind_events_strict(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部 share_participant_reinstated 事件（按 seq 升序）并
+        逐条严格校验**形状**（外层七字段键序、request_id==id、actor_id 为
+        安全标识、reason 为 null、details 恰为四键 V 且键序固定、各值合法）。
+
+        这里只做与现场无关的形状校验；与事前轮换/DKG/健康表/审批单/槽位占用
+        的语义复核在 :meth:`_reconcile_share_bindings` 按事件 seq 完成。任何
+        形状畸形都是不可对账现场（RecoveryError）。纯只读，不分配 seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_SHARE_PARTICIPANT_REINSTATED
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a share_participant_reinstated "
+                    "event whose outer fields are out of the canonical order"
+                )
+            bind_id = event.get("request_id")
+            actor_id = event.get("actor_id")
+            if (
+                not isinstance(bind_id, str)
+                or not ROTATION_ID_RE.match(bind_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a share_participant_reinstated "
+                    "event with a malformed id"
+                )
+            if bind_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"share_participant_reinstated events for {bind_id!r}"
+                )
+            seen.add(bind_id)
+            if not (
+                isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} has a "
+                    "malformed approval_request_id"
+                )
+            if event.get("reason") is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} has a "
+                    "non-null reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details) != list(self._SHARE_BIND_VIEW_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} has "
+                    "malformed details"
+                )
+            if details["id"] != bind_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} details id "
+                    "disagrees with its request_id"
+                )
+            node = details["node"]
+            slot = details["slot"]
+            share_id = details["share_id"]
+            if not isinstance(node, str) or not ROTATION_ID_RE.match(node):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} has a "
+                    "malformed node"
+                )
+            if (
+                not isinstance(slot, int)
+                or isinstance(slot, bool)
+                or slot not in (1, 2)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} has a "
+                    "malformed slot"
+                )
+            if not isinstance(share_id, str) or not _SAFE_SHARE_ID.match(
+                share_id
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} has a "
+                    "malformed share_id"
+                )
+        return events
+
+    def _share_binding_for_share_locked(
+        self, wallet_id: str, share_id: str
+    ) -> Optional[dict]:
+        """份额 id 对应的绑定 V（不要求当前在用），无绑定返回 None。
+
+        份额 id 全局唯一（``<rotation>-share-<slot>``），绑定随份额身份
+        存在：即使其后又有轮换把该份额轮换出在用集合，**冻结了该份额的
+        signed 会话**重放仍须沿用绑定的三键体。读取前先严格复核全部绑定
+        事件（矛盾即 RecoveryError）。调用方须持钱包锁。"""
+        self._reconcile_share_bindings(wallet_id)
+        for event in self._share_bind_events_strict(wallet_id):
+            if event["details"]["share_id"] == share_id:
+                return dict(event["details"])
+        return None
+
+    def _bound_slot_occupied_locked(
+        self, wallet_id: str, share_id: str
+    ) -> bool:
+        """该轮换槽位（share_id）是否已被更早的绑定事件占用（调用方须持
+        钱包锁）。
+
+        槽位按轮换份额 id 判定：每个轮换的 share_ids 全局唯一
+        （``<rotation>-share-<slot>``），故同一槽位被占用当且仅当已存在
+        一条 share_id 相同的已提交绑定事件。"""
+        return any(
+            event["details"]["share_id"] == share_id
+            for event in self._share_bind_events_strict(wallet_id)
+        )
+
+    @staticmethod
+    def _decode_share_bind_message(message: object) -> Optional[dict]:
+        """把审批单 message 解析为 share-bind 的六字段 B 去 approval。
+
+        仅当 message 是逐字规范的紧凑 JSON（恰含
+        id,rotation,dkg,round,node,slot、各值类型/取值合法）时返回该 dict；
+        形状不符或与规范紧凑形有任何差异（空格、键序、额外键）一律
+        返回 None。"""
+        if not isinstance(message, str):
+            return None
+        try:
+            parsed = json.loads(message)
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict) or set(parsed) != {
+            "id",
+            "rotation",
+            "dkg",
+            "round",
+            "node",
+            "slot",
+        }:
+            return None
+        for key in ("id", "rotation", "dkg", "node"):
+            if not isinstance(parsed[key], str) or not ROTATION_ID_RE.match(
+                parsed[key]
+            ):
+                return None
+        round_no = parsed["round"]
+        if (
+            not isinstance(round_no, int)
+            or isinstance(round_no, bool)
+            or round_no < 1
+        ):
+            return None
+        slot = parsed["slot"]
+        if not isinstance(slot, int) or isinstance(slot, bool) or slot not in (
+            1,
+            2,
+        ):
+            return None
+        # 按**固定键序** id,rotation,dkg,round,node,slot 重新紧凑序列化后
+        # 逐字比较：重排键序（解析保留源序，不能直接重 dump parsed）或任何
+        # 空白差异都不接受。
+        canonical = json.dumps(
+            {
+                "id": parsed["id"],
+                "rotation": parsed["rotation"],
+                "dkg": parsed["dkg"],
+                "round": parsed["round"],
+                "node": parsed["node"],
+                "slot": parsed["slot"],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if message != canonical:
+            return None
+        return parsed
+
+    def _reconcile_share_bindings(self, wallet_id: str) -> None:
+        """按 seq 严格复核全部 share_participant_reinstated 事件（调用方须
+        持钱包锁）。
+
+        每条事件都以其**提交之前**的现场复核在线首提的全部前置。事件
+        details 只存 V={id,node,slot,share_id}；rotation/dkg/round 不落在
+        details 中，而由 actor_id 所指同钱包审批单的 message（B 去
+        approval 的紧凑 JSON）逐字锚定，故恢复先取审批单并解析 message：
+
+        - 审批单存在，message 逐字为按 id,rotation,dkg,round,node,slot 序
+          的紧凑 JSON 且 id/node/slot 与 details 一致，状态 approved
+          （其后推进为 signed 亦认可）；
+        - 轮换 rotation 在事件之前已 prepared 且尚未激活；
+        - details.share_id 恰为事件之前当前在用两份份额按槽位（slot-1）的
+          份额（由轮换激活时间线确定）；
+        - 事前 DKG（seq 前缀重建）存在会话 dkg，当前轮恰为 round 且状态为
+          done，创建该轮的故障派生是 replacement=node 的 reinstate，node
+          在该轮节点中；
+        - node 在事前生效健康表（最近 node_state 快照折叠其间更早 rejoin
+          翻转）中为 up；
+        - 同一槽位在事件之前未被仍占用当前在用份额的更早绑定占用。
+
+        同一绑定 id 重复提交或任何矛盾都是不可对账现场（RecoveryError，
+        fail-closed，保留现场）。纯只读，不记事件、不改 seq、不写状态。"""
+        events = self._share_bind_events_strict(wallet_id)
+        if not events:
+            return
+        node_events = self._node_state_events_strict(wallet_id)
+        rejoin_events = self._rejoin_events_strict(wallet_id)
+        activated = self._audit.activated_rotation_events(wallet_id)
+        prepared_events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_SHARE_ROTATION_PREPARED
+        )
+        for event in events:
+            seq = event["seq"]
+            actor_id = event["actor_id"]
+            d = event["details"]
+            bind_id = d["id"]
+            node = d["node"]
+            slot = d["slot"]
+            share_id = d["share_id"]
+
+            # --- 审批单复核（rotation/dkg/round 由其 message 锚定）---
+            try:
+                approval = self._store.get_request(wallet_id, actor_id)
+            except CorruptDataError:
+                raise
+            except ValueError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} approval "
+                    "record is unreadable"
+                ) from exc
+            if not isinstance(approval, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} refers to "
+                    "an unknown approval request"
+                )
+            message_body = self._decode_share_bind_message(
+                approval.get("message")
+            )
+            if message_body is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} approval "
+                    "message does not match a share-bind body"
+                )
+            if approval.get("state") not in ("approved", "signed"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} approval "
+                    "request is not approved"
+                )
+            if message_body["id"] != bind_id or message_body["node"] != node:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} approval "
+                    "message does not agree with its event"
+                )
+            if message_body["slot"] != slot:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} approval "
+                    "message slot does not agree with its event"
+                )
+            rotation_id = message_body["rotation"]
+            dkg_id = message_body["dkg"]
+            round_no = message_body["round"]
+
+            # --- 事前轮换现场：已 prepared 且未激活 ---
+            prepared = next(
+                (
+                    pe
+                    for pe in prepared_events
+                    if pe["seq"] < seq
+                    and isinstance(pe.get("details"), dict)
+                    and pe["details"].get("rotation_id") == rotation_id
+                ),
+                None,
+            )
+            if prepared is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} rotation "
+                    f"{rotation_id!r} was not prepared before the event"
+                )
+            activation = activated.get(rotation_id)
+            if activation is not None and activation["seq"] < seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} rotation "
+                    f"{rotation_id!r} was already active before the event"
+                )
+            prepared_share_ids = prepared["details"].get("share_ids")
+            if (
+                not isinstance(prepared_share_ids, list)
+                or len(prepared_share_ids) != 2
+                or share_id != prepared_share_ids[slot - 1]
+                or share_id != f"{rotation_id}-share-{slot}"
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} share_id "
+                    "does not match the prepared rotation slot"
+                )
+
+            # --- 事前 DKG 现场（前缀重建）---
+            sessions = self._build_dkg_sessions(wallet_id, seq - 1)
+            session = sessions.get(dkg_id)
+            if session is None or session["current"] != round_no:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} round is "
+                    "not the current dkg round"
+                )
+            current_round = session["rounds"][round_no]
+            if current_round["state"] != "done":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} round is "
+                    "not done"
+                )
+            committed = session["failovers"].get(round_no)
+            node_ids = [n for n, _ in current_round["nodes"]]
+            if (
+                round_no < 2
+                or not isinstance(committed, dict)
+                or committed.get("action") != "reinstate"
+                or committed.get("replacement") != node
+                or node not in node_ids
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} node is not "
+                    "the reinstated node of the current done round"
+                )
+
+            # --- node 在事前生效健康表中为 up ---
+            health = self._folded_health_before(
+                node_events, rejoin_events, seq
+            )
+            entry = health.get(node) if isinstance(health, dict) else None
+            if not isinstance(entry, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} node is "
+                    "absent from the prior health table"
+                )
+            if entry.get("state") != "up":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} share-bind {bind_id!r} node is not "
+                    "up in the prior health table"
+                )
+
+            # --- 槽位占用：同一轮换槽位（share_id）至多绑定一次 ---
+            for earlier in events:
+                if earlier["seq"] >= seq:
+                    break
+                if earlier["details"]["share_id"] == share_id:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} share-bind {bind_id!r} slot "
+                        f"{slot} was already occupied"
+                    )
+
+    def post_share_bind(
+        self,
+        wallet_id: str,
+        bind_id: object,
+        rotation_id: object,
+        dkg_id: object,
+        round_no: object,
+        node: object,
+        slot: object,
+        approval_request_id: object,
+    ) -> tuple[int, dict]:
+        """把 DKG 当前 done 轮的 reinstate 复职节点绑定到 prepared 轮换的
+        某个份额槽位，返回 (HTTP 状态码, V={id,node,slot,share_id})。
+
+        请求体恰含 id,rotation,dkg,round,node,slot,approval 七键（HTTP
+        边界拦键集）：id/rotation/dkg/node/approval 为安全标识，round 为
+        非布尔正整数，slot 为非布尔 1|2；键集/类型/值错 400；钱包未知
+        404。
+
+        首提前置：rotation 为当前 prepared 轮换；round 恰为 DKG 当前
+        done 轮；node 为创建该轮的 reinstate 换入节点且在生效健康表中为
+        up；approval 指向同钱包既有 approved 审批单，message 逐字为 B 去
+        approval 后按 id,rotation,dkg,round,node,slot 序的紧凑 JSON；槽位
+        （prepared 轮换份额 id）未被更早绑定占用。轮换/DKG/节点/审批未知
+        404；其余前置不满足 409。share_id 取该 prepared 轮换
+        share_ids[slot-1]。
+
+        首提 201；同 id 七字段全同重放 200 返回同一 V（优先于状态与审批
+        判定，不复查审批单现状）；同 id 异参 409。
+        share_participant_reinstated 是唯一提交点（request_id=id、
+        actor_id=approval、reason=null、details=V）；锁内并发只有一个 201，
+        重启/灾备由事件序列恢复。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先严格复核既有绑定/健康/rejoin 现场：矛盾现场
+                # fail-closed（503），优先于参数 400/404 判定。
+                self._reconcile_share_bindings(wallet_id)
+                # 类型/取值校验（400）
+                for name, value in (
+                    ("id", bind_id),
+                    ("rotation", rotation_id),
+                    ("dkg", dkg_id),
+                    ("node", node),
+                ):
+                    if not isinstance(value, str) or not ROTATION_ID_RE.match(
+                        value
+                    ):
+                        raise ServiceError(
+                            400,
+                            f"{name} must match [A-Za-z0-9_-]{{1,128}}",
+                        )
+                if (
+                    not isinstance(round_no, int)
+                    or isinstance(round_no, bool)
+                    or round_no < 1
+                ):
+                    raise ServiceError(
+                        400, "round must be a positive integer"
+                    )
+                if not isinstance(slot, int) or isinstance(slot, bool) or (
+                    slot not in (1, 2)
+                ):
+                    raise ServiceError(400, "slot must be 1 or 2")
+                if (
+                    not isinstance(approval_request_id, str)
+                    or not ROTATION_ID_RE.match(approval_request_id)
+                ):
+                    raise ServiceError(
+                        400,
+                        "approval must match [A-Za-z0-9_-]{1,128}",
+                    )
+
+                # 幂等优先于 404/状态判定：已提交的同 id 重放。events 的
+                # rotation/dkg/round 不落在 details 中，由已提交事件
+                # actor_id 所指审批单的 message 锚定（只取数据，不复查审批
+                # 单现状）。
+                committed_groups = (
+                    self._audit.share_participant_reinstated_events(
+                        wallet_id
+                    ).get(bind_id)
+                )
+                if committed_groups:
+                    if len(committed_groups) != 1:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has multiple "
+                            f"share_participant_reinstated events for "
+                            f"{bind_id!r}"
+                        )
+                    committed_event = committed_groups[0]
+                    saved = committed_event["details"]
+                    prior_approval = self._store.get_request(
+                        wallet_id, committed_event["actor_id"]
+                    )
+                    prior_body = (
+                        self._decode_share_bind_message(
+                            prior_approval.get("message")
+                        )
+                        if isinstance(prior_approval, dict)
+                        else None
+                    )
+                    same = (
+                        prior_body is not None
+                        and prior_body["id"] == bind_id
+                        and committed_event["actor_id"]
+                        == approval_request_id
+                        and prior_body["rotation"] == rotation_id
+                        and prior_body["dkg"] == dkg_id
+                        and prior_body["round"] == round_no
+                        and saved["node"] == node
+                        and saved["slot"] == slot
+                    )
+                    if same:
+                        return 200, dict(saved)
+                    raise ServiceError(
+                        409,
+                        f"share-bind {bind_id!r} already exists with "
+                        "different parameters",
+                    )
+
+                # 404：轮换 / DKG 会话 / 节点 / 审批单未知
+                rotation = self._store.get_rotation(wallet_id, rotation_id)
+                if rotation is None:
+                    raise ServiceError(
+                        404,
+                        f"share rotation {rotation_id!r} not found",
+                    )
+                sessions = self._dkg_sessions(wallet_id)
+                session = sessions.get(dkg_id)
+                if session is None:
+                    raise ServiceError(
+                        404, f"dkg session {dkg_id!r} not found"
+                    )
+                folded = self._health_table_folding_rejoins_locked(wallet_id)
+                if folded is None or node not in folded:
+                    raise ServiceError(
+                        404,
+                        f"node {node!r} not found in the node health table",
+                    )
+                approval = self._store.get_request(
+                    wallet_id, approval_request_id
+                )
+                if approval is None:
+                    raise ServiceError(
+                        404,
+                        f"approval request {approval_request_id!r} not found",
+                    )
+
+                # 409 前置：轮换须 prepared
+                if rotation.get("state") != "prepared":
+                    raise ServiceError(
+                        409,
+                        f"share rotation {rotation_id!r} is "
+                        f"{rotation.get('state')}, not prepared",
+                    )
+                # round 须为当前轮且 done
+                current = session["current"]
+                if round_no != current:
+                    raise ServiceError(
+                        409,
+                        f"round must be the current round {current}",
+                    )
+                current_round = session["rounds"][current]
+                if current_round["state"] != "done":
+                    raise ServiceError(
+                        409,
+                        "share-bind requires the current round to be done",
+                    )
+                # node 须为该轮 reinstate 换入的节点
+                committed = session["failovers"].get(current)
+                node_ids = [n for n, _ in current_round["nodes"]]
+                if (
+                    current < 2
+                    or not isinstance(committed, dict)
+                    or committed.get("action") != "reinstate"
+                    or committed.get("replacement") != node
+                    or node not in node_ids
+                ):
+                    raise ServiceError(
+                        409,
+                        f"node {node!r} is not the reinstated node of the "
+                        f"current done round {current}",
+                    )
+                # node 须在生效健康表中为 up
+                if folded[node].get("state") != "up":
+                    raise ServiceError(
+                        409, f"node {node!r} is not up in the health table"
+                    )
+
+                # 审批门控：同钱包既有 approved 审批单，message 逐字一致。
+                # 按既有契约懒过期（可能原子记一次 request_expired）。
+                approval = self._expire_if_needed(wallet_id, approval)
+                expected_message = self._share_bind_approval_message(
+                    bind_id, rotation_id, dkg_id, round_no, node, slot
+                )
+                if approval["message"] != expected_message:
+                    raise ServiceError(
+                        409,
+                        "approval request message does not match this "
+                        "share-bind",
+                    )
+                if approval["state"] != "approved":
+                    raise ServiceError(
+                        409,
+                        f"approval request {approval_request_id!r} is "
+                        f"{approval['state']}, not approved",
+                    )
+
+                # share_id 是 prepared 轮换暂存份额的该槽份额；激活后成为
+                # 在用份额（V.share_id=share_ids[slot-1]）。
+                staged_share_ids = rotation.get("share_ids")
+                if (
+                    not isinstance(staged_share_ids, list)
+                    or len(staged_share_ids) != 2
+                    or not all(isinstance(s, str) for s in staged_share_ids)
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} rotation {rotation_id!r} has "
+                        "malformed staged share_ids"
+                    )
+                share_id = staged_share_ids[slot - 1]
+                # 槽位占用：该轮换槽位（share_id）已被更早绑定占用即 409。
+                if self._bound_slot_occupied_locked(wallet_id, share_id):
+                    raise ServiceError(
+                        409, f"share slot {slot} is already bound"
+                    )
+
+                # share_participant_reinstated 是唯一提交点：在跨进程事务
+                # 锁内追加事件；事件之外不写任何绑定状态文件，绑定由审计
+                # 事件序列重建。
+                view = self._share_bind_view(bind_id, node, slot, share_id)
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_SHARE_PARTICIPANT_REINSTATED,
+                        request_id=bind_id,
                         actor_id=approval_request_id,
                         reason=None,
                         details=view,
@@ -5090,6 +5735,7 @@ class WalletService:
         session_id: str,
         share_id: object,
         signature_hex: object,
+        node: object = _NO_NODE,
     ) -> tuple[int, dict]:
         """向会话投递一份额签名，返回 (状态码, 视图)。
 
@@ -5102,10 +5748,15 @@ class WalletService:
         - 轮换激活后，collecting/ready 会话改用钱包当前两份在用份额：
           已收旧份额在持锁恢复中被剔除，视图只反映当前快照，新份额可继续
           投递；signed 会话冻结创建时快照与聚合结果。
+        - 钱包存在已激活的份额槽位绑定（share_participant_reinstated）后，
+          仅**被绑定的当前在用份额**受额外约束：其请求体必须恰含
+          node/share_id/signature 且 node 与绑定的复职节点一致（node 缺失
+          /类型错 400、不一致 409）；未绑定份额体恰含 share_id/signature，
+          夹带 node 一律 400；/sign 与 share-sign 不变。
         """
         try:
             return self._submit_sign_session_share_tx(
-                wallet_id, session_id, share_id, signature_hex
+                wallet_id, session_id, share_id, signature_hex, node
             )
         except CorruptDataError:
             raise
@@ -5119,6 +5770,7 @@ class WalletService:
         session_id: str,
         share_id: object,
         signature_hex: object,
+        node: object = _NO_NODE,
     ) -> tuple[int, dict]:
         with self._wallet_lock(wallet_id):
             self._heal_wallet(wallet_id)
@@ -5165,6 +5817,30 @@ class WalletService:
                     share_pub[sid] = self._validated_replacement_share(
                         wallet_id, sid
                     )["public_key"]
+
+            # 已激活的份额槽位绑定（share_participant_reinstated）只约束
+            # **被绑定份额**：投递该份额时请求体必须恰含 node 且与绑定的
+            # 复职节点一致。node 缺失/类型错为载荷错误 400；不一致为冲突
+            # 409。绑定随份额身份存在（份额 id 全局唯一），故冻结了被绑定
+            # 份额的 signed 会话在后续轮换后重放仍须三键体。未绑定份额不得
+            # 夹带 node（键集错 400）。
+            bound = self._share_binding_for_share_locked(wallet_id, share_id)
+            if bound is not None:
+                if node is self._NO_NODE or not isinstance(node, str) or not node:
+                    raise ServiceError(
+                        400,
+                        "body must contain exactly node, share_id and "
+                        "signature for a bound share",
+                    )
+                if node != bound["node"]:
+                    raise ServiceError(
+                        409,
+                        f"share {share_id!r} is bound to a different node",
+                    )
+            elif node is not self._NO_NODE:
+                raise ServiceError(
+                    400, "body must contain exactly share_id and signature"
+                )
             received = self._session_shares_map(record)
 
             # 已收份额的重放分支必须先于"在用份额"判定：signed 会话冻结
