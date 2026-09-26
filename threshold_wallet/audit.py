@@ -186,8 +186,15 @@ _DETAILS_KEY_ORDER = {
 #: 若先归一再校验，外部对键序的篡改会被静默抹平，故必须在归一化之前核对
 #: **落盘原序**——错序即不可对账现场（RecoveryError），绝不归一。坏 JSON
 #: 在更上层的 json 解析处即为 CorruptDataError。
+#: dkg_failover 手工/旧事件恰为 id,round,action,node,replacement,key,state
+#: 七键序，自动替补事件为既有七键加末键 mode（mode="auto"），两种既定键序
+#: 之外的重排同样错序即 RecoveryError。
 _STRICT_DETAILS_ORDER_TYPES = frozenset(
-    (TYPE_NODE_REJOINED, TYPE_SHARE_PARTICIPANT_REINSTATED)
+    (
+        TYPE_NODE_REJOINED,
+        TYPE_SHARE_PARTICIPANT_REINSTATED,
+        TYPE_DKG_FAILOVER,
+    )
 )
 
 

@@ -263,6 +263,42 @@ class WalletService:
         self._reconcile_chain_arbitration_events(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
+    def _reconcile_dkg_events_locked(self, wallet_id: str) -> None:
+        """按既有 DKG 恢复规则重放并严格对账该钱包全部 DKG 类审计事件
+        （调用方须持钱包事务锁）。
+
+        启动恢复与公开审计查询（get_audit_events / GET audit-events）
+        共用同一条对账路径：
+
+        - DKG 会话仅由 dkg_stage 事件持久化、故障轮次仅由 dkg_failover
+          事件持久化：严格重建轮次链并逐条校验（details 既定键序
+          id,round,action,node,replacement,key,state，自动替补末键
+          mode=auto；abort 的 state 只能为 aborted，手工/自动 replace
+          及 reinstate 只能为 commit；轮次链、节点槽位、健康快照与
+          审批复核），矛盾/损坏 fail-closed；
+        - DKG 故障审批开关仅由 dkg_failover_policy_updated 事件持久化：
+          逐事件严格校验（三 id 字段为 null、details 恰含布尔
+          enabled）；
+        - DKG 节点健康表仅由 node_state 事件持久化、auto 故障的选择须
+          以事前健康快照核验：逐事件严格校验健康表形状（此处），auto
+          故障的事前核验在 _dkg_sessions 内随轮次链完成；
+        - node_rejoined 事件按其提交之前的健康表/DKG/审批单逐条复核：
+          任何矛盾（节点当时不 down|ban、key 不符、非当前 commit|share
+          轮、不占槽、审批单未批准/message 不符）fail-closed；
+        - share_participant_reinstated 绑定事件按其提交之前的轮换/DKG/
+          健康表/审批单逐条复核：rotation 当时 prepared、round 为当前
+          done 轮、node 为该轮 reinstate 换入且当前 up、槽位未占用、
+          share_id 为当时在用份额；任何矛盾 fail-closed。
+
+        纯只读：不写任何状态、不记事件、不改 seq、不触发懒过期。任何
+        状态或上下文矛盾抛 RecoveryError，审计 JSON 损坏抛
+        CorruptDataError，文件系统失败抛 OSError。"""
+        self._dkg_sessions(wallet_id)
+        self._dkg_failover_policy_enabled(wallet_id)
+        self._node_state_events_strict(wallet_id)
+        self._reconcile_node_rejoins(wallet_id)
+        self._reconcile_share_bindings(wallet_id)
+
     def _recover_wallet(self, wallet_id: str) -> None:
         """在已持有该钱包事务锁的前提下，恢复轮换现场与未完成的资产提交。
 
@@ -327,30 +363,11 @@ class WalletService:
             # fail-closed；纯只读。
             self._reconcile_chain_arbitration_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
-            # DKG 会话仅由 dkg_stage 事件持久化：严格重建校验即对账，
-            # 矛盾/损坏 fail-closed；对账不写任何状态、不记事件、不改 seq。
-            self._dkg_sessions(wallet_id)
-            # DKG 故障审批开关仅由 dkg_failover_policy_updated 事件
-            # 持久化：逐事件严格校验（三 id 字段为 null、details 恰含
-            # 布尔 enabled），损坏/矛盾 fail-closed；读取即对账，恢复不
-            # 写任何状态、不记事件、不改 seq。
-            self._dkg_failover_policy_enabled(wallet_id)
-            # DKG 节点健康表仅由 node_state 事件持久化、auto 故障的选择
-            # 须以事前健康快照核验：逐事件严格校验健康表形状（此处），
-            # auto 故障的事前核验在 _dkg_sessions 内随轮次链完成。损坏/
-            # 矛盾 fail-closed，恢复不写任何状态、不记事件、不改 seq。
-            self._node_state_events_strict(wallet_id)
-            # node_rejoined 事件按其提交之前的健康表/DKG/审批单逐条复核：
-            # 任何矛盾（节点当时不 down|ban、key 不符、非当前 commit|share
-            # 轮、不占槽、审批单未批准/message 不符）fail-closed；恢复不
-            # 写任何状态、不记事件、不改 seq。
-            self._reconcile_node_rejoins(wallet_id)
-            # share_participant_reinstated 绑定事件按其提交之前的轮换/DKG/
-            # 健康表/审批单逐条复核：rotation 当时 prepared、round 为当前
-            # done 轮、node 为该轮 reinstate 换入且当前 up、槽位未占用、
-            # share_id 为当时在用份额；任何矛盾 fail-closed，恢复不写状态、
+            # DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/
+            # rejoin/share-bind）仅由审计事件持久化：按既有 DKG 恢复规则
+            # 重放并严格对账，矛盾/损坏 fail-closed；对账不写任何状态、
             # 不记事件、不改 seq。
-            self._reconcile_share_bindings(wallet_id)
+            self._reconcile_dkg_events_locked(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
             raise
@@ -2546,6 +2563,11 @@ class WalletService:
         对账（RecoveryError/OSError/CorruptDataError）时由调用方转 503，
         绝不返回可能半完成的公钥/余额/version 之外的不一致现场。
 
+        DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/rejoin/
+        share-bind）仅由审计事件持久化：查询与启动一样按既有 DKG 恢复
+        规则重放对账（矛盾即 fail-closed 503，保留审计文件、不写盘、
+        不分配 seq、不返回部分结果），绝不返回未对账的 DKG 现场。
+
         存在性判定、分页参数校验与审计读取全部在锁内：绝不先用锁外
         快照决定 404/400，也读不到并发事务半完成状态。"""
         try:
@@ -2553,6 +2575,10 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在，再校验分页参数
                 self._get_wallet_or_404(wallet_id)
+                # 与启动恢复同一套 DKG 重放对账：任何状态或上下文矛盾
+                # （含 dkg_failover details 键序/state 与动作不符）都在
+                # 此 fail-closed，纯只读、不触发懒过期。
+                self._reconcile_dkg_events_locked(wallet_id)
                 seq = (
                     1
                     if from_seq is None
