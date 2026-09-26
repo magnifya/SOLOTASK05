@@ -63,6 +63,9 @@ TYPE_DKG_FAILOVER = "dkg_failover"
 TYPE_DKG_FAILOVER_POLICY_UPDATED = "dkg_failover_policy_updated"
 #: DKG 节点健康表整体快照（details 即 Q={节点: {key, state}}）
 TYPE_NODE_STATE = "node_state"
+#: DKG 节点重新入群（details 即 V，request_id 为 rejoin_id、
+#: actor_id 为 approval_request_id）
+TYPE_NODE_REJOINED = "node_rejoined"
 TYPE_CHAIN_POLICY = "chain_policy"
 TYPE_CHAIN_REPORT = "chain_report"
 TYPE_CHAIN_ARBITRATION = "chain_arbitration"
@@ -106,6 +109,16 @@ _DETAILS_KEY_ORDER = {
     # 故这里只固定顶层键序、保留构造好的嵌套顺序。
     TYPE_NODE_STATE: (
         "nodes",
+    ),
+    # node_rejoined 的 details 即 V：恰含
+    # rejoin_id,dkg_id,round,node,key,state，按此固定键序落盘。
+    TYPE_NODE_REJOINED: (
+        "rejoin_id",
+        "dkg_id",
+        "round",
+        "node",
+        "key",
+        "state",
     ),
     TYPE_DKG_FAILOVER: (
         # 手工/旧事件为既有七键；auto 替补事件为既有七键加末键 mode
@@ -528,6 +541,17 @@ class AuditStore:
         崩溃恢复据此重建各会话的轮次链（abort/replace 派生序列）。
         纯只读，不分配 seq。"""
         return self._events_grouped_by_request(wallet_id, TYPE_DKG_FAILOVER)
+
+    def node_rejoined_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 node_rejoined 事件，按 request_id（rejoin_id）
+        分组，组内按 seq 升序。
+
+        节点重新入群仅由这些事件持久化（事件是唯一提交点）：在线幂等
+        重放与崩溃恢复据此判定各 rejoin_id 是否已经提交。纯只读，不分配
+        seq。"""
+        return self._events_grouped_by_request(wallet_id, TYPE_NODE_REJOINED)
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
         """返回该钱包已落盘的 share_rotation_activated 事件映射
