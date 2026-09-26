@@ -1149,6 +1149,18 @@ class WalletStore:
         if vote is not None:
             if not chain_vote_shape_ok(vote) or vote.get("state") != "adopted":
                 return False
+        # 跨链派发最终性结算触发的提交另带可选键 settle
+        # （{"dispatch_id": D}）：崩溃恢复据此判定"chain_dispatch_settled
+        # 与 asset_operation_committed"两事件提交点是否完整。存在即须
+        # 恰含安全标识 dispatch_id，否则无法安全对账。
+        settle = intent.get("settle")
+        if settle is not None:
+            if (
+                not isinstance(settle, dict)
+                or set(settle) != {"dispatch_id"}
+                or not _valid_safe_id(settle.get("dispatch_id"))
+            ):
+                return False
         old_balance = old_asset["balance"] if old_asset is not None else 0
         old_version = old_asset["version"] if old_asset is not None else 0
         return (

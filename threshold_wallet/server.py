@@ -32,6 +32,8 @@
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/dispatch 请求跨链派发
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/result 上报跨链派发结果回执
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/confirm 上报跨链派发确认进展
+- GET  /v1/wallets/<wallet_id>/chain/<dispatch_id>/finality 查询跨链派发最终性
+- POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/settle 最终性资产结算（空体）
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
@@ -153,6 +155,22 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 raise ServiceError(400, "request body must be a JSON object")
             return body
 
+        def _read_empty_body(self) -> None:
+            """读取并校验空体 POST（如 settle）：请求体必须零字节；任何
+            非空体（含空 JSON 对象 {}）一律 400。始终读完整个 body，避免
+            keep-alive 连接上残留字节污染下一个请求。"""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                raise ServiceError(400, "invalid Content-Length")
+            if length < 0:
+                raise ServiceError(400, "invalid Content-Length")
+            if length > _MAX_BODY_BYTES:
+                raise ServiceError(413, "request body too large")
+            raw = self.rfile.read(length) if length > 0 else b""
+            if raw:
+                raise ServiceError(400, "request body must be empty")
+
         # ---- 路由 -------------------------------------------------------
 
         def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
@@ -210,6 +228,19 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200,
                         service.get_chain_arbitration(wallet_id, rest[1]),
                     )
+                    return
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "finality"
+                ):
+                    # 派发最终性：成功体与错误体均为 UTF-8 紧凑 JSON
+                    # （非 ASCII 不转义、无末换行），同 confirm/result。
+                    self._compact_response = True
+                    result = service.get_chain_dispatch_finality(
+                        wallet_id, rest[1]
+                    )
+                    self._send_json_compact(200, result)
                     return
                 if len(rest) == 2 and rest[0] == "sign-sessions":
                     self._send_json(
@@ -654,6 +685,23 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("block_height"),
                         body.get("block_hash"),
                         body.get("confirmations"),
+                    )
+                    self._send_json_compact(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "settle"
+                ):
+                    # 最终性资产结算：空体 POST（请求体零字节，无
+                    # Content-Length 或长度 0）；任何非空体（含空 JSON
+                    # 对象 {}）一律 400。成功体与错误体均为 UTF-8 紧凑
+                    # JSON（沿用 confirm/result 字节规则）。
+                    self._compact_response = True
+                    self._read_empty_body()
+                    status, result = service.settle_chain_dispatch(
+                        wallet_id, rest[1]
                     )
                     self._send_json_compact(status, result)
                     return

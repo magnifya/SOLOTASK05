@@ -80,6 +80,9 @@ TYPE_CHAIN_DISPATCH_RESULT = "chain_dispatch_result"
 #: 跨链派发确认进展（details 即
 #: V={dispatch_id,adapter_id,tx_id,block_height,block_hash,confirmations,state}）
 TYPE_CHAIN_DISPATCH_CONFIRMATION = "chain_dispatch_confirmation"
+#: 跨链派发最终性结算（details 即 {dispatch_id,operation_id}，与紧邻的
+#: asset_operation_committed 同批原子落盘）
+TYPE_CHAIN_DISPATCH_SETTLED = "chain_dispatch_settled"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -217,6 +220,13 @@ _DETAILS_KEY_ORDER = {
         "confirmations",
         "state",
     ),
+    # chain_dispatch_settled 的 details 恰为两键固定序
+    # dispatch_id,operation_id（事件是最终性结算的唯一提交点，与紧邻的
+    # asset_operation_committed 同批原子落盘）。
+    TYPE_CHAIN_DISPATCH_SETTLED: (
+        "dispatch_id",
+        "operation_id",
+    ),
 }
 
 
@@ -236,6 +246,7 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
         TYPE_CHAIN_DISPATCH_REQUESTED,
         TYPE_CHAIN_DISPATCH_RESULT,
         TYPE_CHAIN_DISPATCH_CONFIRMATION,
+        TYPE_CHAIN_DISPATCH_SETTLED,
     )
 )
 
@@ -742,6 +753,20 @@ class AuditStore:
         恢复判定）。纯只读，不分配 seq。"""
         return self._events_grouped_by_request(
             wallet_id, TYPE_CHAIN_DISPATCH_CONFIRMATION
+        )
+
+    def chain_dispatch_settled_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 chain_dispatch_settled 事件，按 request_id
+        （dispatch_id）分组，组内按 seq 升序。
+
+        跨链派发最终性结算仅由这些事件持久化（事件是唯一提交点）：在线
+        幂等重放与崩溃恢复据此判定每个 dispatch_id 是否已结算及其参数。
+        每个 dispatch_id 至多一条有效事件（重复属不可对账现场，由恢复
+        判定）。纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_CHAIN_DISPATCH_SETTLED
         )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:

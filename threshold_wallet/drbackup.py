@@ -659,6 +659,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "chain_dispatch_requested",
         "chain_dispatch_result",
         "chain_dispatch_confirmation",
+        "chain_dispatch_settled",
     )
 )
 

@@ -272,6 +272,7 @@ class WalletService:
         self._reconcile_chain_dispatch_events(wallet_id)
         self._reconcile_chain_dispatch_result_events(wallet_id)
         self._reconcile_chain_dispatch_confirmation_events(wallet_id)
+        self._reconcile_chain_dispatch_settled_events(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
     def _reconcile_dkg_events_locked(self, wallet_id: str) -> None:
@@ -384,6 +385,10 @@ class WalletService:
             # 结果/策略对账：请求与 broadcasted 结果在先、归属一致、迁移
             # 状态机逐事件成立，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_dispatch_confirmation_events(wallet_id)
+            # 跨链派发最终性结算（chain_dispatch_settled）与派发请求/
+            # 结果/finalized 确认及紧邻提交事件对账：前置齐备、归属一致、
+            # 结算与提交两事件同批紧邻，矛盾/损坏 fail-closed；纯只读。
+            self._reconcile_chain_dispatch_settled_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/
             # rejoin/share-bind）仅由审计事件持久化：按既有 DKG 恢复规则
@@ -530,6 +535,10 @@ class WalletService:
                 # 账本一致性：账本存在时一并按 seq 重放对账，矛盾即
                 # fail-closed。
                 self._reconcile_chain_dispatch_confirmation_events(wallet_id)
+                # 最终性结算与派发请求/结果/finalized 确认及紧邻提交事件
+                # 同属账本一致性：账本存在时一并按 seq 重放对账，矛盾即
+                # fail-closed。
+                self._reconcile_chain_dispatch_settled_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
@@ -3177,6 +3186,14 @@ class WalletService:
                 self._check_vote_commit_triple(
                     wallet_id, operation_id, event, vote
                 )
+            settle = intent.get("settle")
+            if settle is not None:
+                # 最终性结算：chain_dispatch_settled 与提交事件两事件同批
+                # 紧邻落盘（seq 为 n、n+1），核对紧邻前驱是同派发、同
+                # 操作的结算事件。
+                self._check_settle_commit_pair(
+                    wallet_id, settle["dispatch_id"], event
+                )
             committed_record = {
                 "operation_id": operation_id,
                 "asset_id": asset_id,
@@ -3218,6 +3235,14 @@ class WalletService:
                 # adopted（quorum）票，历史票序列与策略自洽。
                 self._check_vote_rollback_prefix(
                     wallet_id, operation_id, intent, intent["vote"]
+                )
+            if intent.get("settle") is not None:
+                # 最终性结算：结算事件与提交事件同批原子落盘，提交事件
+                # 缺失即结算事件也不可能落盘。审计中已存在该派发的结算
+                # 事件即崩溃窗口外的矛盾现场（外部篡改/半写），fail-closed
+                # 保留现场，绝不静默回滚抹掉证据。
+                self._check_settle_rollback_prefix(
+                    wallet_id, intent["settle"]["dispatch_id"]
                 )
         pending = intent["pending"]
         asset_id = intent["asset_id"]
@@ -3472,6 +3497,59 @@ class WalletService:
                 f"{operation_id!r} is not the deciding quorum vote"
             )
 
+    def _check_settle_commit_pair(
+        self,
+        wallet_id: str,
+        dispatch_id: str,
+        commit_event: dict,
+    ) -> None:
+        """核对最终性结算两事件提交点：提交事件的前一条必须是同派发、
+        同操作的 chain_dispatch_settled 事件。
+
+        两事件同批原子落盘且紧邻（seq 为 n、n+1）；前条缺失或类型/派发/
+        操作不符都是不可对账的矛盾现场（RecoveryError，fail-closed，保留
+        现场），绝不任选一条继续前滚。"""
+        commit_seq = commit_event.get("seq")
+        predecessor = None
+        if isinstance(commit_seq, int) and not isinstance(commit_seq, bool):
+            for candidate in self._audit.all_events(wallet_id):
+                if candidate.get("seq") == commit_seq - 1:
+                    predecessor = candidate
+                    break
+        operation_id = commit_event.get("request_id")
+        if (
+            predecessor is None
+            or predecessor.get("type") != audit.TYPE_CHAIN_DISPATCH_SETTLED
+            or predecessor.get("request_id") != dispatch_id
+            or predecessor.get("details")
+            != {"dispatch_id": dispatch_id, "operation_id": operation_id}
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} committed asset operation "
+                f"{operation_id!r} without an adjacent matching "
+                "chain_dispatch_settled event"
+            )
+
+    def _check_settle_rollback_prefix(
+        self,
+        wallet_id: str,
+        dispatch_id: str,
+    ) -> None:
+        """回滚结算意图前的严格判定（提交事件缺失时，调用方须持锁）。
+
+        结算事件与提交事件同批原子落盘：提交事件缺失则结算事件也从未
+        成为事件。审计中已存在该派发的 chain_dispatch_settled 事件却没有
+        对应提交事件（走到这里说明没找到提交事件）即崩溃窗口外的矛盾
+        现场（外部篡改/半写），fail-closed 原样保留现场，绝不猜写。"""
+        grouped = self._audit.chain_dispatch_settled_events(wallet_id).get(
+            dispatch_id
+        )
+        if grouped:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a chain_dispatch_settled event "
+                f"for {dispatch_id!r} without its committed event"
+            )
+
     def commit_asset_operation(
         self, wallet_id: str, operation_id: str
     ) -> tuple[int, dict]:
@@ -3548,6 +3626,8 @@ class WalletService:
         record: dict,
         report_details: dict | None = None,
         vote_details: dict | None = None,
+        settle_dispatch_id: str | None = None,
+        settle_adapter_id: str | None = None,
     ) -> dict:
         """在每钱包事务锁内提交一条 pending 操作，返回 committed 视图 R。
 
@@ -3555,21 +3635,23 @@ class WalletService:
 
             1. 写提交意图（记录 committed 结果 R 与提交前资产快照；
                报告触发的提交另随附达门槛报告 B，多源仲裁触发的提交
-               另随附达成 quorum 的 adopted 票）
+               另随附达成 quorum 的 adopted 票，最终性结算另随附
+               {"dispatch_id": D}）
             2. 原子提交账本：操作转 committed、balance 改、version+1
-            3. 追加提交事件（report_details/vote_details 非 None 时，
-               触发事件 chain_report/chain_vote 与
-               asset_operation_committed 两事件同批一次原子落盘，
-               seq 为 n、n+1，触发事件在先）
+            3. 追加提交事件（report_details/vote_details/settle_dispatch_id
+               非 None 时，触发事件 chain_report/chain_vote/
+               chain_dispatch_settled 与 asset_operation_committed 同批
+               一次原子落盘，seq 连续，触发事件在先）
             4. 删除提交意图
 
         链上确认报告达门槛触发的提交传入 report_details；多源仲裁
-        quorum 达成触发的提交传入 vote_details（两者互斥）：触发事件
-        与提交事件紧邻同批落盘，构成"触发事件后紧邻唯一提交事件"的
-        单一提交点，崩溃窗口内绝不出现孤立触发事件或 seq 缺口。崩溃
-        恢复以提交事件是否落盘为准：事件在则前滚补齐（并核对紧邻触发
-        事件与意图随附内容一致），事件不在则整体回滚 pending 与提交前
-        余额/版本。
+        quorum 达成触发的提交传入 vote_details；跨链派发最终性结算传入
+        settle_dispatch_id（触发事件链为 chain_dispatch_settled +
+        asset_operation_committed 两事件）：触发事件与提交事件紧邻同批
+        落盘，构成"触发事件后紧邻唯一提交事件"的单一提交点，崩溃窗口内
+        绝不出现孤立触发事件或 seq 缺口。崩溃恢复以提交事件是否落盘为
+        准：事件在则前滚补齐（并核对紧邻触发事件与意图随附内容一致），
+        事件不在则整体回滚 pending 与提交前余额/版本。
         """
         asset_id = record["asset_id"]
         asset = self._store.get_asset(wallet_id, asset_id)
@@ -3613,6 +3695,11 @@ class WalletService:
             # {source,report=B,state}，崩溃恢复据此把"票 + 报告 +
             # 提交"三事件批与矛盾现场严格区分开
             intent["vote"] = vote_details
+        if settle_dispatch_id is not None:
+            # 最终性结算：意图随附派发标识，崩溃恢复据此把
+            # "chain_dispatch_settled + 提交"两事件批与矛盾现场严格
+            # 区分开。
+            intent["settle"] = {"dispatch_id": settle_dispatch_id}
         try:
             self._store.write_asset_commit_intent(
                 wallet_id, operation_id, intent
@@ -3624,11 +3711,17 @@ class WalletService:
                 asset_id,
                 asset_record,
             )
-            if report_details is not None or vote_details is not None:
+            if (
+                report_details is not None
+                or vote_details is not None
+                or settle_dispatch_id is not None
+            ):
                 # 触发事件与提交事件同批一次原子落盘：要么全部在
                 # （seq n、n+1、…），要么都不在，绝不留下孤立触发事件。
                 # 多源仲裁达 quorum 时票事件在先、链上报告事件次之、
-                # 提交事件收尾（三事件一次原子提交）。
+                # 提交事件收尾（三事件一次原子提交）；最终性结算为
+                # chain_dispatch_settled 在先、提交事件收尾（两事件一次
+                # 原子提交）。
                 batch: list[dict] = []
                 if vote_details is not None:
                     batch.append(
@@ -3644,6 +3737,19 @@ class WalletService:
                             audit.TYPE_CHAIN_REPORT,
                             request_id=operation_id,
                             details=report_details,
+                        )
+                    )
+                if settle_dispatch_id is not None:
+                    batch.append(
+                        self._audit_event(
+                            audit.TYPE_CHAIN_DISPATCH_SETTLED,
+                            request_id=settle_dispatch_id,
+                            actor_id=settle_adapter_id,
+                            reason=None,
+                            details={
+                                "dispatch_id": settle_dispatch_id,
+                                "operation_id": operation_id,
+                            },
                         )
                     )
                 batch.append(
@@ -4223,24 +4329,40 @@ class WalletService:
                 if record is not None:
                     policy = policies.get(record["asset_id"])
                     if policy is not None and policy["enabled"]:
-                        # 启用时只能经报告提交：提交事件必须紧邻一条
-                        # 达门槛的 chain_report
-                        trigger = (
+                        # 启用时只能经链上触发提交：提交事件必须紧邻一条
+                        # 达门槛的 chain_report（确认数报告自动提交），或
+                        # 紧邻一条同操作的 chain_dispatch_settled（跨链
+                        # 派发最终性结算）。
+                        prev_details = (
                             prev.get("details")
+                            if isinstance(prev, dict)
+                            else None
+                        )
+                        settle_trigger = (
+                            prev is not None
+                            and prev.get("type")
+                            == audit.TYPE_CHAIN_DISPATCH_SETTLED
+                            and isinstance(prev_details, dict)
+                            and prev_details.get("operation_id")
+                            == operation_id
+                        )
+                        report_trigger = (
+                            prev_details
                             if prev is not None
                             and prev.get("type") == audit.TYPE_CHAIN_REPORT
                             and prev.get("request_id") == operation_id
                             else None
                         )
-                        if (
-                            not isinstance(trigger, dict)
-                            or trigger.get("confirmations")
+                        if not settle_trigger and (
+                            not isinstance(report_trigger, dict)
+                            or report_trigger.get("confirmations")
                             < policy["required_confirmations"]
                         ):
                             raise RecoveryError(
                                 f"wallet {wallet_id!r} committed asset "
                                 f"operation {operation_id!r} without a "
-                                "preceding threshold chain report"
+                                "preceding threshold chain report or "
+                                "dispatch settlement"
                             )
                     committed.add(operation_id)
             prev = event
@@ -5462,6 +5584,445 @@ class WalletService:
                     ),
                 )
                 return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    # ---- 跨链派发最终性查询与资产结算（finality / settle）------------------
+
+    #: finality 成功响应 F 的固定键序
+    #: operation_id,chain_id,confirmation（末值为 confirm 既有七键 V）
+    _DISPATCH_FINALITY_VIEW_KEY_ORDER = (
+        "operation_id",
+        "chain_id",
+        "confirmation",
+    )
+
+    #: chain_dispatch_settled 事件 details 的固定键序
+    _DISPATCH_SETTLED_DETAILS_KEY_ORDER = (
+        "dispatch_id",
+        "operation_id",
+    )
+
+    def _dispatch_finality_view(
+        self, request_details: dict, confirmation: dict
+    ) -> dict:
+        """finality 成功响应体 F（三键固定序 operation_id,chain_id,
+        confirmation，末值为 confirm 既有七键 V；键序见
+        _DISPATCH_FINALITY_VIEW_KEY_ORDER）。"""
+        return {
+            "operation_id": request_details["operation_id"],
+            "chain_id": request_details["chain_id"],
+            "confirmation": dict(confirmation),
+        }
+
+    def get_chain_dispatch_finality(
+        self, wallet_id: str, dispatch_id: object
+    ) -> dict:
+        """查询跨链派发最终性，返回
+        F={operation_id,chain_id,confirmation}，末值为 confirm 既有七键 V。
+
+        纯只读：不写文件、不记事件、不分配 seq。路径 D 非法 400；钱包或
+        派发未知 404；无 broadcasted 结果（无结果或 failed）或尚无任何
+        确认进展一律 409。存在确认进展即返回最后一条进展 V（含其
+        confirming|finalized 状态）；是否达 finalized 由结算（settle）
+        另行门控。恢复检查、存在性与状态判定全部在锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、报告、票、派发请求/结果/确认/结算、
+                # 操作与相邻提交事件：矛盾现场 fail-closed。
+                self._reconcile_chain_state_locked(wallet_id)
+                if (
+                    not isinstance(dispatch_id, str)
+                    or not ROTATION_ID_RE.match(dispatch_id)
+                ):
+                    raise ServiceError(
+                        400,
+                        "dispatch_id must match [A-Za-z0-9_-]{1,128}",
+                    )
+
+                requests = self._audit.chain_dispatch_requested_events(
+                    wallet_id
+                )
+                grouped = requests.get(dispatch_id)
+                if not grouped:
+                    raise ServiceError(
+                        404, f"dispatch {dispatch_id!r} not found"
+                    )
+                if len(grouped) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple "
+                        f"chain_dispatch_requested events for {dispatch_id!r}"
+                    )
+                request_details = grouped[0]["details"]
+
+                results = self._audit.chain_dispatch_result_events(wallet_id)
+                result_group = results.get(dispatch_id)
+                if (
+                    not result_group
+                    or result_group[0]["details"]["state"] != "broadcasted"
+                ):
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} has no broadcasted result",
+                    )
+
+                groups = self._audit.chain_dispatch_confirmation_events(
+                    wallet_id
+                ).get(dispatch_id) or []
+                if not groups:
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} has no confirmation yet",
+                    )
+                return self._dispatch_finality_view(
+                    request_details, groups[-1]["details"]
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _dispatch_settled_events_strict(
+        self, wallet_id: str
+    ) -> list[dict]:
+        """返回该钱包全部 chain_dispatch_settled 事件（按 seq 升序）并逐条
+        严格校验**形状**（外层七字段键序、request_id==dispatch_id、
+        actor_id 为安全标识、reason 为 null、details 恰为
+        dispatch_id,operation_id 两键且键序固定、各值合法）。
+
+        与派发请求/结果/确认/账本的先后、归属及紧邻提交语义复核在
+        :meth:`_reconcile_chain_dispatch_settled_events` 按事件 seq 完成。
+        任何形状畸形都是不可对账现场（RecoveryError）。纯只读，不分配
+        seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_SETTLED
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    "event whose outer fields are out of the canonical order"
+                )
+            dispatch_id = event.get("request_id")
+            actor_id = event.get("actor_id")
+            if (
+                not isinstance(dispatch_id, str)
+                or not ROTATION_ID_RE.match(dispatch_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    "event with a malformed dispatch_id"
+                )
+            if dispatch_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"chain_dispatch_settled events for {dispatch_id!r}"
+                )
+            seen.add(dispatch_id)
+            if not (
+                isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} has a malformed adapter_id"
+                )
+            if event.get("reason") is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} has a non-null reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details)
+                != list(self._DISPATCH_SETTLED_DETAILS_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} has malformed details"
+                )
+            if details["dispatch_id"] != dispatch_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} details dispatch_id disagrees with its "
+                    "request_id"
+                )
+            if not (
+                isinstance(details["operation_id"], str)
+                and ROTATION_ID_RE.match(details["operation_id"])
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} has a malformed operation_id"
+                )
+        return events
+
+    def _reconcile_chain_dispatch_settled_events(
+        self, wallet_id: str
+    ) -> None:
+        """按 seq 严格复核全部 chain_dispatch_settled 事件（调用方须持钱包
+        事务锁）。
+
+        每条结算都以其**提交之前**的现场复核在线首提的全部前置：
+
+        - 同一 dispatch_id 的 chain_dispatch_requested、broadcasted 的
+          chain_dispatch_result 必须先于结算事件提交，且存在一条先于结算
+          的 finalized 确认进展（归属、tx 一致性已由请求/结果/确认各自的
+          对账保证，这里复核 actor_id 即请求适配器、operation_id 与请求
+          相同）；
+        - 结算时操作尚为 pending（该操作的 asset_operation_committed 不
+          得早于结算事件）；
+        - 结算事件必须紧邻一条同操作的 asset_operation_committed
+          （两事件同批原子落盘，孤立结算事件即矛盾现场）；该提交事件与
+          账本的逐字段一致由 _reconcile_asset_committed_events 全局对账。
+
+        任一矛盾都 fail-closed（RecoveryError，保留现场）。纯只读，不记
+        事件、不改 seq、不写状态。"""
+        events = self._dispatch_settled_events_strict(wallet_id)
+        if not events:
+            return
+        requests = self._dispatch_events_strict(wallet_id)
+        results = self._dispatch_result_events_strict(wallet_id)
+        confirmations = self._dispatch_confirmation_events_strict(wallet_id)
+        request_by_dispatch = {
+            event["request_id"]: event for event in requests
+        }
+        result_by_dispatch = {
+            event["request_id"]: event for event in results
+        }
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        operations = ledger["operations"]
+        all_events = self._audit.all_events(wallet_id)
+        committed_seq: dict[str, int] = {}
+        for event in all_events:
+            if event.get("type") == audit.TYPE_ASSET_OPERATION_COMMITTED:
+                request_id = event.get("request_id")
+                if isinstance(request_id, str):
+                    committed_seq[request_id] = event["seq"]
+        for index, event in enumerate(all_events):
+            if event.get("type") != audit.TYPE_CHAIN_DISPATCH_SETTLED:
+                continue
+            details = event["details"]
+            dispatch_id = details["dispatch_id"]
+            operation_id = details["operation_id"]
+            seq = event["seq"]
+            request = request_by_dispatch.get(dispatch_id)
+            if request is None or request["seq"] >= seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    f"event for {dispatch_id!r} without a preceding dispatch "
+                    "request"
+                )
+            saved_request = request["details"]
+            if operation_id != saved_request["operation_id"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} operation_id disagrees with its "
+                    "dispatch request"
+                )
+            if event["actor_id"] != saved_request["adapter_id"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_settled "
+                    f"{dispatch_id!r} adapter_id disagrees with its dispatch "
+                    "request"
+                )
+            result = result_by_dispatch.get(dispatch_id)
+            if (
+                result is None
+                or result["seq"] >= seq
+                or result["details"]["state"] != "broadcasted"
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    f"event for {dispatch_id!r} without a preceding "
+                    "broadcasted result"
+                )
+            finalized_prior = any(
+                confirmation["seq"] < seq
+                and confirmation["request_id"] == dispatch_id
+                and confirmation["details"]["state"] == "finalized"
+                for confirmation in confirmations
+            )
+            if not finalized_prior:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    f"event for {dispatch_id!r} without a preceding "
+                    "finalized confirmation"
+                )
+            record = operations.get(operation_id)
+            if record is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    f"event for {dispatch_id!r} whose asset operation "
+                    f"{operation_id!r} is unknown"
+                )
+            prior_commit = committed_seq.get(operation_id)
+            if prior_commit is not None and prior_commit < seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    f"event for already committed asset operation "
+                    f"{operation_id!r}"
+                )
+            follower = (
+                all_events[index + 1] if index + 1 < len(all_events) else None
+            )
+            if (
+                follower is None
+                or follower.get("type")
+                != audit.TYPE_ASSET_OPERATION_COMMITTED
+                or follower.get("request_id") != operation_id
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_settled "
+                    f"event for {dispatch_id!r} without an adjacent "
+                    "committed event"
+                )
+
+    def settle_chain_dispatch(
+        self, wallet_id: str, dispatch_id: object
+    ) -> tuple[int, dict]:
+        """对已 finalize 的跨链派发做资产结算（空体 POST），返回
+        (HTTP 状态码, committed 视图 R)。
+
+        仅当派发归属（adapter）、播链交易（tx）与事件链一致、最后一条
+        确认进展 V 已 finalized、资产操作仍 pending 时才在每钱包跨进程
+        事务锁内原子结算：chain_dispatch_settled 与紧邻的唯一
+        asset_operation_committed 两事件一次原子落盘（seq 为 n、n+1，
+        两事件俱在前滚、俱无回滚，否则 RecoveryError 留现场）。confirming
+        、余额不足或操作已在别处提交一律 409 且无副作用。
+
+        首提 201 返回既有 R；同 dispatch_id 重放优先 200 返回同一 R
+        （不复查现状）；锁内并发只有一个 201，其余 200，重放不记事件。
+        非法 D 400；钱包/派发未知 404。恢复检查、校验、状态判定与事件
+        追加全部在锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、报告、票、派发请求/结果/确认/结算、
+                # 操作与相邻提交事件：矛盾现场 fail-closed。
+                self._reconcile_chain_state_locked(wallet_id)
+                if (
+                    not isinstance(dispatch_id, str)
+                    or not ROTATION_ID_RE.match(dispatch_id)
+                ):
+                    raise ServiceError(
+                        400,
+                        "dispatch_id must match [A-Za-z0-9_-]{1,128}",
+                    )
+
+                # 重放优先于一切现状判定：已结算的同 dispatch_id 一律
+                # 200 返回同一 R（紧邻提交事件的 details），不复查现状。
+                settled_groups = self._audit.chain_dispatch_settled_events(
+                    wallet_id
+                ).get(dispatch_id)
+                if settled_groups:
+                    if len(settled_groups) != 1:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has multiple "
+                            f"chain_dispatch_settled events for "
+                            f"{dispatch_id!r}"
+                        )
+                    settled_event = settled_groups[0]
+                    operation_id = settled_event["details"]["operation_id"]
+                    replay = self._store.get_asset_operation(
+                        wallet_id, operation_id
+                    )
+                    if replay is None or replay["state"] != "committed":
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} chain_dispatch_settled "
+                            f"{dispatch_id!r} has no committed ledger "
+                            "operation"
+                        )
+                    return 200, dict(replay)
+
+                # 404：派发请求未知
+                requests = self._audit.chain_dispatch_requested_events(
+                    wallet_id
+                )
+                grouped = requests.get(dispatch_id)
+                if not grouped:
+                    raise ServiceError(
+                        404, f"dispatch {dispatch_id!r} not found"
+                    )
+                if len(grouped) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple "
+                        f"chain_dispatch_requested events for {dispatch_id!r}"
+                    )
+                request_event = grouped[0]
+                request_details = request_event["details"]
+                operation_id = request_details["operation_id"]
+                adapter_id = request_details["adapter_id"]
+
+                # 409：无 broadcasted 结果
+                results = self._audit.chain_dispatch_result_events(wallet_id)
+                result_group = results.get(dispatch_id)
+                if (
+                    not result_group
+                    or result_group[0]["details"]["state"] != "broadcasted"
+                ):
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} has no broadcasted result",
+                    )
+
+                # 409：最后一条确认进展必须已 finalized（无确认/确认中
+                # 均不可结算）。
+                confirmation_groups = (
+                    self._audit.chain_dispatch_confirmation_events(
+                        wallet_id
+                    ).get(dispatch_id)
+                    or []
+                )
+                if (
+                    not confirmation_groups
+                    or confirmation_groups[-1]["details"]["state"]
+                    != "finalized"
+                ):
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} is not finalized",
+                    )
+
+                record = self._store.get_asset_operation(
+                    wallet_id, operation_id
+                )
+                if record is None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dispatch {dispatch_id!r} "
+                        "refers to an unknown asset operation"
+                    )
+                # 409：操作已在别处提交（链上确认自动提交、人工提交或
+                # 其他结算）。
+                if record["state"] != "pending":
+                    raise ServiceError(
+                        409,
+                        f"asset operation {operation_id!r} is "
+                        f"{record['state']}, not pending",
+                    )
+
+                # 锁内原子结算：余额不足在此抛 409 且无任何副作用
+                # （意图/账本/事件均未写）。成功时
+                # chain_dispatch_settled 与 asset_operation_committed
+                # 两事件同批原子落盘，崩溃按事件俱在/俱无前滚或回滚。
+                committed_record = self._commit_asset_operation_locked(
+                    wallet_id,
+                    operation_id,
+                    record,
+                    settle_dispatch_id=dispatch_id,
+                    settle_adapter_id=adapter_id,
+                )
+                return 201, committed_record
         except CorruptDataError:
             raise
         except ValueError:
