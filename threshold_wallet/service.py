@@ -65,6 +65,22 @@ DKG_FAILOVER_ACTIONS = ("abort", "replace")
 #: DKG 节点健康状态：up 在用可用、down 离线、ban 封禁
 DKG_NODE_STATES = ("up", "down", "ban")
 
+#: 审计事件落盘的外层七字段规范键序（audit 写盘按 sort_keys，惟既定
+#: 类型 details 保序）。恢复据此核对事件**外层**未被重排：正常现场恒为
+#: 此序，任何重排都是外部篡改，按不可对账现场 fail-closed。
+_AUDIT_OUTER_KEY_ORDER = (
+    "actor_id",
+    "at",
+    "details",
+    "reason",
+    "request_id",
+    "seq",
+    "type",
+)
+
+#: node_state 事件 details 内单个节点条目的固定键序。
+_NODE_STATE_ENTRY_KEY_ORDER = ("key", "state")
+
 
 class ServiceError(Exception):
     """业务错误，携带 HTTP 状态码与错误信息。"""
@@ -309,6 +325,11 @@ class WalletService:
             # auto 故障的事前核验在 _dkg_sessions 内随轮次链完成。损坏/
             # 矛盾 fail-closed，恢复不写任何状态、不记事件、不改 seq。
             self._node_state_events_strict(wallet_id)
+            # node_rejoined 事件按其提交之前的健康表/DKG/审批单逐条复核：
+            # 任何矛盾（节点当时不 down|ban、key 不符、非当前 commit|share
+            # 轮、不占槽、审批单未批准/message 不符）fail-closed；恢复不
+            # 写任何状态、不记事件、不改 seq。
+            self._reconcile_node_rejoins(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
             raise
@@ -993,13 +1014,27 @@ class WalletService:
     def _node_state_events_strict(self, wallet_id: str) -> list[dict]:
         """返回该钱包全部 node_state 事件（按 seq 升序），逐条严格校验。
 
-        每条事件 request_id/actor_id/reason 必须为 null，details 恰含
-        ``nodes``：非空、键为安全标识且升序唯一、每值恰含 key(64 位小写
-        hex)/state(up|down|ban)。任何畸形/矛盾都是不可对账现场
-        （RecoveryError，fail-closed），绝不静默忽略。纯只读，不分配
+        每条事件 request_id/actor_id/reason 必须为 null，且：
+
+        - **外层七字段键序**必须为 README 落盘规范序
+          （actor_id,at,details,reason,request_id,seq,type）；
+        - details 恰含 ``nodes``（单键，规范序）；
+        - ``nodes`` 非空、键为安全标识且按节点 ID **升序唯一**；
+        - 每个节点值恰含 ``key``/``state`` 两键且**键序固定为
+          key,state**：key 为 64 位小写 hex，state 为 up|down|ban。
+
+        外层/details/nodes/条目的键序重排、形状或取值非法都是不可对账
+        现场（RecoveryError，fail-closed），绝不静默忽略。纯只读，不分配
         seq。"""
         events = self._audit.events_by_type(wallet_id, audit.TYPE_NODE_STATE)
         for event in events:
+            # 外层七字段键序：读取不重排外层（details 顶层单键亦无歧义），
+            # 故现场键序即落盘键序；任何重排都是外部篡改。
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a node_state event whose "
+                    "outer fields are out of the canonical order"
+                )
             if (
                 event.get("request_id") is not None
                 or event.get("actor_id") is not None
@@ -1010,7 +1045,7 @@ class WalletService:
                     "request_id/actor/reason set"
                 )
             details = event.get("details")
-            if not isinstance(details, dict) or set(details) != {"nodes"}:
+            if not isinstance(details, dict) or list(details) != ["nodes"]:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} has a malformed node_state event"
                 )
@@ -1041,7 +1076,7 @@ class WalletService:
                     )
                 if (
                     not isinstance(entry, dict)
-                    or set(entry) != {"key", "state"}
+                    or list(entry) != list(_NODE_STATE_ENTRY_KEY_ORDER)
                     or not _is_lower_hex_32(entry.get("key"))
                     or entry.get("state") not in DKG_NODE_STATES
                 ):
@@ -1050,16 +1085,6 @@ class WalletService:
                         f"entry for node {node_id!r}"
                     )
         return events
-
-    def _latest_node_states_locked(self, wallet_id: str) -> Optional[dict]:
-        """从 node_state 事件恢复当前节点健康表（取最后一条，已严格校验）。
-
-        无任何 node_state 事件返回 None（GET 未配置 404）。调用方须已持
-        钱包锁且已完成审计对账。"""
-        events = self._node_state_events_strict(wallet_id)
-        if not events:
-            return None
-        return events[-1]["details"]["nodes"]
 
     def put_dkg_nodes(self, wallet_id: str, nodes: object) -> dict:
         """设置 DKG 节点健康表，请求/成功响应（200）同为 Q={"nodes": ...}。
@@ -1076,8 +1101,9 @@ class WalletService:
                 self._get_wallet_or_404(wallet_id)
                 normalized = self._normalize_nodes_body(nodes)
                 body = {"nodes": normalized}
-                current = self._latest_node_states_locked(wallet_id)
+                current = self._health_table_folding_rejoins_locked(wallet_id)
                 # 同值（归一后逐键相等）不记事件；首建或任何差异才记。
+                # 比对的是**生效**健康表（已折叠其后的 rejoin 翻转）。
                 if current != normalized:
                     self._emit(
                         wallet_id,
@@ -1096,14 +1122,16 @@ class WalletService:
     def get_dkg_nodes(self, wallet_id: str) -> dict:
         """读取 DKG 节点健康表：已配置 200 返回 Q，未配置 404。
 
-        健康表纯由 node_state 事件恢复（取最后一条，已严格校验）；损坏/
-        矛盾事件 fail-closed（由 HTTP 边界转 503）。钱包不存在 404。"""
+        返回的是**生效**健康表：最后一条 node_state 快照，再折叠其后已
+        提交 node_rejoined 事件把对应节点置 up（rejoin 不另写快照）。
+        损坏/矛盾事件 fail-closed（由 HTTP 边界转 503）。钱包不存在
+        404。"""
         try:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
                 # 404 优先：锁内先判定钱包存在，再判定健康表是否已配置
                 self._get_wallet_or_404(wallet_id)
-                nodes = self._latest_node_states_locked(wallet_id)
+                nodes = self._health_table_folding_rejoins_locked(wallet_id)
         except CorruptDataError:
             raise
         except ValueError:
@@ -1139,6 +1167,507 @@ class WalletService:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+
+    # ---- DKG 节点重新加入（rejoin）---------------------------------------
+
+    #: rejoin 审批单 message / 事件 details V 的固定键序
+    _REJOIN_VIEW_KEY_ORDER = (
+        "rejoin_id",
+        "dkg_id",
+        "round",
+        "node",
+        "key",
+        "state",
+    )
+
+    @staticmethod
+    def _rejoin_approval_message(
+        rejoin_id: str,
+        dkg_id: str,
+        round_no: int,
+        node: str,
+        key: str,
+    ) -> str:
+        """rejoin 审批单 message 必须逐字一致的紧凑 JSON（无空格、键序
+        固定为 rejoin_id,dkg_id,round,node,key）。"""
+        return json.dumps(
+            {
+                "rejoin_id": rejoin_id,
+                "dkg_id": dkg_id,
+                "round": round_no,
+                "node": node,
+                "key": key,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _rejoin_view(
+        self,
+        rejoin_id: str,
+        dkg_id: str,
+        round_no: int,
+        node: str,
+        key: str,
+    ) -> dict:
+        """rejoin 成功/重放响应体 V（键序固定，state 恒为 up）。"""
+        return {
+            "rejoin_id": rejoin_id,
+            "dkg_id": dkg_id,
+            "round": round_no,
+            "node": node,
+            "key": key,
+            "state": "up",
+        }
+
+    def _rejoin_events_strict(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部 node_rejoined 事件（按 seq 升序）并逐条严格校验
+        **形状**（外层七字段键序、request_id==rejoin_id、actor_id 为安全
+        标识、reason 为 null、details 恰为六键 V 且键序固定、各值合法）。
+
+        这里只做与现场无关的形状校验；与事前健康表/DKG/审批单的语义复核
+        在 :meth:`_reconcile_node_rejoins` 按事件 seq 完成。任何形状畸形
+        都是不可对账现场（RecoveryError）。纯只读，不分配 seq。"""
+        # 用 events_by_type 而非按 request_id 分组：后者会丢掉 request_id
+        # 为 null/非字符串的畸形事件，必须让它们也进入严格校验而非被静默
+        # 忽略。
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_NODE_REJOINED
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a node_rejoined event whose "
+                    "outer fields are out of the canonical order"
+                )
+            rejoin_id = event.get("request_id")
+            actor_id = event.get("actor_id")
+            if (
+                not isinstance(rejoin_id, str)
+                or not ROTATION_ID_RE.match(rejoin_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a node_rejoined event with a "
+                    "malformed rejoin_id"
+                )
+            if rejoin_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple node_rejoined events "
+                    f"for {rejoin_id!r}"
+                )
+            seen.add(rejoin_id)
+            if not (
+                isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "malformed approval_request_id"
+                )
+            if event.get("reason") is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "non-null reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details) != list(self._REJOIN_VIEW_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has "
+                    "malformed details"
+                )
+            if details["rejoin_id"] != rejoin_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} "
+                    "details rejoin_id disagrees with its request_id"
+                )
+            dkg_id = details["dkg_id"]
+            node = details["node"]
+            key = details["key"]
+            round_no = details["round"]
+            if not isinstance(dkg_id, str) or not ROTATION_ID_RE.match(dkg_id):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "malformed dkg_id"
+                )
+            if not isinstance(node, str) or not ROTATION_ID_RE.match(node):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "malformed node"
+                )
+            if not _is_lower_hex_32(key):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "malformed key"
+                )
+            if (
+                not isinstance(round_no, int)
+                or isinstance(round_no, bool)
+                or round_no < 1
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "malformed round"
+                )
+            if details["state"] != "up":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has a "
+                    "state other than up"
+                )
+        return events
+
+    def _health_table_folding_rejoins_locked(self, wallet_id: str) -> Optional[dict]:
+        """当前生效健康表：最后一条 node_state 快照，再按其**之后**提交的
+        node_rejoined 事件把对应节点翻为 up（details.key 不变）。
+
+        无任何 node_state 快照返回 None。读取前先按事前健康表/DKG/审批单
+        完整复核全部 rejoin 事件（矛盾即 RecoveryError）。调用方须持钱包
+        锁。"""
+        self._reconcile_node_rejoins(wallet_id)
+        node_events = self._node_state_events_strict(wallet_id)
+        if not node_events:
+            return None
+        last_state_seq = node_events[-1]["seq"]
+        table = {
+            node_id: dict(entry)
+            for node_id, entry in node_events[-1]["details"]["nodes"].items()
+        }
+        for event in self._rejoin_events_strict(wallet_id):
+            if event["seq"] <= last_state_seq:
+                continue
+            node = event["details"]["node"]
+            if node in table:
+                table[node] = {"key": table[node]["key"], "state": "up"}
+        return table
+
+    def _reconcile_node_rejoins(self, wallet_id: str) -> None:
+        """按 seq 严格复核全部 node_rejoined 事件（调用方须持钱包锁）。
+
+        每条事件都以其**提交之前**的现场复核在线首提的全部前置：
+
+        - 事前健康表（该事件 seq 之前最近 node_state 快照，仅折叠该快照
+          之后、本事件之前的更早 rejoin 翻转）中 N 存在、key 与
+          details.key 一致、state 为 down|ban；
+        - 事前 DKG（seq 前缀重建）存在会话 dkg_id，当前轮恰为 round 且
+          状态为 commit|share，N **不占用**该轮槽位（轮外待命节点）；
+        - 同钱包审批单 actor_id 存在，message 逐字为按
+          rejoin_id,dkg_id,round,node,key 序的紧凑 JSON，且状态为
+          approved（其后推进为 signed 亦认可）。
+
+        任一不满足、或同一 rejoin_id 重复提交，都是不可对账现场
+        （RecoveryError，fail-closed，保留现场）。纯只读，不记事件、不改
+        seq、不写状态。"""
+        events = self._rejoin_events_strict(wallet_id)
+        if not events:
+            return
+        # 事前健康表需要 node_state 事件（同时再严格校验一次）。
+        node_events = self._node_state_events_strict(wallet_id)
+        for event in events:
+            seq = event["seq"]
+            rejoin_id = event["request_id"]
+            actor_id = event["actor_id"]
+            d = event["details"]
+            dkg_id = d["dkg_id"]
+            round_no = d["round"]
+            node = d["node"]
+            key = d["key"]
+
+            # --- 事前健康表 ---
+            health = None
+            snapshot_seq = 0
+            for ne in node_events:
+                if ne["seq"] < seq:
+                    health = ne["details"]["nodes"]
+                    snapshot_seq = ne["seq"]
+            if health is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} has "
+                    "no prior node_state snapshot"
+                )
+            # 折叠该快照**之后**、本事件之前的更早 rejoin 翻转：快照自身
+            # 已权威反映其之前所有 rejoin，只叠加快照之后的翻转。
+            folded = {n: dict(e) for n, e in health.items()}
+            for earlier in events:
+                eseq = earlier["seq"]
+                if eseq >= seq:
+                    break
+                if eseq <= snapshot_seq:
+                    continue
+                en = earlier["details"]["node"]
+                if en in folded:
+                    folded[en] = {"key": folded[en]["key"], "state": "up"}
+            entry = folded.get(node)
+            if not isinstance(entry, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} node "
+                    f"{node!r} is absent from the prior health table"
+                )
+            if entry.get("key") != key:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} key "
+                    "does not match the health table"
+                )
+            if entry.get("state") not in ("down", "ban"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} node "
+                    "is not down or banned in the prior health table"
+                )
+
+            # --- 事前 DKG 现场 ---
+            sessions = self._dkg_sessions(wallet_id, until_seq=seq - 1)
+            session = sessions.get(dkg_id)
+            if session is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} refers "
+                    f"to unknown dkg session {dkg_id!r}"
+                )
+            if session["current"] != round_no:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} round "
+                    "is not the current dkg round"
+                )
+            current_round = session["rounds"][round_no]
+            if current_round["state"] not in ("commit", "share"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} round "
+                    "is not in the commit/share stage"
+                )
+            node_ids = [n for n, _ in current_round["nodes"]]
+            if node in node_ids:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} node "
+                    "already occupies a slot in the round"
+                )
+
+            # --- 审批单复核（同钱包、approved、message 逐字一致）---
+            try:
+                approval = self._store.get_request(wallet_id, actor_id)
+            except CorruptDataError:
+                raise
+            except ValueError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} "
+                    "approval record is unreadable"
+                ) from exc
+            if not isinstance(approval, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} refers "
+                    "to an unknown approval request"
+                )
+            expected_message = self._rejoin_approval_message(
+                rejoin_id, dkg_id, round_no, node, key
+            )
+            if approval.get("message") != expected_message:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} "
+                    "approval message does not match"
+                )
+            # 提交时必为 approved；其后该审批单只能停留 approved 或经
+            # /sign 推进为 signed（pending 才可能转 rejected/expired），
+            # 故这两者都证明提交时刻已批准。
+            if approval.get("state") not in ("approved", "signed"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} node_rejoined {rejoin_id!r} "
+                    "approval request is not approved"
+                )
+
+    def post_node_rejoin(
+        self,
+        wallet_id: str,
+        node: object,
+        rejoin_id: object,
+        dkg_id: object,
+        round_no: object,
+        key: object,
+        approval_request_id: object,
+    ) -> tuple[int, dict]:
+        """故障节点重新加入，返回 (HTTP 状态码, 视图 V)。
+
+        请求体恰含 rejoin_id,dkg_id,round,key,approval_request_id 五键
+        （HTTP 边界拦键集）：rejoin_id/dkg_id/node/approval_request_id 为
+        安全标识，key 为 64 位小写 hex，round 为非布尔正整数；键集/类型/
+        值错 400；钱包/DKG/节点未知 404。
+
+        首提须 N 当前 down|ban 且 key 与健康表一致、round 恰为 DKG 当前
+        commit|share 轮且 N 不占用该轮槽位（轮外待命节点）、审批单为同
+        钱包 approved 且 message 逐字为按
+        rejoin_id,dkg_id,round,node,key 序的紧凑 JSON；
+        否则 409 且现场不变。成功把 N 置 up，201 返回 V。同 rejoin_id 同
+        参重放 200 同 V、异参 409。node_rejoined 是唯一提交点
+        （request_id=rejoin_id、actor_id=approval_request_id、
+        reason=null、details=V）；跨进程并发只有一个 201。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先严格复核 node_state / node_rejoined / DKG 现场：
+                # 矛盾现场 fail-closed（503），优先于参数 400/404 判定。
+                self._reconcile_node_rejoins(wallet_id)
+                # 类型/取值校验（400）
+                self._validate_dkg_node(node)
+                if not isinstance(rejoin_id, str) or not ROTATION_ID_RE.match(
+                    rejoin_id
+                ):
+                    raise ServiceError(
+                        400,
+                        "rejoin_id must match [A-Za-z0-9_-]{1,128}",
+                    )
+                self._validate_dkg_id(dkg_id)
+                if (
+                    not isinstance(round_no, int)
+                    or isinstance(round_no, bool)
+                    or round_no < 1
+                ):
+                    raise ServiceError(
+                        400, "round must be a positive integer"
+                    )
+                if not _is_lower_hex_32(key):
+                    raise ServiceError(
+                        400, "key must be 64 lowercase hex characters"
+                    )
+                if (
+                    not isinstance(approval_request_id, str)
+                    or not ROTATION_ID_RE.match(approval_request_id)
+                ):
+                    raise ServiceError(
+                        400,
+                        "approval_request_id must match "
+                        "[A-Za-z0-9_-]{1,128}",
+                    )
+
+                sessions = self._build_dkg_sessions(wallet_id, None)
+                # 幂等优先于 404/状态判定：已提交的同 rejoin_id 重放。
+                committed_groups = self._audit.node_rejoined_events(
+                    wallet_id
+                ).get(rejoin_id)
+                if committed_groups:
+                    if len(committed_groups) != 1:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} has multiple "
+                            f"node_rejoined events for {rejoin_id!r}"
+                        )
+                    saved = committed_groups[0]["details"]
+                    if (
+                        saved["dkg_id"] == dkg_id
+                        and saved["round"] == round_no
+                        and saved["node"] == node
+                        and saved["key"] == key
+                        and committed_groups[0]["actor_id"]
+                        == approval_request_id
+                    ):
+                        # 同参（含审批单标识）重放：200 同 V，不复查现状
+                        return 200, dict(saved)
+                    raise ServiceError(
+                        409,
+                        f"rejoin {rejoin_id!r} already exists with different "
+                        "parameters",
+                    )
+
+                # 404：DKG 会话未知 / 节点不在健康表
+                session = sessions.get(dkg_id)
+                if session is None:
+                    raise ServiceError(
+                        404, f"dkg session {dkg_id!r} not found"
+                    )
+                # 当前**生效**健康表：最新 node_state 快照折叠其后已提交的
+                # rejoin 翻转（rejoin 只改 state、不改成员，故成员判定与
+                # 原表一致）。
+                folded = self._health_table_folding_rejoins_locked(wallet_id)
+                if folded is None or node not in folded:
+                    raise ServiceError(
+                        404,
+                        f"node {node!r} not found in the node health table",
+                    )
+
+                # 首提前置：生效健康表中 N down|ban 且 key 一致。
+                entry = folded[node]
+                if entry["state"] not in ("down", "ban"):
+                    raise ServiceError(
+                        409,
+                        f"node {node!r} is not down or banned",
+                    )
+                if entry["key"] != key:
+                    raise ServiceError(
+                        409,
+                        "key does not match the node health table",
+                    )
+
+                # round 须为当前 commit|share 轮，且 N 不占槽位。
+                current = session["current"]
+                if round_no != current:
+                    raise ServiceError(
+                        409,
+                        f"round must be the current round {current}",
+                    )
+                current_round = session["rounds"][current]
+                if current_round["state"] not in ("commit", "share"):
+                    raise ServiceError(
+                        409,
+                        "rejoin requires the current round to be in the "
+                        "commit or share stage",
+                    )
+                node_ids = [n for n, _ in current_round["nodes"]]
+                if node in node_ids:
+                    # rejoin 的 N 是当前轮之外的待命故障节点：已占用槽位
+                    # 的在用节点不能"重新加入"。
+                    raise ServiceError(
+                        409,
+                        f"node {node!r} already occupies a slot in the "
+                        "current round",
+                    )
+
+                # 审批门控：同钱包既有 approved 审批单，message 逐字一致。
+                # 按既有契约懒过期（可能原子记一次 request_expired）。
+                approval = self._store.get_request(
+                    wallet_id, approval_request_id
+                )
+                if approval is None:
+                    raise ServiceError(
+                        409,
+                        f"approval request {approval_request_id!r} not found",
+                    )
+                approval = self._expire_if_needed(wallet_id, approval)
+                expected_message = self._rejoin_approval_message(
+                    rejoin_id, dkg_id, round_no, node, key
+                )
+                if approval["message"] != expected_message:
+                    raise ServiceError(
+                        409,
+                        "approval request message does not match this rejoin",
+                    )
+                if approval["state"] != "approved":
+                    raise ServiceError(
+                        409,
+                        f"approval request {approval_request_id!r} is "
+                        f"{approval['state']}, not approved",
+                    )
+
+                # node_rejoined 是唯一提交点：在跨进程事务锁内追加事件，
+                # 事件之外不写任何健康状态文件；当前健康表由"最后快照 +
+                # 其后 rejoin 翻转"在读取时重建。
+                view = self._rejoin_view(
+                    rejoin_id, dkg_id, round_no, node, key
+                )
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_NODE_REJOINED,
+                        request_id=rejoin_id,
+                        actor_id=approval_request_id,
+                        reason=None,
+                        details=view,
+                    ),
+                )
+                return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
 
     # ---- 签名请求审批单 ---------------------------------------------------
 
@@ -6132,8 +6661,16 @@ class WalletService:
             )
         return dkg_id, round_no
 
-    def _dkg_sessions(self, wallet_id: str) -> dict[str, dict]:
+    def _dkg_sessions(
+        self, wallet_id: str, until_seq: Optional[int] = None
+    ) -> dict[str, dict]:
         """从 dkg_stage / dkg_failover 事件重建并严格校验该钱包全部 DKG 会话。
+
+        ``until_seq`` 给定时只重放 ``seq <= until_seq`` 的事件（恢复复核
+        node_rejoined 提交时刻现场用），该路径**不**再重跑全量 rejoin
+        复核（复核内部按各 rejoin seq 前缀反复调用本方法，避免递归）；
+        全量（``until_seq is None``）访问先严格复核 node_rejoined 事件，
+        使 DKG 路由同样在 rejoin 现场矛盾时 fail-closed，绝不绕过对账。
 
         事件是 DKG 状态的唯一持久化与提交点：基线轮（第 1 轮）由
         request_id 为会话 id 的 dkg_stage 事件重放；每个派生轮（第
@@ -6147,8 +6684,20 @@ class WalletService:
         mode=auto）重建时须以其事件提交之前最近的健康快照核验自动选择，
         故即使尚无 DKG 会话，健康表畸形也在此 fail-closed。纯只读，
         不分配 seq、不写任何状态。"""
+        if until_seq is None:
+            self._reconcile_node_rejoins(wallet_id)
+        return self._build_dkg_sessions(wallet_id, until_seq)
+
+    def _build_dkg_sessions(
+        self, wallet_id: str, until_seq: Optional[int]
+    ) -> dict[str, dict]:
+        """只按事件重建 DKG 会话（不触发 rejoin 全量复核）。"""
         # 健康表先严格校验一次，供各 auto 故障按事件 seq 取事前快照核验。
         node_events = self._node_state_events_strict(wallet_id)
+
+        def _accepted(ev: dict) -> bool:
+            return until_seq is None or ev["seq"] <= until_seq
+
         stage_rounds: dict[str, dict[int, list[dict]]] = {}
         for request_id, events in self._audit.dkg_stage_events(
             wallet_id
@@ -6158,7 +6707,7 @@ class WalletService:
             )
             stage_rounds.setdefault(dkg_id, {}).setdefault(
                 round_no, []
-            ).extend(events)
+            ).extend(ev for ev in events if _accepted(ev))
         failover_rounds: dict[str, dict[int, list[dict]]] = {}
         for request_id, events in self._audit.dkg_failover_events(
             wallet_id
@@ -6166,15 +6715,19 @@ class WalletService:
             dkg_id, round_no = self._parse_dkg_request_id(
                 wallet_id, request_id, failover=True
             )
+            accepted = [ev for ev in events if _accepted(ev)]
+            if not accepted:
+                continue
             failover_rounds.setdefault(dkg_id, {}).setdefault(
                 round_no, []
-            ).extend(events)
+            ).extend(accepted)
         sessions: dict[str, dict] = {}
         for dkg_id in sorted(set(stage_rounds) | set(failover_rounds)):
             sessions[dkg_id] = self._rebuild_dkg_session(
                 wallet_id,
                 dkg_id,
-                stage_rounds.get(dkg_id, {}),
+                {r: evs for r, evs in stage_rounds.get(dkg_id, {}).items()
+                 if evs},
                 failover_rounds.get(dkg_id, {}),
                 node_events,
             )
@@ -7185,12 +7738,15 @@ class WalletService:
                             "current round",
                         )
                     if auto_request:
-                        # 自动替补：用当前健康表（即最新一条 node_state
-                        # 快照；恢复核验改用事件提交前快照）选择。node 在用
-                        # 且 down|ban，候选为非参与且 up 的节点，取 ID
-                        # 升序首个并实写其 key。健康表缺失/node 未故障/无
-                        # 候选一律 409，不落事件、DKG 现场不变。
-                        health = self._latest_node_states_locked(wallet_id)
+                        # 自动替补：用当前**生效**健康表（最新 node_state
+                        # 快照折叠其后的 node_rejoined 翻转；恢复核验改用
+                        # 事件提交前快照）选择。node 在用且 down|ban，候选
+                        # 为非参与且 up 的节点，取 ID 升序首个并实写其
+                        # key。健康表缺失/node 未故障/无候选一律 409，不落
+                        # 事件、DKG 现场不变。
+                        health = self._health_table_folding_rejoins_locked(
+                            wallet_id
+                        )
                         if health is None:
                             raise ServiceError(
                                 409,

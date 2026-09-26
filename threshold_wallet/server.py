@@ -10,6 +10,7 @@
 - GET  /v1/wallets/<wallet_id>/dkg-failover-policy  查询 DKG 故障审批开关
 - PUT  /v1/wallets/<wallet_id>/nodes                设置 DKG 节点健康表
 - GET  /v1/wallets/<wallet_id>/nodes                查询 DKG 节点健康表
+- POST /v1/wallets/<wallet_id>/nodes/<node_id>/rejoin 故障节点重新加入
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
@@ -296,6 +297,38 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_error(404, "not found")
                     return
                 wallet_id, rest = matched
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "nodes"
+                    and rest[2] == "rejoin"
+                ):
+                    body = self._read_json_body()
+                    # 请求体恰含 rejoin_id/dkg_id/round/key/
+                    # approval_request_id 五键（值类型/取值由 service 校验）
+                    if set(body) != {
+                        "rejoin_id",
+                        "dkg_id",
+                        "round",
+                        "key",
+                        "approval_request_id",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly rejoin_id, dkg_id, "
+                            "round, key and approval_request_id",
+                        )
+                    status, result = service.post_node_rejoin(
+                        wallet_id,
+                        rest[1],
+                        body.get("rejoin_id"),
+                        body.get("dkg_id"),
+                        body.get("round"),
+                        body.get("key"),
+                        body.get("approval_request_id"),
+                    )
+                    self._send_json(status, result)
+                    return
 
                 if rest == ["sign"]:
                     body = self._read_json_body()

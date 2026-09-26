@@ -43,6 +43,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批开关（缺省 `{"enabled":false}`） |
 | PUT  | `/v1/wallets/{id}/nodes` | 设置 DKG 节点健康表 `{"nodes":{...}}` |
 | GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
+| POST | `/v1/wallets/{id}/nodes/{node}/rejoin` | 故障节点重新加入 `{"rejoin_id","dkg_id","round","key","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
@@ -284,7 +285,11 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   一律 `404`；`PUT` 可首建。健康表仅由 `node_state` 审计事件持久化
   （`request_id`/`actor_id`/`reason` 为 `null`，details 即 Q，取最后
   一条恢复），不写状态文件。**同值不记事件**；仅当与当前表不同才追加
-  一条 `node_state`。事件损坏/形状矛盾 fail-closed（常驻 `503`、
+  一条 `node_state`。恢复对每条 `node_state` 事件严格校验 README 键序：
+  事件**外层七字段**须为落盘规范序
+  （`actor_id,at,details,reason,request_id,seq,type`）、details 恰含
+  `nodes`、节点 ID 按**升序唯一**、每个节点值恰为键序 `key,state`；
+  重排、形状或取值矛盾都 fail-closed（抛 `RecoveryError`，常驻 `503`、
   `serve` 拒绝就绪），重启/灾备恢复后健康表与 seq 不变。
 
 `POST /v1/dkg/{id}/{did}/failover` 的 `replace` 支持**自动替补**：
@@ -312,6 +317,51 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。
   恢复本身不新增审计事件，响应、日志、非份额文件绝不泄露份额私钥或
   份额正文。
+
+### DKG 故障节点重新加入（rejoin）
+
+`POST /v1/wallets/{id}/nodes/{node}/rejoin`（仅 POST），请求体 B 恰含
+`{"rejoin_id","dkg_id","round","key","approval_request_id"}` 五键
+（含其他键或缺键一律 `400`）：把当前轮之外处于 `down|ban` 的待命节点
+重新置为 `up`。路径 `{node}` 即重新加入的节点 N。
+
+- `rejoin_id`/`dkg_id`/N/`approval_request_id` 沿用安全标识
+  `[A-Za-z0-9_-]{1,128}`；`key` 为 64 位小写 hex；`round` 为非布尔正
+  整数。B 的键集/类型/值错 `400`；钱包、DKG 会话、节点（不在健康表）
+  未知一律 `404`。
+- **首提前置**：生效健康表（最后一条 `node_state` 快照折叠其后的
+  rejoin 翻转）中 N 必须为 `down|ban` 且 `key` 与其记录一致；`round`
+  必须恰为该 DKG **当前** `commit|share` 轮，且 N **不占用**该轮槽位
+  （N 是轮外待命节点）。任一不满足 `409`，现场不变。
+- **审批**：`approval_request_id` 必须指向**同一钱包**既有、且为
+  `approved` 的审批单；其 `message` 必须与紧凑 JSON **逐字一致**
+  （无空格、键序固定）：
+  `{"rejoin_id":"RJ","dkg_id":"D","round":R,"node":N,"key":K}`。审批
+  单未知、非 `approved`（操作前按既有契约懒过期）或 message 不符一律
+  `409`，不追加事件、健康/DKG 现场不变。
+- 成功把 N 置为 `up`，`201` 返回
+  `V={"rejoin_id","dkg_id","round","node","key","state"}`，键序固定且
+  `state="up"`。同 `rejoin_id` **同参**（含 `approval_request_id`）重放
+  `200` 返回同一 V（优先于状态判定，不复查现状）；同 `rejoin_id`
+  **异参** `409`。
+- 节点状态仅由审计事件持久化：`node_rejoined` 是唯一提交点
+  （`request_id=rejoin_id`、`actor_id=approval_request_id`、
+  `reason=null`、details 即 V，键序
+  `rejoin_id,dkg_id,round,node,key,state`），不另写健康状态文件；
+  `GET .../nodes` 返回的生效健康表为最后一条 `node_state` 快照折叠其后
+  全部 rejoin 翻转。首提在每钱包跨进程事务锁内追加，跨进程并发只有一个
+  `201`（其余同参 `200`），审计 seq 连续不重号，重放不记事件。
+- 重启/灾备恢复时，每条 `node_rejoined` 都按其**提交之前**的现场逐条
+  复核：事前最近 `node_state` 快照（仅折叠该快照之后、本事件之前的
+  rejoin 翻转）中 N 存在、`key` 一致且为 `down|ban`；事前 DKG
+  （按 seq 前缀重建）存在该会话、当前轮恰为 `round` 且处
+  `commit|share`、N 不占槽；同钱包审批单存在且 message 逐字一致、状态
+  为 `approved`（其后经 `/sign` 推进为 `signed` 亦认可）。重复
+  `rejoin_id`、事前无快照或任何矛盾都 fail-closed（抛
+  `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件 I/O
+  失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。恢复不
+  新增事件、不改 seq，响应、日志、非份额文件绝不泄露份额私钥或份额
+  正文。
 
 ### DKG 故障审批（可选）
 
@@ -485,7 +535,8 @@ quorum 后按既有 commit 契约自动提交。
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
-`dkg_failover`、`dkg_failover_policy_updated`、`node_state`、`chain_policy`、
+`dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
+`node_rejoined`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`。
 
 ## 多进程与故障恢复（保证）
