@@ -69,7 +69,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
 | POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
 | GET  | `/v1/dkg/{id}/{did}` | 查询两方 DKG 会话视图 |
-| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}`（启用故障审批时另加 `approval_request_id`） |
+| POST | `/v1/dkg/{id}/{did}/failover` | 提交 DKG 故障轮次 `{"round","action","node","replacement","key"}`（启用故障审批时另加 `approval_request_id`；`reinstate` 恒为六键） |
 
 ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
@@ -254,6 +254,21 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   `shared` 两数组清空，回到 `commit` 阶段。非法 `400`、冲突 `409`。
   另支持 `replacement`/`key` 双 `null` 的**自动替补**（见下文
   「DKG 节点健康与自动替补」）；一项 `null` 另一项非 `null` 为 `400`。
+- `reinstate`：沿用 `replace` 契约（仅限两方已注册的 `commit|share`
+  轮，换槽清空后两数组回到 `commit`），但请求体恰为有序
+  K=`(round,action,node,replacement,key)` 加 `approval_request_id`
+  六键（`replacement`/`key` 不支持双 `null` 自动选择）；
+  `replacement` 须为**已提交 `node_rejoined` 对应的当前 up 空闲
+  节点**；`approval_request_id` 须为同钱包 `approved` 审批单，
+  `message` 逐字为以 `dkg_id` 后接 K 的紧凑 JSON
+  （`{"dkg_id":"D","round":R,"action":"reinstate","node":N,"replacement":X,"key":K}`）——**审批开关不豁免**
+  （开关关闭同样强制审批），审批单未知/非 approved/message 不符或
+  replacement 不符一律 `409`。仅六字段全同重放 `200`，更换审批单
+  或任一值 `409`。其 `dkg_failover` 事件
+  `actor_id=approval_request_id`、`reason=null`，details 键序
+  `id,round,action,node,replacement,key,state`（K 原位展开，
+  `state=commit`）；恢复按 `actor_id` 复核审批。**仅 reinstate 的
+  `actor_id` 非 `null`，abort/replace 仍为 `null`**，其余契约不变。
 - 首提 `201`；已提交轮次的旧五键同参重放 `200`（**优先于状态与审批
   判定，不复查审批单**）；同 `round` 异参 `409`；`round` 不等于
   当前轮 +1 `409`；钱包/会话未知 `404`。自动替补（双 `null`）的重放
@@ -264,9 +279,10 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   五键。`aborted` 轮一律 `409`；派生轮不接受 `register`（`409`），
   `commit`/`share` 沿用旧约。
 - 故障轮次仅由 `dkg_failover` 审计事件持久化（`request_id` 为
-  `<会话id>/<轮次>`，`actor_id`/`reason` 为 `null`，手工/旧事件
-  details 依次 `id,round,action,node,replacement,key,state`；自动替补
-  事件为既有七键加末键 `mode`（`mode=auto`），**不含审批标识**）：
+  `<会话id>/<轮次>`，`reason` 为 `null`；`actor_id` 仅 reinstate
+  事件非 `null`（审批单标识），abort/replace 恒为 `null`；手工/旧/
+  reinstate 事件 details 依次 `id,round,action,node,replacement,key,state`；
+  自动替补事件为既有七键加末键 `mode`（`mode=auto`），**不含审批标识**）：
   首提在每钱包跨进程事务锁内追加，事件为唯一提交点，跨进程并发只有
   一个 `201`，重放不记。矛盾/损坏现场 fail-closed（常驻 `503`、
   `serve` 拒绝就绪），重启/灾备恢复后轮次与 seq 不变。响应、日志、
@@ -361,7 +377,10 @@ register→commit→share→done 完成两方密钥生成。后端只登记各�
   `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件 I/O
   失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。恢复不
   新增事件、不改 seq，响应、日志、非份额文件绝不泄露份额私钥或份额
-  正文。
+  正文。此外，**审计读取在归一化前**即校验每条 `node_rejoined` 的
+  details 键序须逐字为 README 序
+  （`rejoin_id,dkg_id,round,node,key,state`）：错序/错键集抛
+  `RecoveryError`，坏 JSON 抛 `CorruptDataError`，绝不静默重排。
 
 ### DKG 故障审批（可选）
 

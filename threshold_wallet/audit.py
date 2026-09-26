@@ -34,6 +34,7 @@ from typing import Optional
 
 from .store import (
     CorruptDataError,
+    RecoveryError,
     WalletStore,
     _check_id,
     _SAFE_ID,
@@ -342,6 +343,24 @@ class AuditStore:
                 raise CorruptDataError(
                     f"audit log {path!r} next_seq disagrees with its events"
                 )
+        # node_rejoined 的 details 落盘键序须逐字为 README 既定序
+        # （rejoin_id,dkg_id,round,node,key,state）：归一化之前先校验，
+        # 错序/错键集都是不可对账现场（RecoveryError，fail-closed），
+        # 绝不静默重排；JSON 不可解析仍由 WalletStore._read_json 抛
+        # CorruptDataError。
+        for event in events:
+            if (
+                isinstance(event, dict)
+                and event.get("type") == TYPE_NODE_REJOINED
+            ):
+                details = event.get("details")
+                if not isinstance(details, dict) or list(details) != list(
+                    _DETAILS_KEY_ORDER[TYPE_NODE_REJOINED]
+                ):
+                    raise RecoveryError(
+                        f"audit log {path!r} has a node_rejoined event "
+                        "whose details are out of the README key order"
+                    )
         # 既定事件类型的 details 在内存视图中归一为 README 既定键序，
         # 使查询/重建/重写（落盘与灾备）都按该顺序保序。
         for event in events:
