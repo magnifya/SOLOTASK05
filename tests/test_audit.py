@@ -364,6 +364,154 @@ class AuditHttpTest(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIn("error", body)
 
+    # ---- 公开键序与紧凑 JSON 线格式 --------------------------------------
+
+    def _raw_get(self, path):
+        import http.client
+        from urllib.parse import urlparse
+
+        u = urlparse(self.srv.base_url)
+        conn = http.client.HTTPConnection(u.hostname, u.port)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.status, resp.getheader("Content-Type"), resp.read()
+
+    def test_success_body_is_compact_utf8_no_trailing_newline(self):
+        self.put_policy()
+        status, ctype, raw = self._raw_get(
+            "/v1/wallets/w1/audit-events"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(ctype, "application/json; charset=utf-8")
+        # UTF-8 紧凑 JSON：无 ": "/", " 空白、无末换行
+        self.assertNotIn(b": ", raw)
+        self.assertNotIn(b", ", raw)
+        self.assertFalse(raw.endswith(b"\n"))
+        self.assertTrue(
+            raw.startswith(b'{"wallet_id":"w1","events":[')
+        )
+        # UTF-8 可解码
+        raw.decode("utf-8")
+
+    def test_success_body_does_not_escape_non_ascii(self):
+        self.put_policy()
+        # message 进入 request_created 事件 details，原样非 ASCII
+        self.create_request(rid="r1", message="捐款100")
+        _, _, raw = self._raw_get("/v1/wallets/w1/audit-events")
+        self.assertNotIn(b"\\u", raw)
+        self.assertIn("捐款100".encode("utf-8"), raw)
+
+    def test_other_endpoints_keep_default_spaced_json(self):
+        self.put_policy()
+        # 同一资源的其他 GET（钱包视图）仍是默认带空白序列化，不受影响
+        _, _, wallet_raw = self._raw_get("/v1/wallets/w1")
+        self.assertTrue(b": " in wallet_raw or b", " in wallet_raw)
+        # 错误体（400/404）也保持默认序列化
+        _, _, bad = self._raw_get(
+            "/v1/wallets/w1/audit-events?limit=0"
+        )
+        self.assertEqual(bad, b'{"error": "limit must be a positive integer"}')
+        _, _, missing = self._raw_get(
+            "/v1/wallets/ghost/audit-events"
+        )
+        self.assertIn(b'"error": ', missing)
+
+    def test_non_failover_event_keeps_sorted_outer_order(self):
+        # 其余事件类型契约不变：policy_updated 外层仍是落盘 sort_keys 序
+        self.put_policy()
+        (event,) = [
+            e for e in self.events()["events"]
+            if e["type"] == "policy_updated"
+        ]
+        self.assertEqual(
+            list(event),
+            ["actor_id", "at", "details", "reason", "request_id",
+             "seq", "type"],
+        )
+
+
+class AuditDkgFailoverOrderHttpTest(unittest.TestCase):
+    """dkg_failover 公开键序：外层逻辑序 + details 既定序（auto 末键
+    mode）；查询只重排副本，落盘外层仍为 sort_keys 规范序。"""
+
+    KEY_A = "aa" * 32
+    KEY_B = "bb" * 32
+    KEY_C = "cc" * 32
+    HASH_A = "11" * 32
+    HASH_B = "22" * 32
+
+    def setUp(self):
+        self._ctx = http_server(tempfile.mkdtemp())
+        self.srv = self._ctx.__enter__()
+        self.svc = self.srv.harness.service
+        self.request("POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2})
+        for node, key in (("n1", self.KEY_A), ("n2", self.KEY_B)):
+            self.assertEqual(
+                self.svc.post_dkg_stage(
+                    "w1", "d1", "register", node, key, None, None, None
+                )[0],
+                201,
+            )
+        self.assertEqual(
+            self.svc.post_dkg_stage(
+                "w1", "d1", "commit", "n1", None, self.HASH_A, None, None
+            )[0],
+            201,
+        )
+        self.assertEqual(
+            self.svc.post_dkg_stage(
+                "w1", "d1", "commit", "n2", None, self.HASH_B, None, None
+            )[0],
+            201,
+        )
+
+    def tearDown(self):
+        self._ctx.__exit__(None, None, None)
+
+    def request(self, method, path, body=None):
+        return self.srv.request(method, path, body)
+
+    def test_failover_outer_and_details_order_on_query(self):
+        code, _ = self.svc.post_dkg_failover(
+            "w1", "d1", 2, "replace", "n2", "n3", self.KEY_C,
+            self.svc._NO_APPROVAL,
+        )
+        self.assertEqual(code, 201)
+        result = self.svc.get_audit_events("w1")
+        self.assertEqual(list(result), ["wallet_id", "events"])
+        (event,) = [
+            e for e in result["events"] if e["type"] == "dkg_failover"
+        ]
+        self.assertEqual(
+            list(event),
+            ["seq", "type", "at", "request_id", "actor_id", "reason",
+             "details"],
+        )
+        self.assertEqual(
+            list(event["details"]),
+            ["id", "round", "action", "node", "replacement", "key",
+             "state"],
+        )
+
+    def test_failover_order_visible_in_raw_wire_bytes(self):
+        self.svc.post_dkg_failover(
+            "w1", "d1", 2, "replace", "n2", "n3", self.KEY_C,
+            self.svc._NO_APPROVAL,
+        )
+        import http.client
+        from urllib.parse import urlparse
+
+        u = urlparse(self.srv.base_url)
+        conn = http.client.HTTPConnection(u.hostname, u.port)
+        conn.request("GET", "/v1/wallets/w1/audit-events")
+        raw = conn.getresponse().read()
+        # 紧凑且外层逻辑序：seq 先于 type，actor_id 在 request_id 之后
+        # （前有 2 register + 2 commit，failover 为 seq 5）
+        self.assertIn(
+            b'{"seq":5,"type":"dkg_failover","at":', raw
+        )
+        self.assertNotIn(b", ", raw)
+
 
 class AuditAtomicityTest(unittest.TestCase):
     """状态/事件原子：事件追加失败时回滚状态，且不留下事件。"""

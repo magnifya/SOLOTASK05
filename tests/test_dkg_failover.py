@@ -422,6 +422,13 @@ class DkgFailoverServiceTest(unittest.TestCase):
             {"seq", "type", "at", "request_id", "actor_id", "reason",
              "details"},
         )
+        # 公开查询副本的外层须为逻辑键序（落盘外层仍是 sort_keys 规范序，
+        # 见本用例末尾对磁盘原序的断言；查询只重排副本，不写盘）。
+        self.assertEqual(
+            list(event),
+            ["seq", "type", "at", "request_id", "actor_id", "reason",
+             "details"],
+        )
         self.assertEqual(event["request_id"], "d1/2")
         self.assertIsNone(event["actor_id"])
         self.assertIsNone(event["reason"])

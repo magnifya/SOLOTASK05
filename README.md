@@ -654,8 +654,15 @@ quorum 后按既有 commit 契约自动提交。
 `from_seq`/`limit` 为正整数，默认 1/1000，limit 上限 1000；非法 `400`，
 钱包不存在 `404`。纯只读，不触发懒过期、不分配 seq。
 
+成功响应体为 UTF-8 **紧凑 JSON**（无多余空白、非 ASCII 不转义、无末尾
+换行），整数用十进制、不适用值为 `null`，不含浮点、负零或非有限值；
+事件按 seq 升序排列。
+
 每条事件七字段 `seq,type,at,request_id,actor_id,reason,details`，
-`at` 为 UTC（`...Z`），不适用字段为 `null`。seq 从 1 起、落盘后单调
+`at` 为 UTC（`...Z`），不适用字段为 `null`。其中 `dkg_failover`
+事件的**查询副本**外层按此逻辑键序输出（落盘外层仍为 sort_keys
+规范序，见「DKG 故障轮次」；查询只重排副本、绝不写盘或改 seq），
+其余事件类型查询键序同落盘序。seq 从 1 起、落盘后单调
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、

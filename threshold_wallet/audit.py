@@ -236,6 +236,53 @@ def _order_event_details(event: dict) -> None:
     event["details"] = {key: details[key] for key in order}
 
 
+#: dkg_failover 事件**公开查询**的外层逻辑键序。落盘外层七字段仍为
+#: sort_keys 规范序（actor_id,at,details,...，见 _canonical_event 与
+#: README「DKG 故障轮次」），仅查询副本按本逻辑序重排投影，绝不写盘、
+#: 绝不改 seq；其余事件类型的查询副本保持落盘序（契约不变）。
+_PUBLIC_FAILOVER_EVENT_KEY_ORDER = (
+    "seq",
+    "type",
+    "at",
+    "request_id",
+    "actor_id",
+    "reason",
+    "details",
+)
+
+
+def _public_event_copy(event: dict) -> dict:
+    """构造一条事件的公开查询副本。
+
+    dkg_failover 事件的外层按逻辑序
+    seq,type,at,request_id,actor_id,reason,details 投影，details 按
+    README 既定键序重建副本（auto 事件末键 mode）；键集不符既定形态时
+    details 保留原样（语义对账路径会 fail-closed，这里不猜写）。其余
+    事件类型仅做既有浅拷贝，键序不变。纯只读：绝不就地改动加载后的
+    事件，也不写盘。
+    """
+    if event.get("type") != TYPE_DKG_FAILOVER:
+        return dict(event)
+    # 严格加载按值校验（.get 允许缺键的篡改现场通过），投影层只负责重排、
+    # 不新增异常路径：缺任意外层键时退回浅拷贝原样返回（形状对账不是查询
+    # 层的职责），绝不让只读查询因 KeyError 改变既有的损坏暴露行为。
+    if not all(key in event for key in _PUBLIC_FAILOVER_EVENT_KEY_ORDER):
+        return dict(event)
+    details = event.get("details")
+    if isinstance(details, dict):
+        order = _DETAILS_KEY_ORDER[TYPE_DKG_FAILOVER]
+        matched = next(
+            (candidate for candidate in order if set(details) == set(candidate)),
+            None,
+        )
+        if matched is not None:
+            details = {key: details[key] for key in matched}
+    return {
+        key: (details if key == "details" else event[key])
+        for key in _PUBLIC_FAILOVER_EVENT_KEY_ORDER
+    }
+
+
 def _canonicalize_sorted(value: object) -> object:
     """递归重排为 sort_keys 规范序（与 WalletStore._atomic_write 同字节）。"""
     if isinstance(value, dict):
@@ -707,9 +754,10 @@ class AuditStore:
         if not data:
             return []
         # 严格加载已保证 seq 集合为 1..N；仍按 seq 升序输出，避免外部改动
-        # 事件物理顺序影响公开响应。
+        # 事件物理顺序影响公开响应。副本经公开投影：仅 dkg_failover 的
+        # 外层按逻辑序重排（details 既定序、auto 末键 mode），不写盘。
         events = [
-            dict(event)
+            _public_event_copy(event)
             for event in data["events"]
             if event["seq"] >= from_seq
         ]

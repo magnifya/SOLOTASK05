@@ -71,8 +71,18 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         # ---- 响应/日志辅助 ----------------------------------------------
 
-        def _send_json(self, status: int, body: dict) -> None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        def _send_json(
+            self, status: int, body: dict, compact: bool = False
+        ) -> None:
+            # 紧凑 JSON（无多余空白、无末尾换行）仅用于审计事件查询成功体；
+            # 其余响应保持默认序列化（CLI 及其余 HTTP 契约不变）。
+            separators = (",", ":") if compact else None
+            data = json.dumps(
+                body,
+                ensure_ascii=False,
+                separators=separators,
+                allow_nan=not compact,
+            ).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -193,6 +203,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             from_seq=query.get("from_seq", [None])[0],
                             limit=query.get("limit", [None])[0],
                         ),
+                        compact=True,
                     )
                     return
                 if rest == ["transaction-policy"]:
