@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 
 from threshold_wallet.service import ServiceError, WalletService
-from threshold_wallet.store import RecoveryError
+from threshold_wallet.store import CorruptDataError, RecoveryError
 
 from tests.helpers import http_server, make_harness
 
@@ -454,7 +454,9 @@ class ReorgServiceTest(_SceneMixin, unittest.TestCase):
         self._strip_events(
             lambda e: e["type"] == "chain_dispatch_reorged"
         )
-        with self.assertRaises(RecoveryError):
+        # 删除中间事件造成 seq 缺口：审计 JSON 损坏，启动抛
+        # CorruptDataError（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
             make_harness(self.d)
 
     def test_reorged_details_out_of_order_is_unreconcilable(self):
@@ -549,12 +551,13 @@ class ReorgServiceTest(_SceneMixin, unittest.TestCase):
         self._build_settled()
         status, _ = self._reorg()
         self.assertEqual(status, 201)
-        # 删掉重组确认事件：重组事件缺失紧邻前驱即矛盾现场
+        # 删掉重组确认事件：重组事件缺失紧邻前驱即矛盾现场；删除中间事件
+        # 也造成 seq 缺口（CorruptDataError，同样阻止就绪、现场保留）。
         self._strip_events(
             lambda e: e["type"] == "chain_dispatch_confirmation"
             and e["details"].get("state") == "reorged"
         )
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises(CorruptDataError):
             make_harness(self.d)
 
     def test_crash_before_events_rolls_back_on_restart(self):

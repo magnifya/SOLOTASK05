@@ -849,7 +849,9 @@ class SignSessionCorruptionTest(unittest.TestCase):
         h.service.create_sign_session("w1", "s1", "m", 60)
         with open(self._session_file(d, "w1"), "w") as f:
             f.write("{broken json")
-        with self.assertRaises(RecoveryError):
+        # 启动恢复：坏 JSON 抛 CorruptDataError（不再包成 RecoveryError），
+        # 同样阻止就绪、现场保留。
+        with self.assertRaises(CorruptDataError):
             make_harness(d)
         # 现场保留
         with open(self._session_file(d, "w1")) as f:
@@ -889,12 +891,19 @@ class SignSessionStrictRecoveryTest(unittest.TestCase):
         # 现场原样保留，不归一、不覆盖
         self.assertTrue(os.path.exists(self._sessions_path(d)), label)
 
+    def _assert_corrupt_refuses_ready(self, d, label):
+        # 持久化 JSON 形状损坏：启动恢复抛 CorruptDataError（不再包成
+        # RecoveryError），同样阻止就绪且现场原样保留。
+        with self.assertRaises(CorruptDataError, msg=label):
+            make_harness(d)
+        self.assertTrue(os.path.exists(self._sessions_path(d)), label)
+
     def test_bad_expires_at_refuses(self):
         d, _, _ = self._one_share_scene()
         self._tamper_sessions(
             d, lambda data: data["s1"].__setitem__("expires_at", "nonsense")
         )
-        self._assert_refuses_ready(d, "unparseable expires_at")
+        self._assert_corrupt_refuses_ready(d, "unparseable expires_at")
 
     def test_naive_expires_at_refuses(self):
         d, _, _ = self._one_share_scene()
@@ -903,7 +912,7 @@ class SignSessionStrictRecoveryTest(unittest.TestCase):
                 "expires_at", "2026-09-22T00:00:00"
             )
         )
-        self._assert_refuses_ready(d, "naive expires_at")
+        self._assert_corrupt_refuses_ready(d, "naive expires_at")
 
     def test_non_utc_offset_expires_at_refuses(self):
         d, _, _ = self._one_share_scene()
@@ -912,7 +921,7 @@ class SignSessionStrictRecoveryTest(unittest.TestCase):
                 "expires_at", "2026-09-22T03:00:00+03:00"
             )
         )
-        self._assert_refuses_ready(d, "non-UTC offset expires_at")
+        self._assert_corrupt_refuses_ready(d, "non-UTC offset expires_at")
 
     def test_forged_stored_signature_refuses(self):
         d, _, _ = self._one_share_scene()

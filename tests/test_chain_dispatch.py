@@ -445,7 +445,8 @@ class DispatchServiceTest(unittest.TestCase):
             f.write(b"{broken")
         with self.assertRaises(CorruptDataError):
             self.svc._audit.chain_dispatch_requested_events("w1")
-        with self.assertRaises(RecoveryError):
+        # 启动恢复保持 CorruptDataError 原类型（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
             WalletService(self.h.store)
 
     def test_healthy_log_still_loads(self):

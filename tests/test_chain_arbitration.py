@@ -670,7 +670,9 @@ class ArbitrationCorruptionTest(unittest.TestCase):
             {"source": "s1", "report": _report()},
         )
         self.assertEqual(status, 503)
-        with self.assertRaises(RecoveryError):
+        # 启动拒绝就绪：语义矛盾为 RecoveryError、坏 JSON 为 CorruptDataError，
+        # 两者都阻止 serve（本助手被两类场景共用）。
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(WalletStore(self.tmpdir))
 
     def test_malformed_arbitration_event(self):

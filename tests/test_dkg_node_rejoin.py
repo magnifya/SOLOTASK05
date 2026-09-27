@@ -597,7 +597,9 @@ class RejoinRecoveryTest(unittest.TestCase):
             f.write(b"{not json")
         with self.assertRaises(CorruptDataError):
             self.h.service._audit.node_rejoined_events("w1")
-        self._assert_refuses_ready()
+        # 启动恢复保持 CorruptDataError 原类型（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
+            WalletService(self.h.store)
 
 
 class NodeStateStrictOrderTest(unittest.TestCase):

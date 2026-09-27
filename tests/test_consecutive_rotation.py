@@ -25,7 +25,7 @@ from threshold_wallet import audit as audit_mod
 from threshold_wallet import crypto
 from threshold_wallet.audit import AuditStore
 from threshold_wallet.service import ServiceError, WalletService
-from threshold_wallet.store import RecoveryError, WalletStore
+from threshold_wallet.store import CorruptDataError, RecoveryError, WalletStore
 
 
 def _service(data_dir: str) -> WalletService:
@@ -325,7 +325,10 @@ class CrossRoundCorruptionFailClosedTest(unittest.TestCase):
             )
         ]
         _write_audit(self.tmp, data)
-        self._assert_refuses_ready()
+        # 删除中间事件造成 seq 缺口：审计 JSON 内容损坏，启动抛
+        # CorruptDataError（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
+            _service(self.tmp)
 
     def test_duplicate_activation_event_fails_closed(self):
         data = _audit_obj(self.tmp)
@@ -340,7 +343,10 @@ class CrossRoundCorruptionFailClosedTest(unittest.TestCase):
         data["events"].append(duplicate)
         data["next_seq"] = 6
         _write_audit(self.tmp, data)
-        self._assert_refuses_ready()
+        # 同一 rotation 出现两条 activated 事件属审计损坏（严格唯一），启动
+        # 抛 CorruptDataError（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
+            _service(self.tmp)
 
     def test_record_inconsistent_with_event_fails_closed(self):
         store = WalletStore(self.tmp)

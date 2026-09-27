@@ -186,7 +186,8 @@ class AuditStartupScanTest(unittest.TestCase):
             os.path.exists(_ledger_path(self.tmp))
         )
         _write(_audit_path(self.tmp), "{broken")
-        with self.assertRaises(RecoveryError):
+        # 启动恢复保持 CorruptDataError 原类型（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
             WalletService(WalletStore(self.tmp))
 
     def test_serve_cli_refuses_to_start_on_corrupt_audit(self):
@@ -272,7 +273,9 @@ class LedgerSemanticsTest(unittest.TestCase):
         self._healthy()
         raw = open(_ledger_path(self.tmp), encoding="utf-8").read()
         self._tamper(lambda d: d["assets"]["BTC"].__setitem__("balance", 71))
-        with self.assertRaises(RecoveryError):
+        # 账本语义损坏由存储层直接抛 CorruptDataError（同样阻止就绪、现场
+        # 保留、HTTP 503）。
+        with self.assertRaises(CorruptDataError):
             WalletService(WalletStore(self.tmp))
         # 未被归一或覆盖
         self.assertNotEqual(

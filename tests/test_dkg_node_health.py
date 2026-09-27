@@ -765,8 +765,9 @@ class AutoFailoverRecoveryStrictTest(unittest.TestCase):
             AuditStore(self.h.store.data_dir).events_by_type(
                 "w1", "node_state"
             )
-        # 启动恢复统一包装为 RecoveryError 阻止就绪
-        self._assert_refuses_ready()
+        # 启动恢复保持 CorruptDataError 原类型（同样阻止就绪、现场保留）。
+        with self.assertRaises(CorruptDataError):
+            WalletService(self.h.store)
 
 
 class NodeHealthHttpTest(unittest.TestCase):
