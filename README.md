@@ -753,9 +753,31 @@ quorum 后按既有 commit 契约自动提交。
   同体重放，新进展一律 `409`。
 - 新进展 `201` 返回
   `V={"dispatch_id","adapter_id","tx_id","block_height","block_hash","confirmations","state"}`，
-  键序固定，`state` 为 `confirming|finalized`。历史同体（B 五键全同）
+  键序固定，`state` 为 `confirming|finalized`（已结算派发的重组补偿
+  另有 `reorged`，见下）。历史同体（B 五键全同）
   重放**优先**返回 `200` 与原 V（含原 state），不复查现状；同
   `dispatch_id` 异体新进展按状态机判定。
+- **已结算派发的重组补偿**：派发已 `settle` 后，`confirm` 仅接受
+  重组形态的新 B——`adapter_id` 与派发归属一致，且相对最后一条
+  （`finalized`）进展 `tx_id` 或区块（高度/哈希）改变、
+  `confirmations` 低于 `required_confirmations`、高度回退
+  `0 ≤ 旧高度 − 新高度 ≤ reorg_window`；其余一律 `409`，历史同体
+  仍 `200`。接受时以 `D` 为 `operation_id` 创建**同资产、反向
+  delta** 的补偿操作并原子提交：补偿 id 被占用或补偿后余额将负
+  一律 `409` 且**零副作用**（不写意图/账本、不记事件）。成功 `201`
+  返回既有七键 V（`state="reorged"`）；同 B 重放 `200` 同 V、异体
+  `409`，锁内并发只有一个 `201`。重组在每钱包跨进程事务锁内**原子**
+  完成并连续追加三个七字段事件：`chain_dispatch_confirmation`
+  （details 即 V）、`chain_dispatch_reorged`（details 键序恰为
+  `dispatch_id,operation_id`，两值均为 `D`）、
+  `asset_operation_committed`（details 即补偿操作的 R），seq 为
+  n、n+1、n+2 一次原子落盘，三事件 `request_id=D`、
+  `actor_id=adapter_id`、`reason=null`。三事件**俱在前滚、俱无
+  回滚**：崩溃后按提交意图对账——俱在则前滚补齐账本，俱不在则删除
+  新建补偿操作并恢复提交前余额/version；残缺或矛盾（含 details 键序
+  被重排）是不可对账现场，抛 `RecoveryError` 并保留现场（常驻
+  `503`、`serve` 拒绝就绪）。`reorged` 同为终态：其后不再接受任何
+  新进展（历史同体重放除外）。
 - 确认进展仅由审计事件持久化：`chain_dispatch_confirmation` 是唯一
   提交点（`request_id=dispatch_id`、`actor_id=adapter_id`、
   `reason=null`、details 即 V，键序
@@ -796,8 +818,10 @@ quorum 后按既有 commit 契约自动提交。
   账本、不记事件）。
 - 首提 `201` 返回既有资产操作视图
   `R={operation_id,asset_id,delta,state,balance,version}`
-  （`state="committed"`，balance/version 按既有 commit 契约改账）；同
-  `D` 重放**优先** `200` 返回同一 R（不复查现状，不记事件）；锁内并发
+  （`state="committed"`，balance/version 按既有 commit 契约改账）；
+  同 `D` 重放**优先** `200` 返回同一 R（不复查现状，不记事件）；
+  `201`/`200` 的 R 键序统一为
+  `operation_id,asset_id,delta,state,balance,version`；锁内并发
   只有一个 `201`，其余幂等 `200`。
 - 结算在每钱包跨进程事务锁内**原子**完成并相邻追加两个七字段事件：
   `chain_dispatch_settled` 与紧邻的唯一
@@ -829,7 +853,8 @@ quorum 后按既有 commit 契约自动提交。
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`、
 `chain_dispatch_requested`、`chain_dispatch_result`、
-`chain_dispatch_confirmation`、`chain_dispatch_settled`。
+`chain_dispatch_confirmation`、`chain_dispatch_settled`、
+`chain_dispatch_reorged`。
 
 ## 多进程与故障恢复（保证）
 

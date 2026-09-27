@@ -204,6 +204,47 @@ def chain_vote_shape_ok(vote: object) -> bool:
     return vote["state"] in ("collecting", "conflict", "adopted")
 
 
+def dispatch_reorg_confirmation_shape_ok(
+    confirmation: object, dispatch_id: str
+) -> bool:
+    """重组补偿意图随附的确认进展视图 V 的形状：恰含
+    dispatch_id/adapter_id/tx_id/block_height/block_hash/confirmations/
+    state 七键，dispatch_id 即本补偿操作的 id，adapter_id 为安全标识，
+    tx_id/block_hash 为 64 位小写 hex，block_height/confirmations 为
+    非布尔非负整数，state 只能为 reorged。"""
+    if not isinstance(confirmation, dict):
+        return False
+    if set(confirmation) != {
+        "dispatch_id",
+        "adapter_id",
+        "tx_id",
+        "block_height",
+        "block_hash",
+        "confirmations",
+        "state",
+    }:
+        return False
+    if confirmation["dispatch_id"] != dispatch_id:
+        return False
+    if not _valid_safe_id(confirmation["adapter_id"]):
+        return False
+    if not _is_lower_hex_32(confirmation["tx_id"]):
+        return False
+    if not _is_lower_hex_32(confirmation["block_hash"]):
+        return False
+    if (
+        not _is_plain_int(confirmation["block_height"])
+        or confirmation["block_height"] < 0
+    ):
+        return False
+    if (
+        not _is_plain_int(confirmation["confirmations"])
+        or confirmation["confirmations"] < 0
+    ):
+        return False
+    return confirmation["state"] == "reorged"
+
+
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
     delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
@@ -1041,6 +1082,28 @@ class WalletStore:
                 ledger["assets"][asset_id] = asset_record
             self._atomic_write(path, ledger)
 
+    def remove_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        asset_id: str,
+        asset_record: Optional[dict],
+    ) -> None:
+        """重组补偿提交事件追加失败时回滚：删除本事务新建的操作记录并
+        恢复资产记录（asset_record 为 None 表示事务前该资产无账本记录，
+        直接删除）。操作在事务前不存在，故回滚是删除而非还原。"""
+        _check_id("operation_id", operation_id)
+        _check_id("asset_id", asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger["operations"].pop(operation_id, None)
+            if asset_record is None:
+                ledger["assets"].pop(asset_id, None)
+            else:
+                ledger["assets"][asset_id] = asset_record
+            self._atomic_write(path, ledger)
+
     # ---- 资产提交意图（可恢复事务日志）-----------------------------------
 
     def _asset_intent_path(self, wallet_id: str, operation_id: str) -> str:
@@ -1159,6 +1222,23 @@ class WalletStore:
                 not isinstance(settle, dict)
                 or set(settle) != {"dispatch_id"}
                 or not _valid_safe_id(settle.get("dispatch_id"))
+            ):
+                return False
+        # 已结算派发重组补偿触发的提交另带可选键 reorg
+        # （{"dispatch_id": D, "confirmation": V}，V 为 state=reorged 的
+        # 七键确认进展视图）：崩溃恢复据此判定"chain_dispatch_confirmation
+        # （reorged）+ chain_dispatch_reorged + asset_operation_committed"
+        # 三事件提交点是否完整。存在即须形状合法、dispatch_id 即本操作 id
+        # （补偿操作以 D 为 operation_id），否则无法安全对账。
+        reorg = intent.get("reorg")
+        if reorg is not None:
+            if (
+                not isinstance(reorg, dict)
+                or set(reorg) != {"dispatch_id", "confirmation"}
+                or reorg.get("dispatch_id") != operation_id
+                or not dispatch_reorg_confirmation_shape_ok(
+                    reorg.get("confirmation"), operation_id
+                )
             ):
                 return False
         old_balance = old_asset["balance"] if old_asset is not None else 0

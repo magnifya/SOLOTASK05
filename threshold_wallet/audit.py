@@ -83,6 +83,11 @@ TYPE_CHAIN_DISPATCH_CONFIRMATION = "chain_dispatch_confirmation"
 #: 跨链派发最终性结算（details 即 {dispatch_id,operation_id}，与紧邻的
 #: asset_operation_committed 同批原子落盘）
 TYPE_CHAIN_DISPATCH_SETTLED = "chain_dispatch_settled"
+#: 已结算派发的重组补偿（details 即 {dispatch_id,operation_id}，其中
+#: operation_id 即以 D 新建的反向补偿操作；与紧邻的
+#: chain_dispatch_confirmation（state=reorged）在先、
+#: asset_operation_committed 收尾三事件同批原子落盘）
+TYPE_CHAIN_DISPATCH_REORGED = "chain_dispatch_reorged"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -227,6 +232,14 @@ _DETAILS_KEY_ORDER = {
         "dispatch_id",
         "operation_id",
     ),
+    # chain_dispatch_reorged 的 details 恰为两键固定序
+    # dispatch_id,operation_id（事件是已结算派发重组补偿的提交点之一，
+    # 与紧邻的 chain_dispatch_confirmation（state=reorged）、
+    # asset_operation_committed 三事件同批原子落盘）。
+    TYPE_CHAIN_DISPATCH_REORGED: (
+        "dispatch_id",
+        "operation_id",
+    ),
 }
 
 
@@ -247,6 +260,7 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
         TYPE_CHAIN_DISPATCH_RESULT,
         TYPE_CHAIN_DISPATCH_CONFIRMATION,
         TYPE_CHAIN_DISPATCH_SETTLED,
+        TYPE_CHAIN_DISPATCH_REORGED,
     )
 )
 
@@ -767,6 +781,21 @@ class AuditStore:
         判定）。纯只读，不分配 seq。"""
         return self._events_grouped_by_request(
             wallet_id, TYPE_CHAIN_DISPATCH_SETTLED
+        )
+
+    def chain_dispatch_reorged_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 chain_dispatch_reorged 事件，按 request_id
+        （dispatch_id）分组，组内按 seq 升序。
+
+        已结算派发的重组补偿仅由这些事件持久化（事件与紧邻的重组确认、
+        提交事件同批构成唯一提交点）：在线幂等重放与崩溃恢复据此判定
+        每个 dispatch_id 是否已重组补偿及其参数。每个 dispatch_id 至多
+        一条有效事件（重复属不可对账现场，由恢复判定）。纯只读，不分配
+        seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_CHAIN_DISPATCH_REORGED
         )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:
