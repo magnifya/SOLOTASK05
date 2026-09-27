@@ -43,6 +43,8 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批开关（缺省 `{"enabled":false}`） |
 | PUT  | `/v1/wallets/{id}/nodes` | 设置 DKG 节点健康表 `{"nodes":{...}}` |
 | GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
+| PUT  | `/v1/wallets/{id}/chain-adapters` | 设置跨链适配器健康熔断表 `{"adapters":{...}}` |
+| GET  | `/v1/wallets/{id}/chain-adapters` | 查询跨链适配器健康熔断表（未配置 404） |
 | POST | `/v1/wallets/{id}/nodes/{node}/rejoin` | 故障节点重新加入 `{"rejoin_id","dkg_id","round","key","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
@@ -887,6 +889,44 @@ quorum 后按既有 commit 契约自动提交。
   UTF-8 紧凑 JSON，无末换行）；重放不记事件，响应、日志与非份额文件
   绝不泄露私钥或份额正文。
 
+### 跨链适配器健康熔断（可选）
+
+`PUT /v1/wallets/{W}/chain-adapters` 设置跨链适配器健康熔断表，请求体
+与成功响应（`200`）同为
+`Q={"adapters": {适配器ID: "up"|"down", ...}}`：
+
+- `adapters` 必须**非空**；键 A 匹配安全标识
+  `[A-Za-z0-9_-]{1,128}`，请求体与返回/落盘均须按 **ASCII 升序**排列
+  （键未升序即 `400`，服务端不替客户端重排）；每个值恰为字符串 `"up"`
+  或 `"down"`（布尔等非字符串一律拒）。键集、类型、顺序、值错一律
+  `400`。
+- `GET` 已配置 `200` 返回 Q，**从未配置 `404`**；钱包不存在时 GET/PUT
+  一律 `404`；`PUT` 可首建。健康表仅由 **七字段
+  `chain_adapter_health`** 审计事件持久化
+  （`request_id`/`actor_id`/`reason` 均为 `null`，details 恰为 Q，取最后
+  一条恢复），不写状态文件。**首配/变更各记一条事件；同值不记**（并发
+  同参在钱包跨进程锁内线性化，只有一个首配、其余同值不记）。
+- 恢复对每条 `chain_adapter_health` 事件严格校验 README 键序：事件
+  **外层七字段**须为落盘规范序
+  （`actor_id,at,details,reason,request_id,seq,type`）、details 恰含
+  `adapters`、适配器 ID 按 ASCII **升序唯一**、每个值恰为 `up|down`；
+  重排、形状或取值矛盾都 fail-closed（抛 `RecoveryError`，常驻 `503`、
+  `serve` 拒绝就绪、**不写盘**），重启/灾备恢复后健康表与 seq 不变。
+- `PUT`/`GET` 成功体与错误体均为 UTF-8 紧凑 JSON（`ensure_ascii`，非
+  ASCII 原样、无末换行）。
+
+**对派发的熔断语义**（`POST /v1/wallets/{W}/chain/{O}/dispatch`，其余
+派发契约不变）：
+
+- 仅作用于派发**首提**：首提指向的 `adapter_id` 在当前健康表中显式为
+  `down` 时抛 `ServiceError(409)`，**零副作用**（不追加事件、现场不
+  变）。健康表未配置、或该适配器在表中缺席，一律视为 `up`（不熔断）。
+- **同参重放优先 `200`**：已提交派发的同参重放先于健康判定直接返回，
+  事后把适配器翻为 `down` 不影响幂等重放。
+- 健康变化**不改写、不终止、也不自动接管**任何已有派发；result/confirm/
+  takeover/finality/settle 等其余派发接口契约不变。
+- 健康表的读取、更新与派发判定都在该钱包跨进程事务锁内线性化。
+
 ### 审计事件
 
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
@@ -905,7 +945,8 @@ quorum 后按既有 commit 契约自动提交。
 `chain_report`、`chain_arbitration`、`chain_vote`、
 `chain_dispatch_requested`、`chain_dispatch_result`、
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
-`chain_dispatch_reorged`、`chain_dispatch_taken_over`。
+`chain_dispatch_reorged`、`chain_dispatch_taken_over`、
+`chain_adapter_health`。
 
 ## 多进程与故障恢复（保证）
 

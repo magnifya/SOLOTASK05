@@ -92,6 +92,9 @@ TYPE_CHAIN_DISPATCH_REORGED = "chain_dispatch_reorged"
 #: V={dispatch_id,adapter_id,state}，state="requested"；request_id 为
 #: dispatch_id、actor_id 为 approval_request_id、reason=null）
 TYPE_CHAIN_DISPATCH_TAKEN_OVER = "chain_dispatch_taken_over"
+#: 跨链适配器健康熔断表整体快照（details 即 Q={"adapters": {A: up|down}}；
+#: request_id/actor_id/reason 均为 null，取最后一条恢复）
+TYPE_CHAIN_ADAPTER_HEALTH = "chain_adapter_health"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -250,6 +253,13 @@ _DETAILS_KEY_ORDER = {
         "dispatch_id",
         "adapter_id",
         "state",
+    ),
+    # chain_adapter_health 的 details 恰为 Q={"adapters": {...}}：顶层仅
+    # adapters 一键，嵌套的适配器表由 service 统一归一（适配器 ID 按 ASCII
+    # 升序，值仅为 up|down 字符串），故这里只固定顶层键序、保留构造好的
+    # 嵌套顺序（与 node_state 同模式）。
+    TYPE_CHAIN_ADAPTER_HEALTH: (
+        "adapters",
     ),
 }
 

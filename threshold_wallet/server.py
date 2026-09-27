@@ -10,6 +10,8 @@
 - GET  /v1/wallets/<wallet_id>/dkg-failover-policy  查询 DKG 故障审批开关
 - PUT  /v1/wallets/<wallet_id>/nodes                设置 DKG 节点健康表
 - GET  /v1/wallets/<wallet_id>/nodes                查询 DKG 节点健康表
+- PUT  /v1/wallets/<wallet_id>/chain-adapters       设置跨链适配器健康熔断表
+- GET  /v1/wallets/<wallet_id>/chain-adapters       查询跨链适配器健康熔断表
 - POST /v1/wallets/<wallet_id>/nodes/<node_id>/rejoin 故障节点重新加入
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
@@ -273,6 +275,14 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
                 if rest == ["nodes"]:
                     self._send_json(200, service.get_dkg_nodes(wallet_id))
+                    return
+                if rest == ["chain-adapters"]:
+                    # 跨链适配器健康熔断表：成功体与错误体均为 UTF-8 紧凑
+                    # JSON（非 ASCII 不转义、无末换行），同 dispatch 系列。
+                    self._compact_response = True
+                    self._send_json_compact(
+                        200, service.get_chain_adapters(wallet_id)
+                    )
                     return
                 self._send_error(404, "not found")
             except Exception as exc:
@@ -853,6 +863,23 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             wallet_id, body.get("nodes")
                         )
                         self._send_json(200, result)
+                        return
+                    if rest == ["chain-adapters"]:
+                        # 跨链适配器健康熔断表：成功体与错误体均为 UTF-8
+                        # 紧凑 JSON（非 ASCII 不转义、无末换行）。
+                        self._compact_response = True
+                        body = self._read_json_body()
+                        # PUT 仅收 Q={"adapters": ...}；adapters 表形状
+                        # （非空、安全 ID、值 up|down）由 service 严格校验
+                        if set(body) != {"adapters"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly adapters",
+                            )
+                        result = service.put_chain_adapters(
+                            wallet_id, body.get("adapters")
+                        )
+                        self._send_json_compact(200, result)
                         return
                     if len(rest) == 2 and rest[0] == "chain":
                         body = self._read_json_body()
