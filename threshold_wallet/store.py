@@ -206,8 +206,9 @@ def chain_vote_shape_ok(vote: object) -> bool:
 
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
-    delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
-    balance/version 快照，若存在则同样必须为非布尔整数。"""
+    delta、state 只能为 pending/committed/reorged（reorged 为已结算派发
+    链上重组后的反向补偿操作，与 committed 同属终态）；服务正常写入还带
+    非布尔整数 balance/version 快照，若存在则同样必须为非布尔整数。"""
     if not isinstance(record, dict):
         return False
     operation_id = record.get("operation_id")
@@ -218,7 +219,7 @@ def _asset_operation_shape_ok(key: str, record: object) -> bool:
         return False
     if not _is_plain_int(record.get("delta")) or record.get("delta") == 0:
         return False
-    if record.get("state") not in ("pending", "committed"):
+    if record.get("state") not in ("pending", "committed", "reorged"):
         return False
     for optional_int in ("balance", "version"):
         if optional_int in record and not _is_plain_int(
@@ -871,7 +872,7 @@ class WalletStore:
                     f"asset ledger for wallet {wallet_id!r} operation "
                     f"{record.get('operation_id')!r} lacks a snapshot"
                 )
-            if record["state"] == "committed":
+            if record["state"] in ("committed", "reorged"):
                 committed_by_asset.setdefault(asset_id, []).append(record)
             else:
                 pending_by_asset.setdefault(asset_id, []).append(record)
@@ -1041,6 +1042,29 @@ class WalletStore:
                 ledger["assets"][asset_id] = asset_record
             self._atomic_write(path, ledger)
 
+    def delete_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        asset_id: str,
+        asset_record: Optional[dict],
+    ) -> None:
+        """补偿提交（reorg）事件未落盘时回滚：补偿操作在提交事务中首次
+        创建（无 pending 前驱），故事务未生效时整笔删除该操作，并把资产
+        快照恢复为提交前状态（asset_record 为 None 表示提交前无该资产
+        条目，直接删除）。"""
+        _check_id("operation_id", operation_id)
+        _check_id("asset_id", asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger["operations"].pop(operation_id, None)
+            if asset_record is None:
+                ledger["assets"].pop(asset_id, None)
+            else:
+                ledger["assets"][asset_id] = asset_record
+            self._atomic_write(path, ledger)
+
     # ---- 资产提交意图（可恢复事务日志）-----------------------------------
 
     def _asset_intent_path(self, wallet_id: str, operation_id: str) -> str:
@@ -1122,18 +1146,6 @@ class WalletStore:
         if old_asset is not None and not _asset_entry_shape_ok(old_asset):
             return False
         pending = intent.get("pending")
-        if not _asset_operation_shape_ok(operation_id, pending):
-            return False
-        # pending 是创建时刻的操作快照 R，服务正常写入必带非布尔整数
-        # balance/version；恢复据此还原操作，缺失即不可安全对账。
-        if not _is_plain_int(pending.get("balance")) or not (
-            _is_plain_int(pending.get("version"))
-        ):
-            return False
-        if pending["state"] != "pending" or pending["asset_id"] != asset_id:
-            return False
-        if pending["delta"] != delta:
-            return False
         # 报告触发的提交在意图中随附达门槛报告 B（可选键）：崩溃恢复据此
         # 判定"报告事件 + 提交事件"两事件提交点是否完整。存在即须形状
         # 合法，否则无法安全对账。多源仲裁触发的提交另带 votes（随附
@@ -1160,6 +1172,67 @@ class WalletStore:
                 or set(settle) != {"dispatch_id"}
                 or not _valid_safe_id(settle.get("dispatch_id"))
             ):
+                return False
+        # 已结算派发链上重组的反向补偿提交另带可选键 reorg
+        # （{"dispatch_id": D, "confirmation": V}）：补偿操作 D 在提交
+        # 事务中**首次创建**（无 pending 前驱），崩溃回滚须把该操作整笔
+        # 删除并恢复提交前资产快照，故 reorg 存在时不要求 pending 快照，
+        # 但不得与 settle 共存。存在即须形状合法，否则无法安全对账。
+        reorg = intent.get("reorg")
+        if reorg is not None:
+            if settle is not None:
+                return False
+            confirmation = reorg.get("confirmation")
+            if (
+                not isinstance(reorg, dict)
+                or set(reorg) != {"dispatch_id", "confirmation"}
+                or not _valid_safe_id(reorg.get("dispatch_id"))
+                or reorg.get("dispatch_id") != operation_id
+                or not isinstance(confirmation, dict)
+            ):
+                return False
+            # 随附确认进展须恰为 confirm 既有七键 V，dispatch_id 与本操作
+            # （即补偿操作 id）一致，state 恒为 reorged。
+            if set(confirmation) != {
+                "dispatch_id",
+                "adapter_id",
+                "tx_id",
+                "block_height",
+                "block_hash",
+                "confirmations",
+                "state",
+            }:
+                return False
+            if (
+                confirmation.get("dispatch_id") != operation_id
+                or confirmation.get("state") != "reorged"
+                or not _valid_safe_id(confirmation.get("adapter_id"))
+                or not _is_lower_hex_32(confirmation.get("tx_id"))
+                or not _is_lower_hex_32(confirmation.get("block_hash"))
+                or not _is_plain_int(confirmation.get("block_height"))
+                or confirmation.get("block_height") < 0
+                or not _is_plain_int(confirmation.get("confirmations"))
+                or confirmation.get("confirmations") < 0
+            ):
+                return False
+            if pending is not None:
+                return False
+        else:
+            if pending is None:
+                return False
+        if reorg is None:
+            # 常规提交：pending 是创建时刻的操作快照 R，服务正常写入必带
+            # 非布尔整数 balance/version；恢复据此还原操作，缺失即不可
+            # 安全对账。
+            if not _asset_operation_shape_ok(operation_id, pending):
+                return False
+            if not _is_plain_int(pending.get("balance")) or not (
+                _is_plain_int(pending.get("version"))
+            ):
+                return False
+            if pending["state"] != "pending" or pending["asset_id"] != asset_id:
+                return False
+            if pending["delta"] != delta:
                 return False
         old_balance = old_asset["balance"] if old_asset is not None else 0
         old_version = old_asset["version"] if old_asset is not None else 0

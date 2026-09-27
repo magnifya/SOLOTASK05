@@ -753,9 +753,10 @@ quorum 后按既有 commit 契约自动提交。
   同体重放，新进展一律 `409`。
 - 新进展 `201` 返回
   `V={"dispatch_id","adapter_id","tx_id","block_height","block_hash","confirmations","state"}`，
-  键序固定，`state` 为 `confirming|finalized`。历史同体（B 五键全同）
-  重放**优先**返回 `200` 与原 V（含原 state），不复查现状；同
-  `dispatch_id` 异体新进展按状态机判定。
+  键序固定，`state` 为 `confirming|finalized`；派发**结算之后**发生链上
+  重组时另有 `state="reorged"` 的补偿进展（见下文「已结算派发的链上重组
+  与反向补偿」）。历史同体（B 五键全同）重放**优先**返回 `200` 与原 V
+  （含原 state），不复查现状；同 `dispatch_id` 异体新进展按状态机判定。
 - 确认进展仅由审计事件持久化：`chain_dispatch_confirmation` 是唯一
   提交点（`request_id=dispatch_id`、`actor_id=adapter_id`、
   `reason=null`、details 即 V，键序
@@ -764,9 +765,12 @@ quorum 后按既有 commit 契约自动提交。
   一个 `201`（其余同体 `200`），审计 seq 连续不重号，重放不记事件。
 - 启动、持锁访问与灾备恢复按 seq 逐条复核每条
   `chain_dispatch_confirmation`：请求与 `broadcasted` 结果必须**先于**
-  确认提交、归属一致（`adapter_id` 同请求、`tx_id` 同结果）、迁移状态机
+  确认提交、归属一致（`adapter_id` 同请求；除结算后 `reorged` 重组进展
+  的 `tx_id` 允许改变外，`tx_id` 须同结果）、迁移状态机
   （同块不降、换块窗口、达门槛即 finalized、终态后无新进展、无同体
-  重复事件）逐条成立。任一矛盾都 fail-closed（抛 `RecoveryError`）；
+  重复事件）逐条成立；`reorged` 进展另须先有 `chain_dispatch_settled`
+  并与紧邻的 `chain_dispatch_reorged`、补偿提交构成三事件提交点。任一
+  矛盾都 fail-closed（抛 `RecoveryError`）；
   审计 JSON 损坏抛 `CorruptDataError`、审计文件 I/O 失败抛
   `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪，保留现场、不改
   账本、不写旁路文件、不重记。恢复不新增事件、不改 seq，响应、日志、
@@ -811,6 +815,45 @@ quorum 后按既有 commit 契约自动提交。
 - 最终性查询沿用 confirm 的紧凑 JSON 字节规则（成功体与错误体均为
   UTF-8 紧凑 JSON，无末换行）；重放不记事件，响应、日志与非份额文件
   绝不泄露私钥或份额正文。
+- **R 键序归一**：settle 的 `201`/`200` 响应体 R 一律按
+  `operation_id,asset_id,delta,state,balance,version` 固定序输出（账本
+  落盘键序与其余资产接口视图不变）。
+
+### 已结算派发的链上重组与反向补偿（settled 后再 confirm）
+
+一笔派发**结算之后**，若链上发生重组，适配器可对同一
+`POST /v1/wallets/{W}/chain/{D}/confirm` 上报新的确认进展 B（请求体仍恰为
+confirm 既有五键，HTTP/`400`/`404` 边界不变）：
+
+- 结算之后仅当 **adapter 匹配**（与派发请求的 `adapter_id` 相同），且
+  新 B 满足 **tx_id 改变，或区块改变（高度或哈希不同）、confirmations
+  低于阈值且高度回退 `0 ≤ 旧高度 − 新高度 ≤ reorg_window`** 时才接受；
+  否则 `ServiceError(409)`。阈值/窗口仍取派发请求提交之前该资产的策略。
+- **历史同体仍 `200`**：结算前任意历史确认 B（含原 `finalized` B）与
+  重组 B 本身，按五键全同幂等返回原 V、不记事件、不复查现状（故原
+  `finalized` 同体仍返回 `state="finalized"`）。`reorged` 为终态，其后
+  异体新进展一律 `409`。
+- 接受新 B 即触发**已结算派发重组补偿**：以 `D` 为 `operation_id` 创建
+  一笔与源操作**同资产、反向 delta** 的补偿操作（`state="reorged"`，
+  balance/version 按既有 commit 契约改账）。首提 `201` 返回 confirm 既有
+  七键 V（`state="reorged"`）；同 B 为 `200` 同 V；异体 `409`。
+  `operation_id` 已被占用（任意状态）或补偿会使余额为负，一律 `409`
+  **且零副作用**（不建操作、不改账、不写意图、不记事件）。锁内并发只有
+  一个 `201`，其余同体 `200`。
+- 补偿在每钱包跨进程事务锁内**原子**追加三个连续七字段事件：
+  `chain_dispatch_confirmation`（details 即 V，state=reorged）、
+  `chain_dispatch_reorged`（details 键序恰为
+  `dispatch_id,operation_id`，二者恒等）、紧邻的唯一
+  `asset_operation_committed`（details 即补偿操作视图 R，
+  `state="reorged"`）。三事件 `request_id=D`、`actor_id=adapter_id`、
+  `reason=null`，seq 为 n、n+1、n+2 一次原子落盘，**三者俱在前滚、俱无
+  回滚**：崩溃后按补偿提交意图对账——三事件都在则前滚补齐账本，都不在则
+  整笔删除补偿操作（它在事务中首次创建、无 pending 前驱）并恢复提交前
+  余额/version；任一事件残缺、相邻关系或补偿内容矛盾都抛 `RecoveryError`
+  并保留现场（常驻 `503`、`serve` 拒绝就绪）。
+- 审计 JSON 损坏抛 `CorruptDataError`、审计/账本 I/O 失败抛 `OSError`，
+  均 HTTP `503` 且拒绝 serve；恢复/灾备/重放不新增事件、不改 seq。其余
+  接口、JSON 字节规则与私钥边界不变。
 
 ### 审计事件
 
@@ -829,7 +872,8 @@ quorum 后按既有 commit 契约自动提交。
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`、
 `chain_dispatch_requested`、`chain_dispatch_result`、
-`chain_dispatch_confirmation`、`chain_dispatch_settled`。
+`chain_dispatch_confirmation`、`chain_dispatch_settled`、
+`chain_dispatch_reorged`。
 
 ## 多进程与故障恢复（保证）
 
