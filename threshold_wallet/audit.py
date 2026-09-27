@@ -88,6 +88,9 @@ TYPE_CHAIN_DISPATCH_SETTLED = "chain_dispatch_settled"
 #: chain_dispatch_confirmation（state=reorged）在先、
 #: asset_operation_committed 收尾三事件同批原子落盘）
 TYPE_CHAIN_DISPATCH_REORGED = "chain_dispatch_reorged"
+#: 跨链派发接管（details 即 V={dispatch_id,adapter_id,state}）：派发结果
+#: 为 failed 后把派发接管给新适配器，此后 result 只接受新适配器一次结果
+TYPE_CHAIN_DISPATCH_TAKEN_OVER = "chain_dispatch_taken_over"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -240,7 +243,43 @@ _DETAILS_KEY_ORDER = {
         "dispatch_id",
         "operation_id",
     ),
+    # chain_dispatch_taken_over 的 details 即对外视图 V：三键固定序
+    # dispatch_id,adapter_id,state。
+    TYPE_CHAIN_DISPATCH_TAKEN_OVER: (
+        "dispatch_id",
+        "adapter_id",
+        "state",
+    ),
 }
+
+
+#: 重组补偿收尾的 asset_operation_committed 事件 details 的 README 既定
+#: R 序（operation_id,asset_id,delta,state,balance,version）。仅重组补偿
+#: 的提交事件（request_id 与某条 chain_dispatch_reorged 相同者）按此序
+#: 落盘并在读取时严格核对；其余 asset_operation_committed 事件仍按
+#: sort_keys 规范序落盘（行为不变）。
+_REORG_COMMITTED_DETAILS_ORDER = (
+    "operation_id",
+    "asset_id",
+    "delta",
+    "state",
+    "balance",
+    "version",
+)
+
+
+def _reorged_request_ids(events: list) -> set:
+    """返回事件序列中全部 chain_dispatch_reorged 的 request_id 集合。
+
+    重组补偿的提交事件以派发标识 D 为 request_id（补偿操作即以 D 新建），
+    据此在落盘/读取整日志时识别"重组的 asset_operation_committed"。"""
+    return {
+        event.get("request_id")
+        for event in events
+        if isinstance(event, dict)
+        and event.get("type") == TYPE_CHAIN_DISPATCH_REORGED
+        and isinstance(event.get("request_id"), str)
+    }
 
 
 #: 在归一化前就须按 README 既定键序严格核对 details 的事件类型集合。
@@ -261,6 +300,7 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
         TYPE_CHAIN_DISPATCH_CONFIRMATION,
         TYPE_CHAIN_DISPATCH_SETTLED,
         TYPE_CHAIN_DISPATCH_REORGED,
+        TYPE_CHAIN_DISPATCH_TAKEN_OVER,
     )
 )
 
@@ -342,8 +382,11 @@ def _canonicalize_sorted(value: object) -> object:
     return value
 
 
-def _canonical_event(event: object) -> object:
-    """单条事件的落盘规范形：七字段 sort_keys，惟既定类型 details 保序。"""
+def _canonical_event(event: object, preserve_details: bool = False) -> object:
+    """单条事件的落盘规范形：七字段 sort_keys，惟既定类型 details 保序。
+
+    preserve_details 为真时（重组补偿的 asset_operation_committed）保留
+    details 构造/读取时已归一为 README 既定 R 序的键序，不做 sort_keys。"""
     if not isinstance(event, dict):
         return _canonicalize_sorted(event)
     canonical = {}
@@ -351,8 +394,10 @@ def _canonical_event(event: object) -> object:
         value = event[key]
         if (
             key == "details"
-            and event.get("type") in _DETAILS_KEY_ORDER
             and isinstance(value, dict)
+            and (
+                event.get("type") in _DETAILS_KEY_ORDER or preserve_details
+            )
         ):
             # 保留构造/读取时已归一为 README 既定顺序的 details 键序
             canonical[key] = value
@@ -363,11 +408,25 @@ def _canonical_event(event: object) -> object:
 
 def _canonical_log(data: dict) -> dict:
     """审计日志整体落盘规范形（顶层与各事件 sort_keys，既定 details 保序）。"""
+    events = data.get("events")
+    reorged_ids = (
+        _reorged_request_ids(events) if isinstance(events, list) else set()
+    )
     canonical = {}
     for key in sorted(data):
         value = data[key]
         if key == "events" and isinstance(value, list):
-            canonical[key] = [_canonical_event(event) for event in value]
+            canonical[key] = [
+                _canonical_event(
+                    event,
+                    preserve_details=(
+                        isinstance(event, dict)
+                        and event.get("type") == TYPE_ASSET_OPERATION_COMMITTED
+                        and event.get("request_id") in reorged_ids
+                    ),
+                )
+                for event in value
+            ]
         else:
             canonical[key] = _canonicalize_sorted(value)
     return canonical
@@ -503,6 +562,24 @@ class AuditStore:
                     f"audit log {path!r} has a "
                     f"{event.get('type')} event whose details are out of "
                     "the canonical order"
+                )
+        # 重组补偿的 asset_operation_committed（request_id 与某条
+        # chain_dispatch_reorged 相同者）details 落盘必须恰为 README 既定
+        # R 序 operation_id,asset_id,delta,state,balance,version：错序即
+        # 不可对账现场（RecoveryError），绝不归一而抹平重排。其余提交事件
+        # 不在此列（仍按 sort_keys 规范序）。
+        reorged_ids = _reorged_request_ids(events)
+        for event in events:
+            if (
+                event.get("type") == TYPE_ASSET_OPERATION_COMMITTED
+                and event.get("request_id") in reorged_ids
+                and list(event["details"])
+                != list(_REORG_COMMITTED_DETAILS_ORDER)
+            ):
+                raise RecoveryError(
+                    f"audit log {path!r} has an asset_operation_committed "
+                    "event for a reorg compensation whose details are out "
+                    "of the canonical order"
                 )
         for event in events:
             _order_event_details(event)
@@ -796,6 +873,20 @@ class AuditStore:
         seq。"""
         return self._events_grouped_by_request(
             wallet_id, TYPE_CHAIN_DISPATCH_REORGED
+        )
+
+    def chain_dispatch_taken_over_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 chain_dispatch_taken_over 事件，按 request_id
+        （dispatch_id）分组，组内按 seq 升序。
+
+        跨链派发接管仅由这些事件持久化（事件是唯一提交点）：在线幂等
+        重放与崩溃恢复据此判定每个 dispatch_id 是否已接管及其参数。每个
+        dispatch_id 至多一条有效事件（重复属不可对账现场，由恢复判定）。
+        纯只读，不分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_CHAIN_DISPATCH_TAKEN_OVER
         )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:

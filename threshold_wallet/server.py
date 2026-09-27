@@ -31,6 +31,7 @@
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/observe 多源观察上报
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/dispatch 请求跨链派发
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/result 上报跨链派发结果回执
+- POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/takeover 跨链派发接管
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/confirm 上报跨链派发确认进展
 - GET  /v1/wallets/<wallet_id>/chain/<dispatch_id>/finality 查询跨链派发最终性
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/settle 最终性资产结算（空体）
@@ -652,6 +653,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("tx_id"),
                     )
                     self._send_json_compact(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "takeover"
+                ):
+                    body = self._read_json_body()
+                    # 请求体仅允许 adapter_id/approval_request_id 两键
+                    # （值类型/取值由 service 校验）
+                    if set(body) != {"adapter_id", "approval_request_id"}:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly adapter_id and "
+                            "approval_request_id",
+                        )
+                    status, result = service.post_chain_dispatch_takeover(
+                        wallet_id,
+                        rest[1],
+                        body.get("adapter_id"),
+                        body.get("approval_request_id"),
+                    )
+                    self._send_json(status, result)
                     return
 
                 if (

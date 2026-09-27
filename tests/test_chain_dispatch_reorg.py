@@ -475,6 +475,64 @@ class ReorgServiceTest(_SceneMixin, unittest.TestCase):
         with self.assertRaises(RecoveryError):
             make_harness(self.d)
 
+    def test_reorg_committed_details_persist_in_r_order(self):
+        self._build_settled()
+        status, _ = self._reorg()
+        self.assertEqual(status, 201)
+        # 重组的 asset_operation_committed details 按 R 序落盘
+        path = os.path.join(self.d, "audit", "w1.json")
+        with open(path, encoding="utf-8") as f:
+            log = json.load(f)
+        stored = [
+            e for e in log["events"]
+            if e["type"] == "asset_operation_committed"
+            and e["request_id"] == "dp1"
+        ][0]
+        self.assertEqual(
+            list(stored["details"]),
+            ["operation_id", "asset_id", "delta", "state", "balance",
+             "version"],
+        )
+        # 重启恢复后查询视图仍为 R 序
+        h2 = make_harness(self.d)
+        event = [
+            e for e in h2.service.get_audit_events("w1")["events"]
+            if e["type"] == "asset_operation_committed"
+            and e["request_id"] == "dp1"
+        ][0]
+        self.assertEqual(
+            list(event["details"]),
+            ["operation_id", "asset_id", "delta", "state", "balance",
+             "version"],
+        )
+
+    def test_reorg_committed_details_out_of_order_is_unreconcilable(self):
+        self._build_settled()
+        status, _ = self._reorg()
+        self.assertEqual(status, 201)
+        path = os.path.join(self.d, "audit", "w1.json")
+        with open(path, encoding="utf-8") as f:
+            log = json.load(f)
+        for e in log["events"]:
+            if (
+                e["type"] == "asset_operation_committed"
+                and e["request_id"] == "dp1"
+            ):
+                details = e["details"]
+                e["details"] = {
+                    key: details[key]
+                    for key in (
+                        "asset_id", "balance", "delta", "operation_id",
+                        "state", "version",
+                    )
+                }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(log, f)
+        with self.assertRaises(RecoveryError):
+            make_harness(self.d)
+        with self.assertRaises(RecoveryError):
+            self.svc.get_chain_dispatch_finality("w1", "dp1")
+
     def test_orphan_reorged_event_is_unreconcilable(self):
         self._build_settled()
         status, _ = self._reorg()

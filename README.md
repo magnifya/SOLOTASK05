@@ -65,6 +65,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/chain/{oid}/observe` | 多源观察上报 `{"source","report"}` |
 | POST | `/v1/wallets/{id}/chain/{oid}/dispatch` | 请求跨链派发 `{"dispatch_id","adapter_id","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/result` | 上报跨链派发结果回执 `{"adapter_id","state","tx_id"}` |
+| POST | `/v1/wallets/{id}/chain/{did}/takeover` | 跨链派发接管 `{"adapter_id","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/confirm` | 上报跨链派发确认进展 `{"adapter_id","tx_id","block_height","block_hash","confirmations"}` |
 | GET  | `/v1/wallets/{id}/chain/{did}/finality` | 查询跨链派发最终性 |
 | POST | `/v1/wallets/{id}/chain/{did}/settle` | 最终性资产结算（空体） |
@@ -710,7 +711,9 @@ quorum 后按既有 commit 契约自动提交。
   `state` 为 `broadcasted` 或 `failed`；`state=broadcasted` 时 `tx_id`
   为 64 位小写 hex，`state=failed` 时 `tx_id` 为 `null`。键集/类型/
   值错一律 `400`；钱包或派发未知 `404`；`adapter_id` 与派发归属不符、
-  或同 `dispatch_id` 异参重报一律 `409`。
+  或同 `dispatch_id` 异参重报一律 `409`。派发经 takeover 接管后归属
+  新适配器：只接受新适配器的一次结果（旧适配器新结果或第二条新
+  结果一律 `409`，既有同参重放仍 `200`）。
 - 成功 `201` 返回
   `V={"dispatch_id","operation_id","adapter_id","chain_id","state","tx_id"}`，
   键序固定（`operation_id`/`chain_id` 取自派发请求）。同 `dispatch_id`
@@ -725,10 +728,57 @@ quorum 后按既有 commit 契约自动提交。
 - 启动及持锁访问按 seq 逐条复核每条 `chain_dispatch_result`：请求
   （同一 `dispatch_id` 的 `chain_dispatch_requested`）必须**先于**
   结果提交、归属一致（`operation_id`/`adapter_id`/`chain_id` 与请求
-  相同）、每个派发至多一条结果。任一矛盾都 fail-closed（抛
+  相同）、每个派发至多一条结果（经 takeover 接管后新适配器可再有
+  一条，见下节）。任一矛盾都 fail-closed（抛
   `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件
   I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪，
   保留现场、不增 seq。恢复不新增事件、不改 seq，响应、日志、非
+  份额文件绝不泄露份额私钥或份额正文。
+
+### 跨链派发接管（takeover）
+
+`POST /v1/wallets/{id}/chain/{did}/takeover`（仅 POST），`did` 为已派发
+的 `dispatch_id`。请求体 B 恰含 `{"adapter_id","approval_request_id"}`
+两键（含其他键或缺键一律 `400`），两个值均须匹配安全标识
+`[A-Za-z0-9_-]{1,128}`，非法 `400`：把一笔结果为 `failed` 的跨链派发
+接管给新适配器。
+
+- 钱包、派发、同钱包审批单任一未知一律 `404`。
+- **首提前置**：派发操作须为 `pending`；该派发的结果须为 `failed`
+  且尚未接管；`adapter_id` 必须与派发请求的适配器不同；
+  `approval_request_id` 必须指向**同一钱包**既有、且为 `approved`
+  的审批单（操作前按既有契约懒过期）；其 `message` 必须与紧凑 JSON
+  **逐字一致**（无空格、键序固定为 dispatch_id,adapter_id）：
+  `{"dispatch_id":"D","adapter_id":"A"}`。操作非 pending、结果非
+  failed、已接管、adapter_id 未变化、审批单非 `approved` 或 message
+  不符一律 `409`，不追加事件、现场不变（零副作用）。
+- 成功 `201` 返回 `V={"dispatch_id","adapter_id","state"}`，键序固定
+  且 `state="requested"`。同 `dispatch_id` **同参**（`adapter_id`、
+  `approval_request_id` 全同）重放 `200` 返回同一 V（**优先于状态与
+  审批判定，不复查审批单/派发现状**）；同 `dispatch_id` 异参或再次
+  接管一律 `409`。
+- 接管仅由审计事件持久化：`chain_dispatch_taken_over` 是唯一提交点
+  （`request_id=dispatch_id`、`actor_id=approval_request_id`、
+  `reason=null`、details 即 V，键序 `dispatch_id,adapter_id,state`），
+  不另写接管状态文件。首提在每钱包跨进程事务锁内追加，跨进程并发只有
+  一个 `201`（其余同参 `200`），审计 seq 连续不重号，失败/重放不记
+  事件。
+- **接管后**：`result` 只接受新适配器的一次结果（旧适配器新结果或
+  第二条新适配器结果一律 `409`，既有同参重放仍 `200`）；`confirm`
+  只承接新适配器的 `broadcasted` 交易（归属判定以接管后的新适配器
+  为准）。
+- 重启/灾备恢复时，每条 `chain_dispatch_taken_over` 都按其**提交之前**
+  的现场逐条复核：同 `dispatch_id` 的 `chain_dispatch_requested` 先于
+  接管提交、接管之前最近一条结果为 `failed`、新 `adapter_id` 与请求
+  适配器不同、操作当时为 `pending`（提交点之前无该操作的提交事件）、
+  同钱包审批单存在且 message 逐字一致、状态为 `approved`（其后经
+  `/sign` 推进为 `signed` 亦认可）、每个 `dispatch_id` 至多一条接管。
+  重复接管、审批单缺失/未批准/message 不符或任何矛盾都 fail-closed
+  （抛 `RecoveryError`）；`details` 键序在审计读取归一化**之前**校验
+  （落盘必须恰为 `dispatch_id,adapter_id,state`，错序即
+  `RecoveryError`，绝不先归一而抹平重排）；审计 JSON 损坏抛
+  `CorruptDataError`、审计文件 I/O 失败抛 `OSError`——三者 HTTP 一律
+  `503`、`serve` 拒绝就绪。恢复不新增事件、不改 seq，响应、日志、非
   份额文件绝不泄露份额私钥或份额正文。
 
 ### 跨链派发确认进展（confirm）
@@ -744,7 +794,8 @@ quorum 后按既有 commit 契约自动提交。
   为非布尔非负整数。键集/类型/值错一律 `400`；钱包或派发未知 `404`；
   无 `broadcasted` 结果（尚无结果或结果为 `failed`）、`adapter_id` 或
   `tx_id` 与派发归属（请求适配器 / 播链交易）不符、或迁移冲突一律
-  `409`。
+  `409`。派发经 takeover 接管后归属判定以接管的新适配器及其
+  `broadcasted` 结果为准（confirm 只承接 broadcasted 交易）。
 - 阈值/窗口取**派发请求提交之前**该资产已启用策略的
   `required_confirmations`/`reorg_window`：同块（高度与哈希均同）
   确认数只增不减；换块（迁移）仅限确认中且
@@ -770,8 +821,9 @@ quorum 后按既有 commit 契约自动提交。
   完成并连续追加三个七字段事件：`chain_dispatch_confirmation`
   （details 即 V）、`chain_dispatch_reorged`（details 键序恰为
   `dispatch_id,operation_id`，两值均为 `D`）、
-  `asset_operation_committed`（details 即补偿操作的 R），seq 为
-  n、n+1、n+2 一次原子落盘，三事件 `request_id=D`、
+  `asset_operation_committed`（details 即补偿操作的 R，按 R 序
+  `operation_id,asset_id,delta,state,balance,version` 落盘与恢复），
+  seq 为 n、n+1、n+2 一次原子落盘，三事件 `request_id=D`、
   `actor_id=adapter_id`、`reason=null`。三事件**俱在前滚、俱无
   回滚**：崩溃后按提交意图对账——俱在则前滚补齐账本，俱不在则删除
   新建补偿操作并恢复提交前余额/version；残缺或矛盾（含 details 键序
@@ -854,7 +906,7 @@ quorum 后按既有 commit 契约自动提交。
 `chain_report`、`chain_arbitration`、`chain_vote`、
 `chain_dispatch_requested`、`chain_dispatch_result`、
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
-`chain_dispatch_reorged`。
+`chain_dispatch_reorged`、`chain_dispatch_taken_over`。
 
 ## 多进程与故障恢复（保证）
 
