@@ -276,6 +276,7 @@ class WalletService:
         self._reconcile_chain_dispatch_confirmation_events(wallet_id)
         self._reconcile_chain_dispatch_settled_events(wallet_id)
         self._reconcile_chain_dispatch_reorged_events(wallet_id)
+        self._reconcile_chain_dispatch_taken_over_events(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
     def _reconcile_dkg_events_locked(self, wallet_id: str) -> None:
@@ -397,6 +398,11 @@ class WalletService:
             # 三事件同批紧邻、补偿与原操作同资产反向，矛盾/损坏
             # fail-closed；纯只读。
             self._reconcile_chain_dispatch_reorged_events(wallet_id)
+            # 失败派发接管（chain_dispatch_taken_over）与派发请求/失败
+            # 结果/审批单对账，并由结果/确认/结算对账复核接管后的归属与
+            # 交易链：前置齐备、新适配器不同、审批单 approved 且 message
+            # 逐字一致，矛盾/损坏 fail-closed；纯只读。
+            self._reconcile_chain_dispatch_taken_over_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/
             # rejoin/share-bind）仅由审计事件持久化：按既有 DKG 恢复规则
@@ -551,6 +557,9 @@ class WalletService:
                 # 账本一致性：账本存在时一并按 seq 重放对账，矛盾即
                 # fail-closed。
                 self._reconcile_chain_dispatch_reorged_events(wallet_id)
+                # 失败派发接管与派发请求/失败结果/审批单同属账本一致性：
+                # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
+                self._reconcile_chain_dispatch_taken_over_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
@@ -4671,6 +4680,93 @@ class WalletService:
         "tx_id",
     )
 
+    #: 接管响应 / chain_dispatch_taken_over 事件 details 的固定键序
+    _DISPATCH_TAKEN_OVER_VIEW_KEY_ORDER = (
+        "dispatch_id",
+        "adapter_id",
+        "state",
+    )
+
+    @staticmethod
+    def _takeover_approval_message(
+        dispatch_id: str, adapter_id: str
+    ) -> str:
+        """接管审批单 message 必须逐字一致的紧凑 JSON（无空格、键序固定为
+        dispatch_id,adapter_id）。"""
+        return json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "adapter_id": adapter_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _dispatch_taken_over_view(
+        self, dispatch_id: str, adapter_id: str
+    ) -> dict:
+        """接管成功/重放响应体 V（键序固定，state 恒为 requested）。"""
+        return {
+            "dispatch_id": dispatch_id,
+            "adapter_id": adapter_id,
+            "state": "requested",
+        }
+
+    def _dispatch_takeover_event_locked(
+        self, wallet_id: str, dispatch_id: str
+    ) -> Optional[dict]:
+        """返回某派发唯一的 chain_dispatch_taken_over 事件（调用方持锁）；
+        未接管返回 None；重复接管事件是不可对账现场（RecoveryError）。"""
+        grouped = self._audit.chain_dispatch_taken_over_events(
+            wallet_id
+        ).get(dispatch_id)
+        if not grouped:
+            return None
+        if len(grouped) != 1:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has multiple "
+                f"chain_dispatch_taken_over events for {dispatch_id!r}"
+            )
+        return grouped[0]
+
+    def _effective_broadcasted_result_locked(
+        self, wallet_id: str, dispatch_id: str
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        """返回某派发当前生效适配器的 broadcasted 结果与接管事件
+        （调用方持锁）。
+
+        未接管时返回 (唯一 broadcasted 结果或 None, None)；接管后返回
+        （接管之后新适配器的 broadcasted 结果或 None, 接管事件）。原适配器
+        的 failed 结果在接管后不作为 broadcasted 结果。"""
+        takeover_event = self._dispatch_takeover_event_locked(
+            wallet_id, dispatch_id
+        )
+        result_group = (
+            self._audit.chain_dispatch_result_events(wallet_id).get(
+                dispatch_id
+            )
+            or []
+        )
+        if takeover_event is None:
+            if (
+                len(result_group) == 1
+                and result_group[0]["details"]["state"] == "broadcasted"
+            ):
+                return result_group[0], None
+            return None, None
+        takeover_seq = takeover_event["seq"]
+        post = [
+            event
+            for event in result_group
+            if event["seq"] > takeover_seq
+        ]
+        if (
+            len(post) == 1
+            and post[0]["details"]["state"] == "broadcasted"
+        ):
+            return post[0], takeover_event
+        return None, takeover_event
+
     @staticmethod
     def _dispatch_approval_message(
         operation_id: str,
@@ -5106,7 +5202,15 @@ class WalletService:
         events = self._audit.events_by_type(
             wallet_id, audit.TYPE_CHAIN_DISPATCH_RESULT
         )
-        seen: set[str] = set()
+        # 接管（chain_dispatch_taken_over）允许该派发在失败结果之后再接收
+        # 新适配器的恰好一条结果：接管前至多一条、接管后至多一条；无接管
+        # 的派发维持至多一条。接管事件形状独立（不依赖结果），这里直接取
+        # 严格形状后的接管映射。
+        takeover_by_dispatch = {
+            event["request_id"]: event
+            for event in self._dispatch_taken_over_events_strict(wallet_id)
+        }
+        result_seqs: dict[str, list[int]] = {}
         for event in events:
             if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
                 raise RecoveryError(
@@ -5123,12 +5227,7 @@ class WalletService:
                     f"wallet {wallet_id!r} has a chain_dispatch_result "
                     "event with a malformed dispatch_id"
                 )
-            if dispatch_id in seen:
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} has multiple "
-                    f"chain_dispatch_result events for {dispatch_id!r}"
-                )
-            seen.add(dispatch_id)
+            result_seqs.setdefault(dispatch_id, []).append(event["seq"])
             if not (
                 isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
             ):
@@ -5192,6 +5291,28 @@ class WalletService:
                     f"wallet {wallet_id!r} chain_dispatch_result "
                     f"{dispatch_id!r} has an invalid state"
                 )
+        # 多重性：无接管的派发至多一条结果；已接管的派发在接管事件两侧
+        # 各至多一条（接管前一条失败结果、接管后至多一条新适配器结果）。
+        for dispatch_id, seqs in result_seqs.items():
+            takeover = takeover_by_dispatch.get(dispatch_id)
+            takeover_seq = takeover["seq"] if takeover is not None else None
+            if takeover is None:
+                if len(seqs) > 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple "
+                        f"chain_dispatch_result events for {dispatch_id!r}"
+                    )
+                continue
+            before = [s for s in seqs if s < takeover_seq]
+            after = [s for s in seqs if s > takeover_seq]
+            if len(before) > 1 or len(after) > 1 or any(
+                s == takeover_seq for s in seqs
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has malformed "
+                    f"chain_dispatch_result events around the takeover of "
+                    f"{dispatch_id!r}"
+                )
         return events
 
     def _reconcile_chain_dispatch_result_events(
@@ -5218,6 +5339,10 @@ class WalletService:
         for event in requests:
             # 重复 dispatch_id 已在 _dispatch_events_strict 拦截。
             request_by_dispatch[event["request_id"]] = event
+        takeover_by_dispatch = {
+            event["request_id"]: event
+            for event in self._dispatch_taken_over_events_strict(wallet_id)
+        }
         for event in events:
             details = event["details"]
             dispatch_id = details["dispatch_id"]
@@ -5234,13 +5359,37 @@ class WalletService:
                     f"{dispatch_id!r} does not follow its dispatch request"
                 )
             saved = request["details"]
-            for name in ("operation_id", "adapter_id", "chain_id"):
-                if details[name] != saved[name]:
+            takeover = takeover_by_dispatch.get(dispatch_id)
+            after_takeover = (
+                takeover is not None and event["seq"] > takeover["seq"]
+            )
+            if after_takeover:
+                # 接管后的结果：operation_id/chain_id 仍取自原派发请求，
+                # adapter_id 取自接管事件（新适配器），且必须与原适配器不同。
+                if (
+                    details["operation_id"] != saved["operation_id"]
+                    or details["chain_id"] != saved["chain_id"]
+                ):
                     raise RecoveryError(
-                        f"wallet {wallet_id!r} chain_dispatch_result "
-                        f"{dispatch_id!r} {name} disagrees with its dispatch "
-                        "request"
+                        f"wallet {wallet_id!r} post-takeover "
+                        f"chain_dispatch_result {dispatch_id!r} disagrees "
+                        "with its dispatch request"
                     )
+                new_adapter = takeover["details"]["adapter_id"]
+                if details["adapter_id"] != new_adapter:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} post-takeover "
+                        f"chain_dispatch_result {dispatch_id!r} does not use "
+                        "the takeover adapter"
+                    )
+            else:
+                for name in ("operation_id", "adapter_id", "chain_id"):
+                    if details[name] != saved[name]:
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} chain_dispatch_result "
+                            f"{dispatch_id!r} {name} disagrees with its "
+                            "dispatch request"
+                        )
 
     def post_chain_dispatch_result(
         self,
@@ -5302,28 +5451,19 @@ class WalletService:
                     )
 
                 results = self._audit.chain_dispatch_result_events(wallet_id)
-                # 幂等/异参冲突优先于派发存在性判定：已提交的结果只按全参
-                # 比较回放，不复查请求/现场现状。
-                committed = results.get(dispatch_id)
-                if committed:
-                    if len(committed) != 1:
-                        raise RecoveryError(
-                            f"wallet {wallet_id!r} has multiple "
-                            f"chain_dispatch_result events for "
-                            f"{dispatch_id!r}"
-                        )
-                    saved = committed[0]["details"]
+                # 幂等优先于派发存在性/现状判定：任一已提交结果与全参
+                # （adapter_id/state/tx_id）相同即 200 返回同一 V。接管前后
+                # 可有两条结果（旧适配器 failed、新适配器一条），两者
+                # adapter_id 必不同，同参匹配绝不会有歧义。
+                committed = results.get(dispatch_id) or []
+                for prior in committed:
+                    saved = prior["details"]
                     if (
                         saved["adapter_id"] == adapter_id
                         and saved["state"] == state
                         and saved["tx_id"] == tx_id
                     ):
                         return 200, dict(saved)
-                    raise ServiceError(
-                        409,
-                        f"dispatch {dispatch_id!r} already has a result with "
-                        "different parameters",
-                    )
 
                 # 404：派发请求未知
                 requests = self._audit.chain_dispatch_requested_events(
@@ -5342,17 +5482,52 @@ class WalletService:
                     )
                 request_details = grouped[0]["details"]
 
-                # 409：上报方适配器与派发归属不符
-                if request_details["adapter_id"] != adapter_id:
-                    raise ServiceError(
-                        409,
-                        f"dispatch {dispatch_id!r} belongs to another adapter",
-                    )
+                takeover_event = self._dispatch_takeover_event_locked(
+                    wallet_id, dispatch_id
+                )
+                if takeover_event is None:
+                    # 未接管：上报方适配器须与派发归属一致，且每派发至多
+                    # 一条结果（异参重报落入此分支即 409）。
+                    if committed:
+                        raise ServiceError(
+                            409,
+                            f"dispatch {dispatch_id!r} already has a result "
+                            "with different parameters",
+                        )
+                    if request_details["adapter_id"] != adapter_id:
+                        raise ServiceError(
+                            409,
+                            f"dispatch {dispatch_id!r} belongs to another "
+                            "adapter",
+                        )
+                else:
+                    # 已接管：result 此后只接受新适配器的恰好一条结果。
+                    new_adapter = takeover_event["details"]["adapter_id"]
+                    if adapter_id != new_adapter:
+                        raise ServiceError(
+                            409,
+                            f"dispatch {dispatch_id!r} was taken over by "
+                            "another adapter",
+                        )
+                    takeover_seq = takeover_event["seq"]
+                    post_results = [
+                        event
+                        for event in committed
+                        if event["seq"] > takeover_seq
+                    ]
+                    if post_results:
+                        # 新适配器已有一条结果且非同参（同参已在上方按 200
+                        # 回放）：第二次/异参结果一律 409。
+                        raise ServiceError(
+                            409,
+                            f"dispatch {dispatch_id!r} already has a "
+                            "post-takeover result with different parameters",
+                        )
 
                 view = self._dispatch_result_view(
                     dispatch_id,
                     request_details["operation_id"],
-                    request_details["adapter_id"],
+                    adapter_id,
                     request_details["chain_id"],
                     state,
                     tx_id,
@@ -5594,7 +5769,15 @@ class WalletService:
         request_by_dispatch = {
             event["request_id"]: event for event in requests
         }
-        result_by_dispatch = {event["request_id"]: event for event in results}
+        results_by_dispatch: dict[str, list[dict]] = {}
+        for event in results:
+            results_by_dispatch.setdefault(
+                event["request_id"], []
+            ).append(event)
+        takeover_by_dispatch = {
+            event["request_id"]: event
+            for event in self._dispatch_taken_over_events_strict(wallet_id)
+        }
         settled_by_dispatch = {
             event["request_id"]: event
             for event in self._dispatch_settled_events_strict(wallet_id)
@@ -5617,23 +5800,46 @@ class WalletService:
                     f"event for {dispatch_id!r} without a preceding dispatch "
                     "request"
                 )
-            result = result_by_dispatch.get(dispatch_id)
-            if (
-                result is None
-                or result["seq"] >= event["seq"]
-                or result["details"]["state"] != "broadcasted"
-            ):
+            takeover = takeover_by_dispatch.get(dispatch_id)
+            after_takeover = (
+                takeover is not None and event["seq"] > takeover["seq"]
+            )
+            # 确认进展只能对应先于本事件的 broadcasted 结果。接管后取新
+            # 适配器在接管之后的 broadcasted 结果；无接管取原适配器唯一的
+            # broadcasted 结果。
+            prior_results = [
+                result
+                for result in results_by_dispatch.get(dispatch_id, [])
+                if result["seq"] < event["seq"]
+                and (
+                    takeover is None
+                    or (
+                        result["seq"] > takeover["seq"]
+                        if after_takeover
+                        else result["seq"] < takeover["seq"]
+                    )
+                )
+            ]
+            result = (
+                prior_results[-1] if prior_results else None
+            )
+            if result is None or result["details"]["state"] != "broadcasted":
                 raise RecoveryError(
                     f"wallet {wallet_id!r} has a chain_dispatch_confirmation "
                     f"event for {dispatch_id!r} without a preceding "
                     "broadcasted result"
                 )
             saved_request = request["details"]
-            if details["adapter_id"] != saved_request["adapter_id"]:
+            effective_adapter = (
+                takeover["details"]["adapter_id"]
+                if after_takeover
+                else saved_request["adapter_id"]
+            )
+            if details["adapter_id"] != effective_adapter:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} chain_dispatch_confirmation "
-                    f"{dispatch_id!r} adapter_id disagrees with its dispatch "
-                    "request"
+                    f"{dispatch_id!r} adapter_id disagrees with the effective "
+                    "dispatch adapter"
                 )
             if (
                 details["state"] != "reorged"
@@ -5860,26 +6066,28 @@ class WalletService:
                 request_event = grouped[0]
                 request_details = request_event["details"]
 
-                # 409：无 broadcasted 结果（无结果或结果为 failed）
-                results = self._audit.chain_dispatch_result_events(wallet_id)
-                result_group = results.get(dispatch_id)
-                if result_group and len(result_group) != 1:
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} has multiple "
-                        f"chain_dispatch_result events for {dispatch_id!r}"
+                # 409：无当前生效适配器的 broadcasted 结果。未接管时结果须
+                # 为原适配器唯一一条 broadcasted；接管后须存在接管之后新
+                # 适配器的 broadcasted 结果（原适配器结果为 failed）。
+                broadcasted_result, takeover_event = (
+                    self._effective_broadcasted_result_locked(
+                        wallet_id, dispatch_id
                     )
-                if (
-                    not result_group
-                    or result_group[0]["details"]["state"] != "broadcasted"
-                ):
+                )
+                if broadcasted_result is None:
                     raise ServiceError(
                         409,
                         f"dispatch {dispatch_id!r} has no broadcasted result",
                     )
-                result_details = result_group[0]["details"]
+                result_details = broadcasted_result["details"]
+                effective_adapter_id = (
+                    takeover_event["details"]["adapter_id"]
+                    if takeover_event is not None
+                    else request_details["adapter_id"]
+                )
 
-                # 409：归属冲突（上报方适配器/交易与派发归属不符）
-                if request_details["adapter_id"] != adapter_id:
+                # 409：归属冲突（上报方适配器与当前生效适配器不符）
+                if effective_adapter_id != adapter_id:
                     raise ServiceError(
                         409,
                         f"dispatch {dispatch_id!r} belongs to another adapter",
@@ -6169,12 +6377,12 @@ class WalletService:
                     )
                 request_details = grouped[0]["details"]
 
-                results = self._audit.chain_dispatch_result_events(wallet_id)
-                result_group = results.get(dispatch_id)
-                if (
-                    not result_group
-                    or result_group[0]["details"]["state"] != "broadcasted"
-                ):
+                broadcasted_result, _ = (
+                    self._effective_broadcasted_result_locked(
+                        wallet_id, dispatch_id
+                    )
+                )
+                if broadcasted_result is None:
                     raise ServiceError(
                         409,
                         f"dispatch {dispatch_id!r} has no broadcasted result",
@@ -6183,6 +6391,8 @@ class WalletService:
                 groups = self._audit.chain_dispatch_confirmation_events(
                     wallet_id
                 ).get(dispatch_id) or []
+                # 接管前结果为 failed，不可能有确认进展；接管后的进展归属
+                # 新适配器，确认链整体属于当前生效适配器。
                 if not groups:
                     raise ServiceError(
                         409,
@@ -6300,11 +6510,17 @@ class WalletService:
         requests = self._dispatch_events_strict(wallet_id)
         results = self._dispatch_result_events_strict(wallet_id)
         confirmations = self._dispatch_confirmation_events_strict(wallet_id)
+        takeovers = self._dispatch_taken_over_events_strict(wallet_id)
         request_by_dispatch = {
             event["request_id"]: event for event in requests
         }
-        result_by_dispatch = {
-            event["request_id"]: event for event in results
+        results_by_dispatch: dict[str, list[dict]] = {}
+        for event in results:
+            results_by_dispatch.setdefault(
+                event["request_id"], []
+            ).append(event)
+        takeover_by_dispatch = {
+            event["request_id"]: event for event in takeovers
         }
         ledger = self._store.check_asset_ledger_semantics(wallet_id)
         operations = ledger["operations"]
@@ -6336,18 +6552,31 @@ class WalletService:
                     f"{dispatch_id!r} operation_id disagrees with its "
                     "dispatch request"
                 )
-            if event["actor_id"] != saved_request["adapter_id"]:
+            takeover = takeover_by_dispatch.get(dispatch_id)
+            if takeover is not None and takeover["seq"] < seq:
+                effective_adapter = takeover["details"]["adapter_id"]
+            else:
+                effective_adapter = saved_request["adapter_id"]
+            if event["actor_id"] != effective_adapter:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} chain_dispatch_settled "
-                    f"{dispatch_id!r} adapter_id disagrees with its dispatch "
-                    "request"
+                    f"{dispatch_id!r} adapter_id disagrees with the effective "
+                    "dispatch adapter"
                 )
-            result = result_by_dispatch.get(dispatch_id)
-            if (
-                result is None
-                or result["seq"] >= seq
-                or result["details"]["state"] != "broadcasted"
-            ):
+            # 结算前必须存在当前生效适配器的 broadcasted 结果：未接管时即
+            # 原适配器唯一结果；接管后须为接管之后新适配器的结果。
+            prior_broadcasted = [
+                result
+                for result in results_by_dispatch.get(dispatch_id, [])
+                if result["seq"] < seq
+                and result["details"]["state"] == "broadcasted"
+                and (
+                    takeover is None
+                    or takeover["seq"] >= seq
+                    or result["seq"] > takeover["seq"]
+                )
+            ]
+            if not prior_broadcasted:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} has a chain_dispatch_settled "
                     f"event for {dispatch_id!r} without a preceding "
@@ -6493,6 +6722,10 @@ class WalletService:
         request_by_dispatch = {
             event["request_id"]: event for event in requests
         }
+        takeover_by_dispatch = {
+            event["request_id"]: event
+            for event in self._dispatch_taken_over_events_strict(wallet_id)
+        }
         settled_by_dispatch = {
             event["request_id"]: event
             for event in self._dispatch_settled_events_strict(wallet_id)
@@ -6512,11 +6745,18 @@ class WalletService:
                     "request"
                 )
             saved_request = request["details"]
-            if event["actor_id"] != saved_request["adapter_id"]:
+            # 失败派发可经接管由新适配器播链、结算后再重组：重组事件的
+            # actor 取当前生效适配器（接管在先时为新适配器）。
+            takeover = takeover_by_dispatch.get(dispatch_id)
+            if takeover is not None and takeover["seq"] < seq:
+                effective_adapter = takeover["details"]["adapter_id"]
+            else:
+                effective_adapter = saved_request["adapter_id"]
+            if event["actor_id"] != effective_adapter:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} chain_dispatch_reorged "
-                    f"{dispatch_id!r} adapter_id disagrees with its dispatch "
-                    "request"
+                    f"{dispatch_id!r} adapter_id disagrees with the effective "
+                    "dispatch adapter"
                 )
             settled = settled_by_dispatch.get(dispatch_id)
             if settled is None or settled["seq"] >= seq:
@@ -6578,6 +6818,388 @@ class WalletService:
                     f"{dispatch_id!r} committed details are not the inverse "
                     "of its settled operation"
                 )
+
+    # ---- 跨链派发失败接管 -------------------------------------------------
+
+    def _dispatch_taken_over_events_strict(
+        self, wallet_id: str
+    ) -> list[dict]:
+        """返回该钱包全部 chain_dispatch_taken_over 事件（按 seq 升序）并
+        逐条严格校验**形状**（外层七字段键序、request_id==dispatch_id、
+        actor_id 为安全标识（approval_request_id）、reason 为 null、details
+        恰为三键 V 且键序固定 dispatch_id,adapter_id,state、state 恒为
+        requested、adapter_id 为安全标识）。
+
+        这里只做与现场无关的形状校验；与派发请求/失败结果/审批单的先后、
+        归属及 message 语义复核在
+        :meth:`_reconcile_chain_dispatch_taken_over_events` 按事件 seq 完成。
+        任何形状畸形都是不可对账现场（RecoveryError）。纯只读，不分配
+        seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_TAKEN_OVER
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_taken_over "
+                    "event whose outer fields are out of the canonical order"
+                )
+            dispatch_id = event.get("request_id")
+            actor_id = event.get("actor_id")
+            if (
+                not isinstance(dispatch_id, str)
+                or not ROTATION_ID_RE.match(dispatch_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_taken_over "
+                    "event with a malformed dispatch_id"
+                )
+            if dispatch_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"chain_dispatch_taken_over events for {dispatch_id!r}"
+                )
+            seen.add(dispatch_id)
+            if not (
+                isinstance(actor_id, str) and ROTATION_ID_RE.match(actor_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} has a malformed approval_request_id"
+                )
+            if event.get("reason") is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} has a non-null reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details)
+                != list(self._DISPATCH_TAKEN_OVER_VIEW_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} has malformed details"
+                )
+            if details["dispatch_id"] != dispatch_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} details dispatch_id disagrees with its "
+                    "request_id"
+                )
+            if not (
+                isinstance(details["adapter_id"], str)
+                and ROTATION_ID_RE.match(details["adapter_id"])
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} has a malformed adapter_id"
+                )
+            if details["state"] != "requested":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} has a state other than requested"
+                )
+        return events
+
+    def _reconcile_chain_dispatch_taken_over_events(
+        self, wallet_id: str
+    ) -> None:
+        """按 seq 严格复核全部 chain_dispatch_taken_over 事件（调用方须持
+        钱包事务锁）。
+
+        每条接管都以其**提交之前**的现场复核在线首提的全部前置：
+
+        - 同一 dispatch_id 的 chain_dispatch_requested 必须先于接管事件
+          提交（请求先于接管）；
+        - 接管提交之前该派发已有唯一 chain_dispatch_result 且为 failed
+          （仅 failed 且未接管时可接管）；
+        - 接管 adapter_id 与原请求适配器不同；
+        - actor_id 指向同钱包审批单，存在、message 逐字为按
+          dispatch_id,adapter_id（新适配器）序的紧凑 JSON、状态为
+          approved（其后经 /sign 推进为 signed 亦认可）。
+
+        任一矛盾都 fail-closed（RecoveryError，保留现场）。纯只读，不记
+        事件、不改 seq、不写状态。接管之后新适配器结果与确认进展的归属
+        复核在结果/确认各自的对账中按接管事件完成。"""
+        events = self._dispatch_taken_over_events_strict(wallet_id)
+        if not events:
+            return
+        requests = self._dispatch_events_strict(wallet_id)
+        request_by_dispatch = {
+            event["request_id"]: event for event in requests
+        }
+        # 各资产操作的提交 seq：接管时操作必须仍为 pending（提交点不得早
+        # 于接管事件；接管后新适配器成功播链再结算是允许的）。
+        committed_seq: dict[str, int] = {}
+        for committed in self._audit.events_by_type(
+            wallet_id, audit.TYPE_ASSET_OPERATION_COMMITTED
+        ):
+            request_id = committed.get("request_id")
+            if isinstance(request_id, str):
+                committed_seq[request_id] = committed["seq"]
+        # 接管提交之前的失败结果：按 seq 逐条收集（每派发至多一条由结果
+        # 形状校验保证；接管后允许新适配器再提交一条结果，故这里不能直接
+        # 用按 request 分组的"至多一条"断言，而按 seq 取接管前的最后一条
+        # 结果）。
+        result_events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_RESULT
+        )
+        results_by_dispatch: dict[str, list[dict]] = {}
+        for event in result_events:
+            results_by_dispatch.setdefault(
+                event["request_id"], []
+            ).append(event)
+        for event in events:
+            details = event["details"]
+            dispatch_id = details["dispatch_id"]
+            seq = event["seq"]
+            request = request_by_dispatch.get(dispatch_id)
+            if request is None or request["seq"] >= seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_taken_over "
+                    f"event for {dispatch_id!r} without a preceding dispatch "
+                    "request"
+                )
+            saved_request = request["details"]
+            # 接管时资产操作必须仍为 pending（提交点不得先于接管）。
+            operation_id = saved_request["operation_id"]
+            operation_commit_seq = committed_seq.get(operation_id)
+            if operation_commit_seq is not None and operation_commit_seq < seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} follows a committed asset operation"
+                )
+            # 接管前必须已有失败结果
+            prior_results = [
+                result
+                for result in results_by_dispatch.get(dispatch_id, [])
+                if result["seq"] < seq
+            ]
+            if (
+                not prior_results
+                or prior_results[-1]["details"]["state"] != "failed"
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} has no preceding failed result"
+                )
+            # 新适配器必须不同于原适配器
+            if details["adapter_id"] == saved_request["adapter_id"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} keeps the original adapter"
+                )
+            # 审批单复核：同钱包、存在、message 逐字一致、approved/signed
+            approval_request_id = event["actor_id"]
+            try:
+                approval = self._store.get_request(
+                    wallet_id, approval_request_id
+                )
+            except CorruptDataError:
+                raise
+            except ValueError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain dispatch takeover approval "
+                    "record is unreadable"
+                ) from exc
+            if not isinstance(approval, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} refers to an unknown approval request"
+                )
+            expected_message = self._takeover_approval_message(
+                dispatch_id, details["adapter_id"]
+            )
+            if approval.get("message") != expected_message:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} approval message does not match"
+                )
+            if approval.get("state") not in ("approved", "signed"):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                    f"{dispatch_id!r} approval request is not approved"
+                )
+
+    def post_chain_dispatch_takeover(
+        self,
+        wallet_id: str,
+        dispatch_id: object,
+        adapter_id: object,
+        approval_request_id: object,
+    ) -> tuple[int, dict]:
+        """对一笔失败（result=failed）的跨链派发申请由新适配器接管，返回
+        (HTTP 状态码, 视图 V={dispatch_id,adapter_id,state})。
+
+        请求体恰含 adapter_id,approval_request_id 两键（HTTP 边界拦键集），
+        两值与路径 D 均须匹配安全标识；键集/值错 400；钱包/派发/审批单
+        未知 404。仅当派发所属资产操作仍为 pending、已有结果为 failed、
+        且尚未接管时可首提；新 adapter_id 必须不同于原适配器；审批单须为
+        同钱包既有 approved 审批单，其 message 逐字等于按
+        dispatch_id,adapter_id 序的紧凑 JSON。任一不满足 409 且零副作用。
+
+        成功 201 返回 V（state="requested"）；同参（adapter_id 与
+        approval_request_id 全同）重放优先 200 返回同一 V（不复查现状）；
+        异参或对已接管派发再次接管一律 409。
+        chain_dispatch_taken_over 是唯一提交点（request_id=dispatch_id、
+        actor_id=approval_request_id、reason=null、details=V）；锁内并发
+        只有一个 201，重放不记事件。接管后 result 只接受新适配器的恰好一
+        条结果，confirm 只承接新适配器 broadcasted 交易的确认进展。恢复
+        检查、校验、状态判定与事件追加全部在锁内完成。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、票、派发请求/结果/确认/结算/重组/
+                # 接管、操作与相邻提交事件：矛盾现场 fail-closed，优先于
+                # 参数 400/404 判定。
+                self._reconcile_chain_state_locked(wallet_id)
+                # 类型/取值校验（400）
+                for name, value in (
+                    ("dispatch_id", dispatch_id),
+                    ("adapter_id", adapter_id),
+                    ("approval_request_id", approval_request_id),
+                ):
+                    if not isinstance(value, str) or not ROTATION_ID_RE.match(
+                        value
+                    ):
+                        raise ServiceError(
+                            400,
+                            f"{name} must match [A-Za-z0-9_-]{{1,128}}",
+                        )
+
+                # 幂等/再次接管优先于派发存在性等现状判定：已提交的接管只
+                # 按全参（adapter_id、approval_request_id）比较回放。
+                takeover_event = self._dispatch_takeover_event_locked(
+                    wallet_id, dispatch_id
+                )
+                if takeover_event is not None:
+                    saved = takeover_event["details"]
+                    if (
+                        saved["adapter_id"] == adapter_id
+                        and takeover_event["actor_id"]
+                        == approval_request_id
+                    ):
+                        return 200, self._dispatch_taken_over_view(
+                            dispatch_id, adapter_id
+                        )
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} has already been taken over",
+                    )
+
+                # 404：派发请求未知
+                requests = self._audit.chain_dispatch_requested_events(
+                    wallet_id
+                )
+                grouped = requests.get(dispatch_id)
+                if not grouped:
+                    raise ServiceError(
+                        404, f"dispatch {dispatch_id!r} not found"
+                    )
+                if len(grouped) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple "
+                        f"chain_dispatch_requested events for "
+                        f"{dispatch_id!r}"
+                    )
+                request_details = grouped[0]["details"]
+
+                # 404：同钱包审批单未知
+                approval = self._store.get_request(
+                    wallet_id, approval_request_id
+                )
+                if approval is None:
+                    raise ServiceError(
+                        404,
+                        f"approval request {approval_request_id!r} not found",
+                    )
+
+                # 409：资产操作必须仍为 pending
+                record = self._store.get_asset_operation(
+                    wallet_id, request_details["operation_id"]
+                )
+                if record is None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dispatch {dispatch_id!r} "
+                        "refers to an unknown asset operation"
+                    )
+                if record["state"] != "pending":
+                    raise ServiceError(
+                        409,
+                        f"asset operation "
+                        f"{request_details['operation_id']!r} is "
+                        f"{record['state']}, not pending",
+                    )
+
+                # 409：接管前该派发恰有一条结果且为 failed
+                result_group = (
+                    self._audit.chain_dispatch_result_events(wallet_id).get(
+                        dispatch_id
+                    )
+                    or []
+                )
+                if (
+                    len(result_group) != 1
+                    or result_group[0]["details"]["state"] != "failed"
+                ):
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} has no failed result",
+                    )
+
+                # 409：新适配器必须不同于原适配器
+                if adapter_id == request_details["adapter_id"]:
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} takeover adapter must "
+                        "differ from the original adapter",
+                    )
+
+                # 审批门控：同钱包既有 approved 审批单，message 逐字一致。
+                # 按既有契约懒过期（可能原子记一次 request_expired）。
+                approval = self._expire_if_needed(wallet_id, approval)
+                expected_message = self._takeover_approval_message(
+                    dispatch_id, adapter_id
+                )
+                if approval["message"] != expected_message:
+                    raise ServiceError(
+                        409,
+                        "approval request message does not match this "
+                        "takeover",
+                    )
+                if approval["state"] != "approved":
+                    raise ServiceError(
+                        409,
+                        f"approval request {approval_request_id!r} is "
+                        f"{approval['state']}, not approved",
+                    )
+
+                view = self._dispatch_taken_over_view(
+                    dispatch_id, adapter_id
+                )
+                # chain_dispatch_taken_over 是唯一提交点：在跨进程事务锁内
+                # 追加事件；事件之外不写任何接管状态文件。
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_DISPATCH_TAKEN_OVER,
+                        request_id=dispatch_id,
+                        actor_id=approval_request_id,
+                        reason=None,
+                        details=view,
+                    ),
+                )
+                return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
 
     def settle_chain_dispatch(
         self, wallet_id: str, dispatch_id: object
@@ -6656,19 +7278,20 @@ class WalletService:
                 request_event = grouped[0]
                 request_details = request_event["details"]
                 operation_id = request_details["operation_id"]
-                adapter_id = request_details["adapter_id"]
 
-                # 409：无 broadcasted 结果
-                results = self._audit.chain_dispatch_result_events(wallet_id)
-                result_group = results.get(dispatch_id)
-                if (
-                    not result_group
-                    or result_group[0]["details"]["state"] != "broadcasted"
-                ):
+                # 409：无当前生效适配器的 broadcasted 结果（接管后取新
+                # 适配器接管之后的 broadcasted 结果）。
+                broadcasted_result, takeover_event = (
+                    self._effective_broadcasted_result_locked(
+                        wallet_id, dispatch_id
+                    )
+                )
+                if broadcasted_result is None:
                     raise ServiceError(
                         409,
                         f"dispatch {dispatch_id!r} has no broadcasted result",
                     )
+                adapter_id = broadcasted_result["details"]["adapter_id"]
 
                 # 409：最后一条确认进展必须已 finalized（无确认/确认中
                 # 均不可结算）。
