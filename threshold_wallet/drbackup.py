@@ -662,6 +662,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "chain_dispatch_settled",
         "chain_dispatch_reorged",
         "chain_dispatch_taken_over",
+        "chain_adapter_health",
     )
 )
 

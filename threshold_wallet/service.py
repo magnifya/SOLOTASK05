@@ -66,6 +66,9 @@ DKG_FAILOVER_ACTIONS = ("abort", "replace", "reinstate")
 #: DKG 节点健康状态：up 在用可用、down 离线、ban 封禁
 DKG_NODE_STATES = ("up", "down", "ban")
 
+#: 跨链适配器健康状态：up 可用、down 熔断（未配置或缺席均视为 up）
+CHAIN_ADAPTER_STATES = ("up", "down")
+
 #: 跨链派发结果回执 state 取值：broadcasted 已播链（带 tx_id）、failed
 #: 失败（tx_id 为 null）
 DISPATCH_RESULT_STATES = ("broadcasted", "failed")
@@ -277,6 +280,7 @@ class WalletService:
         self._reconcile_chain_dispatch_settled_events(wallet_id)
         self._reconcile_chain_dispatch_reorged_events(wallet_id)
         self._reconcile_chain_dispatch_taken_over_events(wallet_id)
+        self._reconcile_chain_adapter_health_events(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
     def _reconcile_dkg_events_locked(self, wallet_id: str) -> None:
@@ -403,6 +407,11 @@ class WalletService:
             # 交易链：前置齐备、新适配器不同、审批单 approved 且 message
             # 逐字一致，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_dispatch_taken_over_events(wallet_id)
+            # 跨链适配器健康表（chain_adapter_health）仅由审计事件持久化：
+            # 逐事件严格校验快照形状（details 恰为 Q、适配器 ID 升序唯一、
+            # 值为 up|down、三 id 字段 null），矛盾/损坏 fail-closed；
+            # 纯只读。
+            self._reconcile_chain_adapter_health_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
             # DKG 类事件（dkg_stage/dkg_failover/故障审批开关/健康表/
             # rejoin/share-bind）仅由审计事件持久化：按既有 DKG 恢复规则
@@ -560,6 +569,10 @@ class WalletService:
                 # 失败派发接管与派发请求/失败结果/审批单同属账本一致性：
                 # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_dispatch_taken_over_events(wallet_id)
+                # 适配器健康表事件同属链上现场：账本存在时一并严格校验，
+                # 矛盾即 fail-closed（无账本时由适配器路由的严格读取与
+                # 启动恢复覆盖）。
+                self._reconcile_chain_adapter_health_events(wallet_id)
             self._recover_sign_sessions(wallet_id)
         except (RecoveryError, CorruptDataError):
             # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
@@ -4389,6 +4402,185 @@ class WalletService:
             )
         return policy
 
+    # ---- 跨链适配器健康熔断 ----------------------------------------------
+
+    def _normalize_adapters_body(self, adapters: object) -> dict:
+        """校验 PUT chain-adapters 请求体 Q 的 adapters 表并归一。
+
+        adapters 须为非空对象，键为安全标识；每值恰为字符串 up|down。
+        归一为按适配器 ID 升序的表。非法抛 ServiceError(400)。"""
+        if not isinstance(adapters, dict) or not adapters:
+            raise ServiceError(
+                400,
+                "adapters must be a non-empty object keyed by adapter id",
+            )
+        # 排序前先确认键全为合法标识（混合类型键会让 sorted 抛
+        # TypeError，必须在排序前拦住，统一落 400 而非 503）。
+        for adapter_id in adapters:
+            if not isinstance(adapter_id, str) or not ROTATION_ID_RE.match(
+                adapter_id
+            ):
+                raise ServiceError(
+                    400, "adapter id must match [A-Za-z0-9_-]{1,128}"
+                )
+        normalized: dict[str, str] = {}
+        for adapter_id in sorted(adapters):
+            state = adapters[adapter_id]
+            if not isinstance(state, str) or state not in CHAIN_ADAPTER_STATES:
+                raise ServiceError(
+                    400,
+                    "adapter state must be one of "
+                    + ", ".join(CHAIN_ADAPTER_STATES),
+                )
+            normalized[adapter_id] = state
+        return normalized
+
+    def _adapter_health_events_strict(self, wallet_id: str) -> list[dict]:
+        """返回该钱包全部 chain_adapter_health 事件（按 seq 升序），逐条
+        严格校验。
+
+        每条事件 request_id/actor_id/reason 必须为 null，且：
+
+        - **外层七字段键序**必须为 README 落盘规范序
+          （actor_id,at,details,reason,request_id,seq,type）；
+        - details 恰含 ``adapters``（单键）；
+        - ``adapters`` 非空、键为安全标识且按适配器 ID **升序唯一**；
+        - 每个值恰为字符串 ``up|down``。
+
+        外层/details/adapters 的键序重排、形状或取值非法都是不可对账
+        现场（RecoveryError，fail-closed），绝不静默忽略。纯只读，不
+        分配 seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_ADAPTER_HEALTH
+        )
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_adapter_health event "
+                    "whose outer fields are out of the canonical order"
+                )
+            if (
+                event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_adapter_health event "
+                    "with request_id/actor/reason set"
+                )
+            details = event.get("details")
+            if not isinstance(details, dict) or list(details) != ["adapters"]:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed "
+                    "chain_adapter_health event"
+                )
+            adapters = details["adapters"]
+            if not isinstance(adapters, dict) or not adapters:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an empty or malformed "
+                    "chain_adapter_health adapters table"
+                )
+            # 排序前先确认键全为字符串（损坏现场可能含非字符串键）。
+            if any(not isinstance(k, str) for k in adapters):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_adapter_health has a "
+                    "non-string adapter id"
+                )
+            keys = list(adapters)
+            if keys != sorted(keys) or len(set(keys)) != len(keys):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_adapter_health adapters are "
+                    "not in strictly ascending order"
+                )
+            for adapter_id, state in adapters.items():
+                if not ROTATION_ID_RE.match(adapter_id):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_adapter_health has a "
+                        "malformed adapter id"
+                    )
+                if state not in CHAIN_ADAPTER_STATES:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_adapter_health has a "
+                        f"malformed state for adapter {adapter_id!r}"
+                    )
+        return events
+
+    def _reconcile_chain_adapter_health_events(self, wallet_id: str) -> None:
+        """按 seq 严格复核全部 chain_adapter_health 事件（调用方须持钱包
+        事务锁）。
+
+        健康表为整体快照型事件：各快照形状（键集、适配器 ID 升序唯一、
+        状态取值）在 :meth:`_adapter_health_events_strict` 逐条校验，取
+        最后一条恢复，快照之间无额外跨事件语义；矛盾/损坏 fail-closed。
+        纯只读，不记事件、不改 seq、不写状态。"""
+        self._adapter_health_events_strict(wallet_id)
+
+    def _chain_adapter_health_table_locked(
+        self, wallet_id: str
+    ) -> Optional[dict]:
+        """当前适配器健康表：最后一条 chain_adapter_health 快照的
+        adapters 表（副本）；从未配置返回 None。调用方须持钱包锁。"""
+        events = self._adapter_health_events_strict(wallet_id)
+        if not events:
+            return None
+        return dict(events[-1]["details"]["adapters"])
+
+    def put_chain_adapters(self, wallet_id: str, adapters: object) -> dict:
+        """设置跨链适配器健康表，请求/成功响应（200）同为
+        Q={"adapters": {A: "up"|"down"}}。
+
+        PUT 仅收 Q；adapters 非空、键为安全标识（归一为 ID 升序），每值
+        恰为 up|down；非法 400，钱包不存在 404，可首建。**首配/变更各记
+        一条事件，同值不记**；并发同参只记一条。健康表纯由
+        chain_adapter_health 审计事件持久化
+        （request_id/actor_id/reason 为 null，details 即 Q），不写状态
+        文件。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：锁内先判定钱包存在性，再校验请求体
+                self._get_wallet_or_404(wallet_id)
+                normalized = self._normalize_adapters_body(adapters)
+                body = {"adapters": normalized}
+                current = self._chain_adapter_health_table_locked(wallet_id)
+                # 同值（归一后逐键相等）不记事件；首配或任何差异才记。
+                if current != normalized:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_CHAIN_ADAPTER_HEALTH,
+                            details=body,
+                        ),
+                    )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return body
+
+    def get_chain_adapters(self, wallet_id: str) -> dict:
+        """读取跨链适配器健康表：已配置 200 返回 Q，从未配置 404。
+
+        损坏/矛盾事件 fail-closed（由 HTTP 边界转 503）。钱包不存在
+        404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在，再判定健康表是否已配置
+                self._get_wallet_or_404(wallet_id)
+                adapters = self._chain_adapter_health_table_locked(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        if adapters is None:
+            raise ServiceError(
+                404,
+                f"wallet {wallet_id!r} has no configured chain adapter health",
+            )
+        return {"adapters": adapters}
+
     def post_chain_report(
         self,
         wallet_id: str,
@@ -5126,6 +5318,18 @@ class WalletService:
                                 f"asset operation {operation_id!r} already "
                                 "has a dispatch",
                             )
+
+                # 健康熔断：**首次**派发到显式 down 的适配器一律 409，且
+                # 零副作用（置于懒过期与任何事件追加之前）。健康表未配置
+                # 或该适配器缺席均视为 up；健康事后变化不影响已提交派发
+                # （重放优先 200 已在上方短路，不改写/终止/自动接管）。
+                health = self._chain_adapter_health_table_locked(wallet_id)
+                if health is not None and health.get(adapter_id) == "down":
+                    raise ServiceError(
+                        409,
+                        f"chain adapter {adapter_id!r} is down (circuit "
+                        "open)",
+                    )
 
                 # 审批门控：同钱包既有 approved 审批单，message 逐字一致。
                 # 按既有契约懒过期（可能原子记一次 request_expired）。

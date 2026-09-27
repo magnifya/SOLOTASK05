@@ -43,6 +43,8 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/dkg-failover-policy` | 查询 DKG 故障审批开关（缺省 `{"enabled":false}`） |
 | PUT  | `/v1/wallets/{id}/nodes` | 设置 DKG 节点健康表 `{"nodes":{...}}` |
 | GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
+| PUT  | `/v1/wallets/{id}/chain-adapters` | 设置跨链适配器健康表 `{"adapters":{A:"up"|"down"}}` |
+| GET  | `/v1/wallets/{id}/chain-adapters` | 查询跨链适配器健康表（未配置 404） |
 | POST | `/v1/wallets/{id}/nodes/{node}/rejoin` | 故障节点重新加入 `{"rejoin_id","dkg_id","round","key","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
@@ -656,6 +658,40 @@ quorum 后按既有 commit 契约自动提交。
   与灾备恢复后视图与 seq 连续不变；恢复不重报、不提交、不新增审计事件、
   不改 seq。
 
+### 跨链适配器健康与熔断（可选）
+
+`PUT /v1/wallets/{W}/chain-adapters` 设置跨链适配器健康表，请求体与
+成功响应（`200`）同为
+`Q={"adapters":{适配器ID:"up"|"down", ...}}`：
+
+- `adapters` 必须**非空**；键 A 为安全标识
+  `[A-Za-z0-9_-]{1,128}`，服务端归一为按适配器 ID **ASCII 升序**
+  返回/落盘；每个值恰为字符串 `up|down`。请求体键集错（多/缺
+  `adapters`）、表非对象/为空、键非法（含非字符串键）、值类型或取值
+  非法一律 `400`。
+- `GET` 已配置 `200` 返回 Q，**从未配置 `404`**；钱包不存在时
+  GET/PUT 一律 `404`；`PUT` 可首建。健康表仅由七字段
+  `chain_adapter_health` 审计事件持久化（`request_id`/`actor_id`/
+  `reason` 均为 `null`，details 恰为 Q，取最后一条恢复），不写状态
+  文件。**首配与任何变更各记一条事件；同值不记，跨进程并发同参也只记
+  一条。**
+- 更新、读取与派发判定都在每钱包跨进程事务锁内线性化。重启/灾备恢复
+  对每条事件严格核对 README 键序：事件**外层七字段**须为落盘规范序
+  （`actor_id,at,details,reason,request_id,seq,type`）、details 恰含
+  `adapters`、适配器 ID 按**升序唯一**、每值为 `up|down`；重排、形状
+  或取值矛盾都 fail-closed（抛 `RecoveryError` 且**不写盘**，常驻
+  `503`、`serve` 拒绝就绪、留现场），重启/灾备恢复后健康表与 seq
+  不变。
+- 成功体与错误体均为 UTF-8 紧凑 JSON，非 ASCII 原样、无末换行。
+
+**派发烧断**：`POST .../chain/{oid}/dispatch` 的**首次**提交若显式
+指向当前健康表中为 `down` 的适配器，一律 `409` 且**零副作用**（不追加
+任何事件、不触发审批单懒过期、不改任何现场）；健康表**未配置**或该
+适配器 ID **缺席**均视为 `up`。已提交派发的**同参重放优先返回 `200`**，
+不复查健康表——事后把适配器翻为 `down` 不会改写、终止已有派发，也不会
+自动接管（接管仍只能走既有 takeover 契约）；健康变化不影响 result/
+confirm/finality/settle 等其余派发流程。
+
 ### 跨链派发（dispatch）
 
 `POST /v1/wallets/{id}/chain/{oid}/dispatch`（仅 POST），`oid` 为资产
@@ -905,7 +941,8 @@ quorum 后按既有 commit 契约自动提交。
 `chain_report`、`chain_arbitration`、`chain_vote`、
 `chain_dispatch_requested`、`chain_dispatch_result`、
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
-`chain_dispatch_reorged`、`chain_dispatch_taken_over`。
+`chain_dispatch_reorged`、`chain_dispatch_taken_over`、
+`chain_adapter_health`。
 
 ## 多进程与故障恢复（保证）
 
