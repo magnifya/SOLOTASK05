@@ -670,7 +670,7 @@ class ArbitrationCorruptionTest(unittest.TestCase):
             {"source": "s1", "report": _report()},
         )
         self.assertEqual(status, 503)
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(WalletStore(self.tmpdir))
 
     def test_malformed_arbitration_event(self):
@@ -929,7 +929,7 @@ class ArbitrationCorruptionTest(unittest.TestCase):
             "POST", "/v1/wallets/w1/chain/op1/report", _report()
         )
         self.assertEqual(status, 503)
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(WalletStore(self.tmpdir))
 
 
@@ -1158,7 +1158,7 @@ class LegacyChainArbitrationCompatTest(unittest.TestCase):
                 "details": {"sources": {"s1": True}, "quorum": 2},
             },
         )
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(WalletStore(self.tmpdir))
 
 

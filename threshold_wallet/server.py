@@ -35,6 +35,7 @@
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/result 上报跨链派发结果回执
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/confirm 上报跨链派发确认进展
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/takeover 失败派发由新适配器接管
+- POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/isolate 隔离显式 down 适配器的在途派发
 - GET  /v1/wallets/<wallet_id>/chain/<dispatch_id>/finality 查询跨链派发最终性
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/settle 最终性资产结算（空体）
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
@@ -742,6 +743,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         rest[1],
                         body.get("adapter_id"),
                         body.get("approval_request_id"),
+                    )
+                    self._send_json_compact(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "isolate"
+                ):
+                    # 派发隔离：成功体与错误体均为 UTF-8 紧凑 JSON
+                    # （非 ASCII 不转义、无末换行），同 takeover/result。
+                    # 请求体必须恰为空 JSON 对象 {}（缺键同样不许夹带
+                    # 其他键；非对象/非法 JSON 由 _read_json_body 拦）。
+                    self._compact_response = True
+                    body = self._read_json_body()
+                    if set(body) != set():
+                        raise ServiceError(
+                            400,
+                            "body must be exactly the empty JSON object {}",
+                        )
+                    status, result = service.post_chain_dispatch_isolate(
+                        wallet_id,
+                        rest[1],
                     )
                     self._send_json_compact(status, result)
                     return

@@ -28,7 +28,9 @@ python -m unittest discover -s tests -v
 
 启动时若任一钱包现场无法对账恢复，`serve` 打印单行 JSON 错误并以非零
 码退出（fail-closed，不绑定端口）；常驻请求遇到不可对账现场统一返回
-`503`。
+`503`。异常三分类保持到启动边界：持久化 JSON 损坏抛
+`CorruptDataError`、审计/文件 I/O 失败抛 `OSError`、现场语义矛盾抛
+`RecoveryError`——三者 HTTP 一律 `503`、`serve` 一律拒绝就绪。
 
 ## HTTP 接口
 
@@ -69,6 +71,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/chain/{did}/result` | 上报跨链派发结果回执 `{"adapter_id","state","tx_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/confirm` | 上报跨链派发确认进展 `{"adapter_id","tx_id","block_height","block_hash","confirmations"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/takeover` | 失败派发由新适配器接管 `{"adapter_id","approval_request_id"}` |
+| POST | `/v1/wallets/{id}/chain/{did}/isolate` | 隔离显式 down 适配器的在途派发（体须恰为 `{}`） |
 | GET  | `/v1/wallets/{id}/chain/{did}/finality` | 查询跨链派发最终性 |
 | POST | `/v1/wallets/{id}/chain/{did}/settle` | 最终性资产结算（空体） |
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
@@ -739,19 +742,23 @@ quorum 后按既有 commit 契约自动提交。
 `POST /v1/wallets/{W}/chain/{D}/takeover`（仅 POST），`D` 为已派发的
 `dispatch_id`。请求体 B 恰含 `{"adapter_id","approval_request_id"}`
 两键（含其他键或缺键一律 `400`），两值与路径 `D` 均须匹配安全标识
-`[A-Za-z0-9_-]{1,128}`，非法 `400`：把一笔结果已 `failed` 的派发交给
-一个**新的**链上适配器重新播链。
+`[A-Za-z0-9_-]{1,128}`，非法 `400`：把一笔**结果已 `failed`** 或**已
+隔离（isolate）**的派发交给一个**新的**链上适配器重新播链。
 
 - 钱包、派发、同钱包审批单任一未知一律 `404`。
-- **首提前置**：派发所属资产操作仍为 `pending`；该派发恰有一条
-  `chain_dispatch_result` 且 `state="failed"`，且尚无接管；新
-  `adapter_id` 必须与派发原适配器**不同**；`approval_request_id` 必须
-  指向**同一钱包**既有、且为 `approved` 的审批单（操作前按既有契约懒
-  过期）；其 `message` 必须与紧凑 JSON **逐字一致**（无空格、键序固定
-  为 dispatch_id,adapter_id）：`{"dispatch_id":"D","adapter_id":"A2"}`。
-  操作已提交、无结果/结果为 `broadcasted`、已接管、新旧适配器相同、
-  审批单非 `approved` 或 message 不符一律 `409`，不追加事件、现场
-  不变（零副作用）。
+- **首提前置**：派发所属资产操作仍为 `pending`；且下列二者恰居其一——
+  该派发恰有一条 `chain_dispatch_result` 且 `state="failed"`、尚无接管
+  也无隔离；**或**该派发已有一条 `chain_dispatch_isolated` 且没有任何
+  result（即接管可从 `failed` 或 `isolated` 发起）；新 `adapter_id`
+  必须与派发原适配器**不同**，且其在**当前**健康熔断表中**不得显式为
+  `down`**（健康表未配置或该适配器缺席视为 `up`；显式 `down` 一律
+  `409`）；`approval_request_id` 必须指向**同一钱包**既有、且为
+  `approved` 的审批单（操作前按既有契约懒过期）；其 `message` 必须与
+  紧凑 JSON **逐字一致**（无空格、键序固定为
+  dispatch_id,adapter_id）：`{"dispatch_id":"D","adapter_id":"A2"}`。
+  操作已提交、无结果且无隔离、结果为 `broadcasted`、隔离与结果并存、
+  已接管、新旧适配器相同、新适配器显式 `down`、审批单非 `approved` 或
+  message 不符一律 `409`，不追加事件、现场不变（零副作用）。
 - 成功 `201` 返回
   `V={"dispatch_id","adapter_id","state"}`，键序固定且
   `state="requested"`。同 D **同参**（`adapter_id`、
@@ -763,14 +770,17 @@ quorum 后按既有 commit 契约自动提交。
   details 即响应 V，键序 `dispatch_id,adapter_id,state`），不另写接管
   状态文件。首提在每钱包跨进程事务锁内追加，跨进程并发只有一个 `201`
   （其余同参 `200`），审计 seq 连续不重号，重放不记事件。
-- **接管之后**：`result` 只接受**新适配器**的**恰好一条**结果（旧
-  适配器、或新适配器第二条/异参结果一律 `409`，同参仍 `200`）；
+- **接管之后**：`result` 只接受**新适配器**的**恰好一条**结果（隔离后
+  或接管后的旧适配器回执、或新适配器第二条/异参结果一律 `409`，同参仍
+  `200`）；
   `confirm` 只承接新适配器 `broadcasted` 交易的确认进展（新适配器、
   新 tx；旧适配器身份或旧 tx 一律 `409`）；`finality`/`settle` 以及
   已结算后的重组补偿随之以接管后的生效适配器与交易链为准，契约不变。
 - 重启/灾备恢复按 seq 逐条复核每条 `chain_dispatch_taken_over`：派发
   请求必须**先于**接管；接管时资产操作仍为 pending（其提交点不得早于
-  接管）；接管之前恰有一条 `failed` 结果；新适配器不同于原适配器；
+  接管）；接管前置为互斥二者之一——接管之前恰有一条 `failed` 结果且无
+  隔离，**或**接管之前有一条 `chain_dispatch_isolated` 且没有任何
+  result；两种接管都要求新适配器不同于原适配器；
   actor_id 指向同钱包审批单且存在、message 逐字为按
   dispatch_id,adapter_id 序的紧凑 JSON、状态为 `approved`（其后经
   `/sign` 推进为 `signed` 亦认可）；每派发至多一条接管。接管后那条
@@ -782,6 +792,51 @@ quorum 后按既有 commit 契约自动提交。
   `RecoveryError`）；审计 JSON 损坏抛 `CorruptDataError`、审计文件
   I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。
   恢复不新增事件、不改 seq，重放不记事件。
+
+### 跨链派发隔离（isolate）
+
+`POST /v1/wallets/{W}/chain/{D}/isolate`（仅 POST），`D` 为已派发的
+`dispatch_id`。请求体**须恰为空 JSON 对象 `{}`**（夹带任何键、空体、
+非 JSON、非 JSON 对象一律 `400`）：把一笔尚在途、但其派发原适配器已在
+当前健康熔断表中显式 `down` 的派发标记为隔离，此后只允许由**新的**适配
+器接管（见上文 takeover），旧适配器不再被采信。
+
+- 路径 `D` 须匹配安全标识 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包或
+  派发未知 `404`（存在性先于参数判定）。
+- **首提前置**（全部在该钱包跨进程事务锁内判定，任一不满足 `409` 且
+  **零副作用**，均抛 `ServiceError`——不追加事件、现场不变）：
+  - 派发所属资产操作仍为 `pending`；
+  - 该派发没有任何 `chain_dispatch_result`、没有 `chain_dispatch_taken_over`、
+    没有 `chain_dispatch_isolated`（result/takeover/isolate 互斥在前）；
+  - 派发**原适配器**（dispatch 请求中的 `adapter_id`）在**当前**
+    `chain_adapter_health` 健康表中显式为 `down`；健康表未配置、该适配器
+    在表中缺席或为 `up`，一律视为不可隔离（`409`）。
+- 成功 `201` 返回
+  `V={"dispatch_id","adapter_id","state"}`，键序固定且
+  `state="isolated"`，`adapter_id` 为派发原适配器。**同 D 重放优先
+  `200` 返回同一 V**，不复查健康表与现场现状（事后把适配器翻回 `up` 不
+  影响幂等重放）。
+- 隔离仅由审计事件持久化：**七字段
+  `chain_dispatch_isolated`** 是唯一提交事件（`request_id=D`、
+  `actor_id=null`、`reason=null`、details 即响应 V，details 键序
+  `dispatch_id,adapter_id,state`，外层七字段按落盘规范序
+  `actor_id,at,details,reason,request_id,seq,type`），不另写隔离状态
+  文件。首提在每钱包跨进程事务锁内追加，跨进程并发只有一个 `201`（其余
+  同 D 重放 `200`），审计 seq 连续不重号，重放不记事件。
+- **隔离之后**：旧适配器（原 `adapter_id`）的 `result` 一律 `409`
+  （failed/broadcasted、同参异参皆然）；该派发可按 takeover 契约由一个
+  **不同于原适配器**的新适配器接管（接管前置此时为「已隔离且无结果」，
+  与「恰一条 failed 结果」二选一，见下）；接管后新适配器的
+  result/confirm/finality/settle 契约不变。
+- 重启/灾备恢复按 seq 逐条复核每条 `chain_dispatch_isolated`：同一
+  `dispatch_id` 的 `chain_dispatch_requested` 必须**先于**隔离提交且
+  details 适配器一致；隔离提交**之前最近**一条 `chain_adapter_health`
+  快照必须存在且该适配器显式为 `down`；隔离时操作仍 pending（提交点不
+  得早于隔离）；隔离之前没有任何 result/takeover；隔离之后、接管（若有）
+  之前不得出现 result；每个 `dispatch_id` 至多一条隔离。任一矛盾都保留
+  现场并抛 `RecoveryError`；审计 JSON 损坏抛 `CorruptDataError`、审计
+  文件 I/O 失败抛 `OSError`——三者 HTTP 一律 `503`、`serve` 拒绝就绪。
+  重启/灾备恢复/重放都不新增事件、不改 seq。
 
 ### 跨链派发确认进展（confirm）
 
@@ -924,7 +979,10 @@ quorum 后按既有 commit 契约自动提交。
 - **同参重放优先 `200`**：已提交派发的同参重放先于健康判定直接返回，
   事后把适配器翻为 `down` 不影响幂等重放。
 - 健康变化**不改写、不终止、也不自动接管**任何已有派发；result/confirm/
-  takeover/finality/settle 等其余派发接口契约不变。
+  takeover/finality/settle 等其余派发接口契约不变。显式 `down` 适配器
+  的在途派发只能经 `POST .../isolate` 显式隔离、再由新适配器 takeover
+  （或在收到 `failed` 回执后直接 takeover）；隔离首提与 takeover 首提
+  对新适配器的健康判定都在钱包锁内按当前快照完成。
 - 健康表的读取、更新与派发判定都在该钱包跨进程事务锁内线性化。
 
 ### 审计事件
@@ -946,7 +1004,7 @@ quorum 后按既有 commit 契约自动提交。
 `chain_dispatch_requested`、`chain_dispatch_result`、
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
 `chain_dispatch_reorged`、`chain_dispatch_taken_over`、
-`chain_adapter_health`。
+`chain_dispatch_isolated`、`chain_adapter_health`。
 
 ## 多进程与故障恢复（保证）
 

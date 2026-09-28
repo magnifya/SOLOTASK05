@@ -539,7 +539,8 @@ class ReinstateRecoveryTest(unittest.TestCase):
             json.dump(log, f)
 
     def _assert_refuses_ready(self):
-        with self.assertRaises(RecoveryError):
+        # 矛盾=RecoveryError、坏 JSON=CorruptDataError：启动保留根因类型。
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(self.h.store)
 
     def test_restart_keeps_round_seq_and_replays(self):

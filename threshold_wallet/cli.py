@@ -190,16 +190,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "serve":
             # 延迟导入：客户端命令不需要 store/server
             from .server import serve
-            from .store import RecoveryError, WalletStore
+            from .store import (
+                CorruptDataError,
+                RecoveryError,
+                WalletStore,
+            )
             from .service import WalletService
 
             # 构造服务即完成启动恢复；恢复无法对账到一致状态时必须阻止
             # 服务就绪（fail-closed）：打印单行 JSON 错误并以非零码退出，
-            # 绝不绑定端口对外暴露半完成状态。
+            # 绝不绑定端口对外暴露半完成状态。三类异常各自保持类型：
+            # 矛盾=RecoveryError、坏 JSON=CorruptDataError、I/O=OSError。
             try:
                 service = WalletService(WalletStore(args.data_dir))
             except RecoveryError as exc:
                 return _fail(f"recovery failed, refusing to serve: {exc}")
+            except CorruptDataError as exc:
+                return _fail(
+                    f"wallet data is corrupt, refusing to serve: {exc}"
+                )
             except OSError as exc:
                 return _fail(f"cannot open data dir, refusing to serve: {exc}")
             print(

@@ -209,7 +209,7 @@ class CorruptLedgerStartupBlocksTest(unittest.TestCase):
     def test_constructor_blocks_readiness(self):
         _seed(self.tmp).create_asset_operation("w1", "op1", "btc", 100)
         _write(LEDGER(self.tmp), "{broken")
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises(CorruptDataError):
             WalletService(WalletStore(self.tmp))
         # 现场保留
         self.assertEqual(

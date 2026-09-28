@@ -425,7 +425,8 @@ class RejoinRecoveryTest(unittest.TestCase):
         return next(e for e in log["events"] if e["type"] == "node_rejoined")
 
     def _assert_refuses_ready(self):
-        with self.assertRaises(RecoveryError):
+        # 矛盾=RecoveryError、坏 JSON=CorruptDataError：启动保留根因类型。
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(self.h.store)
 
     def test_restart_keeps_state_and_logs_nothing(self):

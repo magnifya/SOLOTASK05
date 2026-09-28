@@ -29,7 +29,11 @@ import urllib.error
 import urllib.request
 
 from threshold_wallet.service import ServiceError, WalletService
-from threshold_wallet.store import RecoveryError, WalletStore
+from threshold_wallet.store import (
+    CorruptDataError,
+    RecoveryError,
+    WalletStore,
+)
 
 from tests.helpers import http_server, make_harness
 
@@ -611,8 +615,9 @@ class TakeoverServiceTest(_SceneMixin, unittest.TestCase):
         self.assertEqual(self._takeover()[0], 201)
         with open(self._audit_path(), "w", encoding="utf-8") as f:
             f.write("{broken")
-        # 启动恢复统一以 RecoveryError 阻止就绪（CorruptDataError 被包装）。
-        self._expect_recovery_fail()
+        # 新异常分类：审计坏 JSON 以 CorruptDataError 原样上抛阻止就绪
+        # （不再统一包装为 RecoveryError）；HTTP 仍一律 503。
+        self._expect_recovery_fail(error=CorruptDataError)
 
     # ---- HTTP 层 -----------------------------------------------------------
 

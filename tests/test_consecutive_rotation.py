@@ -25,7 +25,7 @@ from threshold_wallet import audit as audit_mod
 from threshold_wallet import crypto
 from threshold_wallet.audit import AuditStore
 from threshold_wallet.service import ServiceError, WalletService
-from threshold_wallet.store import RecoveryError, WalletStore
+from threshold_wallet.store import CorruptDataError, RecoveryError, WalletStore
 
 
 def _service(data_dir: str) -> WalletService:
@@ -311,7 +311,9 @@ class CrossRoundCorruptionFailClosedTest(unittest.TestCase):
         service.activate_share_rotation("w1", "rot-2")
 
     def _assert_refuses_ready(self):
-        with self.assertRaises(RecoveryError):
+        # 矛盾=RecoveryError、坏 JSON=CorruptDataError：启动恢复保留根因
+        # 类型，二者都阻止就绪。
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             _service(self.tmp)
 
     def test_missing_first_activation_event_fails_closed(self):

@@ -92,6 +92,11 @@ TYPE_CHAIN_DISPATCH_REORGED = "chain_dispatch_reorged"
 #: V={dispatch_id,adapter_id,state}，state="requested"；request_id 为
 #: dispatch_id、actor_id 为 approval_request_id、reason=null）
 TYPE_CHAIN_DISPATCH_TAKEN_OVER = "chain_dispatch_taken_over"
+#: 跨链派发隔离（details 即响应 V={dispatch_id,adapter_id,state}，
+#: state="isolated"；request_id 为 dispatch_id、actor_id/reason 为 null；
+#: 仅当原适配器在当前健康表显式 down、派发尚无 result/takeover/isolate
+#: 且操作仍 pending 时可首提）
+TYPE_CHAIN_DISPATCH_ISOLATED = "chain_dispatch_isolated"
 #: 跨链适配器健康熔断表整体快照（details 即 Q={"adapters": {A: up|down}}；
 #: request_id/actor_id/reason 均为 null，取最后一条恢复）
 TYPE_CHAIN_ADAPTER_HEALTH = "chain_adapter_health"
@@ -254,6 +259,13 @@ _DETAILS_KEY_ORDER = {
         "adapter_id",
         "state",
     ),
+    # chain_dispatch_isolated 的 details 即隔离响应 V：三键固定序
+    # dispatch_id,adapter_id,state（state 恒为 isolated）。
+    TYPE_CHAIN_DISPATCH_ISOLATED: (
+        "dispatch_id",
+        "adapter_id",
+        "state",
+    ),
     # chain_adapter_health 的 details 恰为 Q={"adapters": {...}}：顶层仅
     # adapters 一键，嵌套的适配器表由 service 统一归一（适配器 ID 按 ASCII
     # 升序，值仅为 up|down 字符串），故这里只固定顶层键序、保留构造好的
@@ -283,6 +295,7 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
         TYPE_CHAIN_DISPATCH_SETTLED,
         TYPE_CHAIN_DISPATCH_REORGED,
         TYPE_CHAIN_DISPATCH_TAKEN_OVER,
+        TYPE_CHAIN_DISPATCH_ISOLATED,
     )
 )
 
@@ -938,6 +951,20 @@ class AuditStore:
         判定）。纯只读，不分配 seq。"""
         return self._events_grouped_by_request(
             wallet_id, TYPE_CHAIN_DISPATCH_TAKEN_OVER
+        )
+
+    def chain_dispatch_isolated_events(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """返回该钱包全部 chain_dispatch_isolated 事件，按 request_id
+        （dispatch_id）分组，组内按 seq 升序。
+
+        派发隔离仅由这些事件持久化（事件是唯一提交点）：在线幂等重放与
+        崩溃恢复据此判定每个 dispatch_id 是否已隔离。每个 dispatch_id
+        至多一条有效事件（重复属不可对账现场，由恢复判定）。纯只读，不
+        分配 seq。"""
+        return self._events_grouped_by_request(
+            wallet_id, TYPE_CHAIN_DISPATCH_ISOLATED
         )
 
     def activated_rotation_events(self, wallet_id: str) -> dict[str, dict]:

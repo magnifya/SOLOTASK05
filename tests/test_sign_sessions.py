@@ -849,7 +849,7 @@ class SignSessionCorruptionTest(unittest.TestCase):
         h.service.create_sign_session("w1", "s1", "m", 60)
         with open(self._session_file(d, "w1"), "w") as f:
             f.write("{broken json")
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises(CorruptDataError):
             make_harness(d)
         # 现场保留
         with open(self._session_file(d, "w1")) as f:
@@ -884,7 +884,9 @@ class SignSessionStrictRecoveryTest(unittest.TestCase):
             json.dump(data, f)
 
     def _assert_refuses_ready(self, d, label):
-        with self.assertRaises(RecoveryError, msg=label):
+        with self.assertRaises(
+            (RecoveryError, CorruptDataError), msg=label
+        ):
             make_harness(d)
         # 现场原样保留，不归一、不覆盖
         self.assertTrue(os.path.exists(self._sessions_path(d)), label)

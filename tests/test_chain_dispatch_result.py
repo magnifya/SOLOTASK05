@@ -452,7 +452,8 @@ class DispatchResultServiceTest(unittest.TestCase):
             f.write(b"{broken")
         with self.assertRaises(CorruptDataError):
             self.svc._audit.chain_dispatch_result_events("w1")
-        with self.assertRaises(RecoveryError):
+        # 启动保留根因类型：坏 JSON=CorruptDataError，仍拒绝就绪
+        with self.assertRaises(CorruptDataError):
             WalletService(self.h.store)
 
     def test_healthy_log_still_loads(self):

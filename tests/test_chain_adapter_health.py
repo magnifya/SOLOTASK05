@@ -406,8 +406,8 @@ class ChainAdaptersServiceTest(unittest.TestCase):
             self.svc._audit.events_by_type(
                 "w1", "chain_adapter_health"
             )
-        # 启动统一包装为 RecoveryError 拒绝就绪
-        with self.assertRaises(RecoveryError):
+        # 启动保留根因类型：坏 JSON=CorruptDataError，仍拒绝就绪
+        with self.assertRaises(CorruptDataError):
             WalletService(self.h.store)
 
     def test_io_error_on_put_is_503_boundary(self):
@@ -842,7 +842,7 @@ class ServeRefusalTest(unittest.TestCase):
     def test_corrupt_json_refuses_ready(self):
         with open(os.path.join(self.d, "audit", "w1.json"), "wb") as f:
             f.write(b"{not json")
-        with self.assertRaises(RecoveryError):
+        with self.assertRaises(CorruptDataError):
             WalletService(WalletStore(self.d))
 
 

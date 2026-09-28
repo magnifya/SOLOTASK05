@@ -691,7 +691,8 @@ class AutoFailoverRecoveryStrictTest(unittest.TestCase):
                     if e["type"] == "dkg_failover")
 
     def _assert_refuses_ready(self):
-        with self.assertRaises(RecoveryError):
+        # 矛盾=RecoveryError、坏 JSON=CorruptDataError：启动保留根因类型。
+        with self.assertRaises((RecoveryError, CorruptDataError)):
             WalletService(self.h.store)
 
     def test_tampered_replacement_is_fail_closed(self):

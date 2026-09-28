@@ -429,6 +429,11 @@ class ReorgServiceTest(_SceneMixin, unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             log = json.load(f)
         log["events"] = [e for e in log["events"] if not predicate(e)]
+        # 重新编号保持 seq 连续：本测试要验证的是事件链**语义矛盾**
+        # （RecoveryError），而非 seq 缺口这类结构性审计损坏
+        # （CorruptDataError）。
+        for index, event in enumerate(log["events"], 1):
+            event["seq"] = index
         log["next_seq"] = len(log["events"]) + 1
         with open(path, "w", encoding="utf-8") as f:
             json.dump(log, f)

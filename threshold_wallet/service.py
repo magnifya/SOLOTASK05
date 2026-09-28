@@ -210,8 +210,12 @@ class WalletService:
         的资产提交事务。对外服务前必须完成，使任何查询/重放都读不到
         半完成状态。
 
-        任一钱包恢复失败（RecoveryError/OSError）都向上抛出，由调用方阻止
-        服务就绪（fail-closed）：绝不静默跳过带着损坏现场对外服务。"""
+        任一钱包恢复失败都向上抛出，由调用方阻止服务就绪（fail-closed）：
+        绝不静默跳过带着损坏现场对外服务。异常类型保持 README 的三分
+        边界——持久化 JSON 损坏抛 CorruptDataError、审计/文件 I/O 失败抛
+        OSError、现场语义矛盾抛 RecoveryError（三者 HTTP 一律 503、serve
+        一律拒绝就绪），绝不再把 CorruptDataError 包装成 RecoveryError
+        而抹平"坏 JSON"与"矛盾"的区分。"""
         wallet_ids = sorted(
             set(self._store.list_rotation_wallet_ids())
             | set(self._store.list_staging_wallet_ids())
@@ -224,14 +228,10 @@ class WalletService:
         )
         for wallet_id in wallet_ids:
             with self._wallet_lock(wallet_id):
-                try:
-                    self._recover_wallet(wallet_id)
-                except CorruptDataError as exc:
-                    # 启动恢复统一以 RecoveryError 阻止就绪（fail-closed）；
-                    # 损坏的审计/账本 JSON 现场原样保留，不猜写
-                    raise RecoveryError(
-                        f"wallet {wallet_id!r} cannot be reconciled: {exc}"
-                    ) from exc
+                # 异常类型原样上抛：坏 JSON=CorruptDataError、I/O=OSError、
+                # 矛盾=RecoveryError；_recover_wallet 已保证只有这三类
+                # （及 wallet_id 非法的 ValueError，不会出现在枚举所得 id）。
+                self._recover_wallet(wallet_id)
 
     def _list_restore_txn_wallet_ids(self) -> list[str]:
         """存在未完成灾备恢复事务（restore-txn）的钱包（延迟导入避免环）。"""
@@ -281,8 +281,14 @@ class WalletService:
         self._reconcile_chain_dispatch_settled_events(wallet_id)
         self._reconcile_chain_dispatch_reorged_events(wallet_id)
         self._reconcile_chain_dispatch_taken_over_events(wallet_id)
-        # 跨链适配器健康熔断表（chain_adapter_health 快照）：派发熔断按
-        # 最后一条快照判定，访问派发/链状态前先严格核对全部快照形状。
+        # 派发隔离（chain_dispatch_isolated）与派发请求/健康表/result/
+        # takeover 对账：派发在先、事前健康表显式 down、操作仍 pending、
+        # 每派发至多一次且与 result/takeover 互斥在前，矛盾/损坏
+        # fail-closed；纯只读。
+        self._reconcile_chain_dispatch_isolated_events(wallet_id)
+        # 跨链适配器健康熔断表（chain_adapter_health）：仅由审计事件
+        # 持久化，逐事件严格核对键集/适配器 ID ASCII 升序/up|down，
+        # 重排或取值矛盾 fail-closed；纯只读，不记事件、不改 seq。
         self._chain_adapter_health_events_strict(wallet_id)
         return self._store.check_asset_ledger_semantics(wallet_id)
 
@@ -331,9 +337,10 @@ class WalletService:
 
         损坏 JSON / 形状异常在存储层表现为 CorruptDataError（ValueError
         子类）：损坏现场原样向上抛出，保持调用方的异常类型边界
-        （损坏＝CorruptDataError、无法对账＝RecoveryError）；其余
-        ValueError 同样无法对账，统一转成 RecoveryError，绝不把
-        ValueError 漏给调用方当成普通参数错误。"""
+        （损坏＝CorruptDataError、I/O 失败＝OSError、无法对账＝
+        RecoveryError，三者 HTTP 一律 503、serve 一律拒绝就绪）；仅其余
+        非 CorruptDataError 的 ValueError 才统一转成 RecoveryError，绝不
+        把 ValueError 漏给调用方当成普通参数错误。"""
         try:
             # 灾备恢复事务的崩溃残留最先对账：committed 在则前滚到快照现场、
             # 否则按 old/ 备份整体回滚到恢复前现场。必须先于审计/账本/轮换
@@ -410,6 +417,11 @@ class WalletService:
             # 交易链：前置齐备、新适配器不同、审批单 approved 且 message
             # 逐字一致，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_dispatch_taken_over_events(wallet_id)
+            # 派发隔离（chain_dispatch_isolated）与派发请求/事前健康表/
+            # result/takeover/审批无关（隔离 actor 为 null）对账：派发在先、
+            # 事前健康表显式 down、操作仍 pending、每派发至多一次且与
+            # result/takeover 互斥在前，矛盾/损坏 fail-closed；纯只读。
+            self._reconcile_chain_dispatch_isolated_events(wallet_id)
             # 跨链适配器健康熔断表（chain_adapter_health）：仅由审计事件
             # 持久化，逐事件严格核对键集/适配器 ID ASCII 升序/up|down，
             # 重排或取值矛盾 fail-closed；纯只读，不记事件、不改 seq。
@@ -420,10 +432,14 @@ class WalletService:
             # 重放并严格对账，矛盾/损坏 fail-closed；对账不写任何状态、
             # 不记事件、不改 seq。
             self._reconcile_dkg_events_locked(wallet_id)
-        except (RecoveryError, CorruptDataError):
-            # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
+        except (RecoveryError, CorruptDataError, OSError):
+            # 矛盾=RecoveryError / 坏 JSON=CorruptDataError / I/O=OSError：
+            # 三类异常都保持各自类型向上抛出（HTTP 一律 503、serve 拒绝
+            # 就绪），绝不把 I/O 或坏 JSON 重新包装成 RecoveryError。
             raise
-        except (OSError, ValueError) as exc:
+        except ValueError as exc:
+            # 其余非 CorruptDataError 的 ValueError（持久化形状/取值异常）：
+            # 无法对账，统一转 RecoveryError；绝不漏给调用方当参数错误。
             raise RecoveryError(
                 f"wallet {wallet_id!r} cannot be reconciled: {exc}"
             ) from exc
@@ -571,15 +587,21 @@ class WalletService:
                 # 失败派发接管与派发请求/失败结果/审批单同属账本一致性：
                 # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_dispatch_taken_over_events(wallet_id)
+                # 派发隔离与派发请求/事前健康表/result/takeover 同属账本
+                # 一致性：账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
+                self._reconcile_chain_dispatch_isolated_events(wallet_id)
                 # 跨链适配器健康熔断表与派发熔断同属账本一致性：账本存在
                 # 时一并严格重放全部快照形状，矛盾即 fail-closed。
                 self._chain_adapter_health_events_strict(wallet_id)
             self._recover_sign_sessions(wallet_id)
-        except (RecoveryError, CorruptDataError):
-            # 无法对账 / 损坏的审计或账本 JSON：保持异常类型边界向上抛出
+        except (RecoveryError, CorruptDataError, OSError):
+            # 矛盾=RecoveryError / 坏 JSON=CorruptDataError / I/O=OSError：
+            # 三类异常保持各自类型向上抛出（HTTP 一律 503），绝不把 I/O
+            # 失败重新包装成 RecoveryError。
             raise
-        except (OSError, ValueError) as exc:
-            # 检测/对账阶段读到无法解析的现场：不能假定静止，fail-closed
+        except ValueError as exc:
+            # 其余非 CorruptDataError 的 ValueError：现场不可假定静止，
+            # fail-closed（RecoveryError）。
             raise RecoveryError(
                 f"wallet {wallet_id!r} cannot be reconciled: {exc}"
             ) from exc
@@ -4880,6 +4902,13 @@ class WalletService:
         "state",
     )
 
+    #: 隔离响应 / chain_dispatch_isolated 事件 details 的固定键序
+    _DISPATCH_ISOLATED_VIEW_KEY_ORDER = (
+        "dispatch_id",
+        "adapter_id",
+        "state",
+    )
+
     @staticmethod
     def _takeover_approval_message(
         dispatch_id: str, adapter_id: str
@@ -5692,6 +5721,20 @@ class WalletService:
                     wallet_id, dispatch_id
                 )
                 if takeover_event is None:
+                    # 已隔离（尚未接管）：旧适配器的任何结果一律 409——
+                    # 隔离即冻结原适配器回执，只允许随后由**新适配器**
+                    # takeover 再播链。
+                    if (
+                        self._dispatch_isolate_event_locked(
+                            wallet_id, dispatch_id
+                        )
+                        is not None
+                    ):
+                        raise ServiceError(
+                            409,
+                            f"dispatch {dispatch_id!r} is isolated; its old "
+                            "adapter can no longer report results",
+                        )
                     # 未接管：上报方适配器须与派发归属一致，且每派发至多
                     # 一条结果（异参重报落入此分支即 409）。
                     if committed:
@@ -7120,8 +7163,14 @@ class WalletService:
 
         - 同一 dispatch_id 的 chain_dispatch_requested 必须先于接管事件
           提交（请求先于接管）；
-        - 接管提交之前该派发已有唯一 chain_dispatch_result 且为 failed
-          （仅 failed 且未接管时可接管）；
+        - 接管提交之前该派发的前置为互斥二者之一：
+
+          * 已有唯一 chain_dispatch_result 且为 failed（failed 接管）；
+          * 已有 chain_dispatch_isolated 且没有任何 result（isolated
+            接管）；
+
+          两种情形都要求接管时尚未接管；隔离与 failed 结果并存、或两者
+          皆无都属矛盾现场；
         - 接管 adapter_id 与原请求适配器不同；
         - actor_id 指向同钱包审批单，存在、message 逐字为按
           dispatch_id,adapter_id（新适配器）序的紧凑 JSON、状态为
@@ -7178,20 +7227,53 @@ class WalletService:
                     f"wallet {wallet_id!r} chain_dispatch_taken_over "
                     f"{dispatch_id!r} follows a committed asset operation"
                 )
-            # 接管前必须已有失败结果
+            # 接管前置（互斥二者之一）：
+            #   a) 接管前恰有一条 failed 结果且无隔离；
+            #   b) 接管前有一条隔离事件且无任何 result。
             prior_results = [
                 result
                 for result in results_by_dispatch.get(dispatch_id, [])
                 if result["seq"] < seq
             ]
-            if (
-                not prior_results
-                or prior_results[-1]["details"]["state"] != "failed"
-            ):
-                raise RecoveryError(
-                    f"wallet {wallet_id!r} chain_dispatch_taken_over "
-                    f"{dispatch_id!r} has no preceding failed result"
+            isolated_groups = (
+                self._audit.chain_dispatch_isolated_events(wallet_id).get(
+                    dispatch_id
                 )
+                or []
+            )
+            prior_isolations = [
+                isolated
+                for isolated in isolated_groups
+                if isolated["seq"] < seq
+            ]
+            if prior_isolations:
+                # 形状/隔离对账已保证每派发至多一条；隔离接管前不得有
+                # result，隔离适配器须与原派发适配器一致。
+                if len(prior_isolations) != 1 or prior_results:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                        f"{dispatch_id!r} follows both an isolation and a "
+                        "result"
+                    )
+                if (
+                    prior_isolations[0]["details"]["adapter_id"]
+                    != saved_request["adapter_id"]
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                        f"{dispatch_id!r} follows an isolation on a different "
+                        "adapter"
+                    )
+            else:
+                if (
+                    not prior_results
+                    or prior_results[-1]["details"]["state"] != "failed"
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_taken_over "
+                        f"{dispatch_id!r} has neither a preceding failed "
+                        "result nor an isolation"
+                    )
             # 新适配器必须不同于原适配器
             if details["adapter_id"] == saved_request["adapter_id"]:
                 raise RecoveryError(
@@ -7242,10 +7324,14 @@ class WalletService:
 
         请求体恰含 adapter_id,approval_request_id 两键（HTTP 边界拦键集），
         两值与路径 D 均须匹配安全标识；键集/值错 400；钱包/派发/审批单
-        未知 404。仅当派发所属资产操作仍为 pending、已有结果为 failed、
-        且尚未接管时可首提；新 adapter_id 必须不同于原适配器；审批单须为
-        同钱包既有 approved 审批单，其 message 逐字等于按
-        dispatch_id,adapter_id 序的紧凑 JSON。任一不满足 409 且零副作用。
+        未知 404。仅当派发所属资产操作仍 pending 时可首提，且前置为下列
+        二者之一（互斥）：该派发恰有一条 ``failed`` 结果且尚无隔离；或该
+        派发已隔离（chain_dispatch_isolated）且尚无结果——即接管可从
+        failed 或 isolated 发起；新 adapter_id 必须不同于原适配器，且其在
+        **当前**健康表中不得显式为 ``down``（未配置/缺席视为 up；显式
+        down 一律 409）；审批单须为同钱包既有 approved 审批单，其 message
+        逐字等于按 dispatch_id,adapter_id 序的紧凑 JSON。任一不满足 409 且
+        零副作用。
 
         成功 201 返回 V（state="requested"）；同参（adapter_id 与
         approval_request_id 全同）重放优先 200 返回同一 V（不复查现状）；
@@ -7342,20 +7428,37 @@ class WalletService:
                         f"{record['state']}, not pending",
                     )
 
-                # 409：接管前该派发恰有一条结果且为 failed
+                # 409：接管前置为互斥二者之一——
+                #   a) 恰一条 failed 结果且未隔离（既有 failed 接管）；
+                #   b) 已隔离（chain_dispatch_isolated）且尚无结果。
+                # broadcasted 结果、failed 与隔离并存等其余情形一律 409
+                # （后者在线正常流程不可达：恢复对账已把隔离后的旧适配器
+                # 结果判为矛盾现场 503；此处为防御性 409）。
                 result_group = (
                     self._audit.chain_dispatch_result_events(wallet_id).get(
                         dispatch_id
                     )
                     or []
                 )
-                if (
-                    len(result_group) != 1
-                    or result_group[0]["details"]["state"] != "failed"
-                ):
+                isolated = self._dispatch_isolate_event_locked(
+                    wallet_id, dispatch_id
+                )
+                has_failed_result = (
+                    len(result_group) == 1
+                    and result_group[0]["details"]["state"] == "failed"
+                )
+                if isolated is not None:
+                    if result_group:
+                        raise ServiceError(
+                            409,
+                            f"dispatch {dispatch_id!r} is isolated but also "
+                            "has a result",
+                        )
+                elif not has_failed_result:
                     raise ServiceError(
                         409,
-                        f"dispatch {dispatch_id!r} has no failed result",
+                        f"dispatch {dispatch_id!r} has neither a failed "
+                        "result nor an isolation to take over",
                     )
 
                 # 409：新适配器必须不同于原适配器
@@ -7364,6 +7467,16 @@ class WalletService:
                         409,
                         f"dispatch {dispatch_id!r} takeover adapter must "
                         "differ from the original adapter",
+                    )
+
+                # 409：新适配器在**当前**健康表中不得显式 down（未配置/
+                # 缺席视为 up；熔断表只阻止派发到显式 down 的适配器）。
+                adapters = self._chain_adapters_locked(wallet_id)
+                if adapters is not None and adapters.get(adapter_id) == "down":
+                    raise ServiceError(
+                        409,
+                        f"chain adapter {adapter_id!r} is down (circuit "
+                        "breaker open)",
                     )
 
                 # 审批门控：同钱包既有 approved 审批单，message 逐字一致。
@@ -7396,6 +7509,360 @@ class WalletService:
                         audit.TYPE_CHAIN_DISPATCH_TAKEN_OVER,
                         request_id=dispatch_id,
                         actor_id=approval_request_id,
+                        reason=None,
+                        details=view,
+                    ),
+                )
+                return 201, view
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _dispatch_isolated_view(
+        self, dispatch_id: str, adapter_id: str
+    ) -> dict:
+        """隔离成功/重放响应体 V（三键固定序，state 恒为 isolated）。"""
+        return {
+            "dispatch_id": dispatch_id,
+            "adapter_id": adapter_id,
+            "state": "isolated",
+        }
+
+    def _dispatch_isolate_event_locked(
+        self, wallet_id: str, dispatch_id: str
+    ) -> Optional[dict]:
+        """返回某派发唯一的 chain_dispatch_isolated 事件（调用方持锁）；
+        未隔离返回 None；重复隔离事件是不可对账现场（RecoveryError）。"""
+        grouped = self._audit.chain_dispatch_isolated_events(
+            wallet_id
+        ).get(dispatch_id)
+        if not grouped:
+            return None
+        if len(grouped) != 1:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has multiple "
+                f"chain_dispatch_isolated events for {dispatch_id!r}"
+            )
+        return grouped[0]
+
+    def _dispatch_isolated_events_strict(
+        self, wallet_id: str
+    ) -> list[dict]:
+        """返回该钱包全部 chain_dispatch_isolated 事件（按 seq 升序）并
+        逐条严格校验**形状**（外层七字段键序、request_id==dispatch_id、
+        actor_id/reason 恒为 null、details 恰为三键 V 且键序固定
+        dispatch_id,adapter_id,state、state 恒为 isolated、adapter_id 为
+        安全标识）。
+
+        这里只做与现场无关的形状校验；与派发请求/健康表/操作/结果/接管的
+        语义复核在 :meth:`_reconcile_chain_dispatch_isolated_events` 按事件
+        seq 完成。任何形状畸形都是不可对账现场（RecoveryError）。纯只读，
+        不分配 seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_ISOLATED
+        )
+        seen: set[str] = set()
+        for event in events:
+            if list(event) != list(_AUDIT_OUTER_KEY_ORDER):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_isolated "
+                    "event whose outer fields are out of the canonical order"
+                )
+            dispatch_id = event.get("request_id")
+            if (
+                not isinstance(dispatch_id, str)
+                or not ROTATION_ID_RE.match(dispatch_id)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_isolated "
+                    "event with a malformed dispatch_id"
+                )
+            if dispatch_id in seen:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple "
+                    f"chain_dispatch_isolated events for {dispatch_id!r}"
+                )
+            seen.add(dispatch_id)
+            # 隔离无审批/无操作人：actor_id 与 reason 恒为 null。
+            if (
+                event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} has a non-null actor_id or reason"
+                )
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or list(details)
+                != list(self._DISPATCH_ISOLATED_VIEW_KEY_ORDER)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} has malformed details"
+                )
+            if details["dispatch_id"] != dispatch_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} details dispatch_id disagrees with its "
+                    "request_id"
+                )
+            if not (
+                isinstance(details["adapter_id"], str)
+                and ROTATION_ID_RE.match(details["adapter_id"])
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} has a malformed adapter_id"
+                )
+            if details["state"] != "isolated":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} has a state other than isolated"
+                )
+        return events
+
+    def _reconcile_chain_dispatch_isolated_events(
+        self, wallet_id: str
+    ) -> None:
+        """按 seq 严格复核全部 chain_dispatch_isolated 事件（调用方须持
+        钱包事务锁）。
+
+        每条隔离都以其**提交之前**的现场复核在线首提的全部前置：
+
+        - 同一 dispatch_id 的 chain_dispatch_requested 必须先于隔离事件
+          提交（派发在先）；
+        - 隔离提交之前最近一条 chain_adapter_health 快照必须存在，且派发
+          原适配器在该快照中显式为 ``down``（无快照/缺席/up 都矛盾）；
+        - 隔离时资产操作仍为 pending（该操作的提交点不得早于隔离）；
+        - 隔离之前该派发没有任何 chain_dispatch_result 与
+          chain_dispatch_taken_over（result/takeover/isolate 互斥在前）；
+        - 隔离之后、接管之前同样不得有 result（隔离只允许后续 takeover
+          由新适配器重新播链）；未接管的隔离派发之后不得再有任何 result；
+        - actor_id/reason 为 null、每派发至多一条隔离（形状校验保证）。
+
+        任一矛盾都 fail-closed（RecoveryError，保留现场）。纯只读，不记
+        事件、不改 seq、不写状态。"""
+        events = self._dispatch_isolated_events_strict(wallet_id)
+        if not events:
+            return
+        requests = self._dispatch_events_strict(wallet_id)
+        request_by_dispatch = {
+            event["request_id"]: event for event in requests
+        }
+        # 适配器健康快照按 seq 升序（形状已在 _chain_adapter_health_events_strict
+        # 严格校验）：隔离前置取其 seq 之前的最后一条。
+        health_events = self._chain_adapter_health_events_strict(wallet_id)
+        # 各资产操作的提交 seq。
+        committed_seq: dict[str, int] = {}
+        for committed in self._audit.events_by_type(
+            wallet_id, audit.TYPE_ASSET_OPERATION_COMMITTED
+        ):
+            request_id = committed.get("request_id")
+            if isinstance(request_id, str):
+                committed_seq[request_id] = committed["seq"]
+        result_events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_CHAIN_DISPATCH_RESULT
+        )
+        results_by_dispatch: dict[str, list[dict]] = {}
+        for event in result_events:
+            results_by_dispatch.setdefault(
+                event["request_id"], []
+            ).append(event)
+        takeover_by_dispatch = {
+            event["request_id"]: event
+            for event in self._dispatch_taken_over_events_strict(wallet_id)
+        }
+        for event in events:
+            details = event["details"]
+            dispatch_id = details["dispatch_id"]
+            seq = event["seq"]
+            adapter_id = details["adapter_id"]
+            request = request_by_dispatch.get(dispatch_id)
+            if request is None or request["seq"] >= seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a chain_dispatch_isolated "
+                    f"event for {dispatch_id!r} without a preceding dispatch "
+                    "request"
+                )
+            saved_request = request["details"]
+            if saved_request["adapter_id"] != adapter_id:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} adapter disagrees with its dispatch "
+                    "request"
+                )
+            # 事前健康表：seq 之前最后一条快照必须存在且原适配器显式 down。
+            health_table = None
+            for health_event in health_events:
+                if health_event["seq"] < seq:
+                    health_table = health_event["details"]["adapters"]
+                else:
+                    break
+            if (
+                health_table is None
+                or health_table.get(adapter_id) != "down"
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} has no preceding health snapshot with "
+                    "its adapter explicitly down"
+                )
+            # 隔离时操作必须仍为 pending。
+            operation_id = saved_request["operation_id"]
+            operation_commit_seq = committed_seq.get(operation_id)
+            if operation_commit_seq is not None and operation_commit_seq < seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} follows a committed asset operation"
+                )
+            # 与 result/takeover 的先后互斥：隔离之前不得有 result 或接管；
+            # 隔离之后只允许 takeover（其后新适配器 result 由结果对账复核）。
+            takeover = takeover_by_dispatch.get(dispatch_id)
+            for result in results_by_dispatch.get(dispatch_id, []):
+                if result["seq"] < seq:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} chain_dispatch_isolated "
+                        f"{dispatch_id!r} follows an earlier dispatch result"
+                    )
+                if takeover is None or result["seq"] < takeover["seq"]:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has a dispatch result between "
+                        f"isolation and takeover for {dispatch_id!r}"
+                    )
+            if takeover is not None and takeover["seq"] < seq:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} chain_dispatch_isolated "
+                    f"{dispatch_id!r} follows an earlier takeover"
+                )
+
+    def post_chain_dispatch_isolate(
+        self, wallet_id: str, dispatch_id: object
+    ) -> tuple[int, dict]:
+        """隔离一笔尚在途但原适配器已显式熔断的派发，返回
+        (HTTP 状态码, 视图 V={dispatch_id,adapter_id,state})。
+
+        请求体恰为空 JSON 对象 ``{}``（HTTP 边界拦键集）；路径 D 须匹配
+        安全标识，非法 400；钱包/派发未知 404。首提前置：派发所属资产
+        操作仍为 pending；该派发尚无 result、无 takeover、无 isolate；派
+        发原适配器（dispatch 请求中的 adapter_id）在**当前**健康表中显式
+        为 ``down``（健康表未配置、适配器缺席或为 up 一律 409）。任一不
+        满足 409 且零副作用（不追加事件、现场不变）。
+
+        首提 201 返回 V（state="isolated"）；同 D 重放优先 200 返回同一
+        V（不复查健康表与现状）。chain_dispatch_isolated 是唯一提交事件
+        （request_id=D、actor_id/reason=null、details=V）；钱包锁内并发
+        只有一个 201，重放不记事件。隔离后旧适配器 result 一律 409；该派
+        发可再经 takeover 由新适配器接管（failed/isolate 二选一前置）。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                # 持锁访问先重放策略、票、派发请求/结果/确认/结算/重组/
+                # 接管/隔离、操作与相邻提交事件：矛盾现场 fail-closed。
+                self._reconcile_chain_state_locked(wallet_id)
+                if (
+                    not isinstance(dispatch_id, str)
+                    or not ROTATION_ID_RE.match(dispatch_id)
+                ):
+                    raise ServiceError(
+                        400,
+                        "dispatch_id must match [A-Za-z0-9_-]{1,128}",
+                    )
+
+                # 同 D 重放优先于一切现状判定：已隔离即 200 返回同一 V，
+                # 不复查健康表（事后把适配器翻回 up 不影响幂等重放）。
+                isolate_event = self._dispatch_isolate_event_locked(
+                    wallet_id, dispatch_id
+                )
+                if isolate_event is not None:
+                    return 200, dict(isolate_event["details"])
+
+                # 404：派发请求未知
+                requests = self._audit.chain_dispatch_requested_events(
+                    wallet_id
+                )
+                grouped = requests.get(dispatch_id)
+                if not grouped:
+                    raise ServiceError(
+                        404, f"dispatch {dispatch_id!r} not found"
+                    )
+                if len(grouped) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has multiple "
+                        f"chain_dispatch_requested events for "
+                        f"{dispatch_id!r}"
+                    )
+                request_details = grouped[0]["details"]
+                adapter_id = request_details["adapter_id"]
+
+                # 409：资产操作必须仍为 pending
+                record = self._store.get_asset_operation(
+                    wallet_id, request_details["operation_id"]
+                )
+                if record is None:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} dispatch {dispatch_id!r} "
+                        "refers to an unknown asset operation"
+                    )
+                if record["state"] != "pending":
+                    raise ServiceError(
+                        409,
+                        f"asset operation "
+                        f"{request_details['operation_id']!r} is "
+                        f"{record['state']}, not pending",
+                    )
+
+                # 409：已有 result / takeover，不能隔离
+                result_group = (
+                    self._audit.chain_dispatch_result_events(wallet_id).get(
+                        dispatch_id
+                    )
+                    or []
+                )
+                if result_group:
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} already has a result",
+                    )
+                if (
+                    self._dispatch_takeover_event_locked(
+                        wallet_id, dispatch_id
+                    )
+                    is not None
+                ):
+                    raise ServiceError(
+                        409,
+                        f"dispatch {dispatch_id!r} has already been taken over",
+                    )
+
+                # 409：原适配器必须在**当前**健康表中显式 down；健康表
+                # 未配置或该适配器缺席视为 up（不熔断/不可隔离）。
+                adapters = self._chain_adapters_locked(wallet_id)
+                if adapters is None or adapters.get(adapter_id) != "down":
+                    raise ServiceError(
+                        409,
+                        f"chain adapter {adapter_id!r} is not explicitly "
+                        "down in the current health table",
+                    )
+
+                view = self._dispatch_isolated_view(
+                    dispatch_id, adapter_id
+                )
+                # chain_dispatch_isolated 是唯一提交点：跨进程事务锁内追加
+                # 事件；事件之外不写任何隔离状态文件。actor_id/reason 恒为
+                # null（隔离无审批、无操作人）。
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_CHAIN_DISPATCH_ISOLATED,
+                        request_id=dispatch_id,
+                        actor_id=None,
                         reason=None,
                         details=view,
                     ),
