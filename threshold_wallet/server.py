@@ -32,6 +32,7 @@
 - GET  /v1/wallets/<wallet_id>/chain/<asset_id>/arbitration 查询多源仲裁策略
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/observe 多源观察上报
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/dispatch 请求跨链派发
+- POST /v1/wallets/<wallet_id>/chain/<operation_id>/dispatch-auto 健康感知自动派发
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/result 上报跨链派发结果回执
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/confirm 上报跨链派发确认进展
 - POST /v1/wallets/<wallet_id>/chain/<dispatch_id>/takeover 失败派发由新适配器接管
@@ -793,6 +794,34 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         rest[1],
                         body.get("dispatch_id"),
                         body.get("adapter_id"),
+                        body.get("approval_request_id"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "chain"
+                    and rest[2] == "dispatch-auto"
+                ):
+                    # 健康感知自动派发：请求体仅允许
+                    # dispatch_id/approval_request_id 两键（适配器由后端在
+                    # 锁内按健康表 ASCII 最小 up 适配器自选；值类型/取值由
+                    # service 校验）。响应字节规则同 dispatch。
+                    body = self._read_json_body()
+                    if set(body) != {
+                        "dispatch_id",
+                        "approval_request_id",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly dispatch_id and "
+                            "approval_request_id",
+                        )
+                    status, result = service.post_chain_dispatch_auto(
+                        wallet_id,
+                        rest[1],
+                        body.get("dispatch_id"),
                         body.get("approval_request_id"),
                     )
                     self._send_json(status, result)

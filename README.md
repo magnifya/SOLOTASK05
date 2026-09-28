@@ -68,6 +68,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/chain/{asset_id}/arbitration` | 查询多源仲裁策略（未配置 404） |
 | POST | `/v1/wallets/{id}/chain/{oid}/observe` | 多源观察上报 `{"source","report"}` |
 | POST | `/v1/wallets/{id}/chain/{oid}/dispatch` | 请求跨链派发 `{"dispatch_id","adapter_id","approval_request_id"}` |
+| POST | `/v1/wallets/{id}/chain/{oid}/dispatch-auto` | 健康感知自动派发 `{"dispatch_id","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/result` | 上报跨链派发结果回执 `{"adapter_id","state","tx_id"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/confirm` | 上报跨链派发确认进展 `{"adapter_id","tx_id","block_height","block_hash","confirmations"}` |
 | POST | `/v1/wallets/{id}/chain/{did}/takeover` | 失败派发由新适配器接管 `{"adapter_id","approval_request_id"}` |
@@ -705,6 +706,67 @@ quorum 后按既有 commit 契约自动提交。
   `503`、`serve` 拒绝就绪。恢复不新增事件、不改 seq，响应、日志、非
   份额文件绝不泄露份额私钥或份额正文。
 
+### 健康感知自动派发（dispatch-auto）
+
+`POST /v1/wallets/{W}/chain/{O}/dispatch-auto`（仅 POST），`O` 为资产
+操作 id。请求体 B 恰含 `{"dispatch_id","approval_request_id"}` 两键
+（含其他键或缺键一律 `400`），两值与路径 `O` 均须匹配安全标识
+`[A-Za-z0-9_-]{1,128}`，非法 `400`：把一个 `pending` 资产操作按该资产
+已启用的跨链确认策略，**自动**派发给当前健康熔断表中 ASCII 最小的
+`up` 适配器。其余派发契约不变。
+
+- 钱包、操作、该资产跨链确认策略、同钱包审批单任一未知一律 `404`。
+- **首提前置**：操作须为 `pending`；该资产策略须已启用
+  （`enabled:true`，停用 `409`）；在该钱包跨进程事务锁内读取**当前**
+  `chain_adapter_health` 健康表，取其中状态显式为 `up` 的适配器里
+  **ASCII 最小**者实选为 `adapter_id`——健康表**未配置**、或其中没有
+  任何 `up` 适配器，一律 `409`（适配器在表中缺席即不被选中，与手动派发
+  “缺席视为 up”的熔断语义不同）；`approval_request_id` 必须指向
+  **同一钱包**既有、且为 `approved` 的审批单（操作前按既有契约懒
+  过期）；其 `message` 必须与紧凑 JSON **逐字一致**（无空格、键序固定为
+  operation_id,dispatch_id,chain_id，**不含 adapter_id**——适配器由
+  后端选择，审批单不预设）：
+  `{"operation_id":"O","dispatch_id":"D","chain_id":"C"}`，其中
+  `chain_id` 取该资产策略链。审批单非 `approved` 或 message 不符一律
+  `409`，不追加事件、现场不变。
+- 成功 `201` 返回
+  `V={"dispatch_id","operation_id","adapter_id","chain_id","state"}`，
+  键序固定且 `state="requested"`（与手动 dispatch 同形）。同
+  `dispatch_id` **同操作同体**（路径操作、`approval_request_id` 全同）
+  重放 `200` 返回同一 V（**优先于状态与健康/审批判定，不复查现状**，
+  故事后健康翻转、无 up、策略停用、审批单状态变化都不影响幂等重放）；
+  同 `dispatch_id` 异参（含更换审批单或路径操作）、或该操作已有派发
+  （**手动 `dispatch` 或本自动派发皆然，二者全局互斥**），一律 `409`。
+- 自动派发仅由审计事件持久化：**七字段
+  `chain_dispatch_auto_requested`** 是唯一提交点
+  （`request_id=dispatch_id`、`actor_id=approval_request_id`、
+  `reason=null`、details 即 V，键序
+  `dispatch_id,operation_id,adapter_id,chain_id,state`），不另写派发
+  状态文件。首提在每钱包跨进程事务锁内追加，跨进程并发只有一个 `201`
+  （其余同 D 同 O 同体 `200`），审计 seq 连续不重号，失败/重放不记
+  事件。
+- **后续沿用 dispatch**：自动派发一经提交，其
+  result/confirm/finality/settle/reorg/takeover/isolate 完全按既有
+  dispatch 契约执行（归属适配器即自动实选的 `adapter_id`）；自动派发与
+  手动派发的 dispatch_id、每个资产操作均全局至多一条派发请求。
+- 重启/灾备恢复时，每条 `chain_dispatch_auto_requested` 都按其**提交
+  之前**的现场逐条复核：操作在账本中存在且当时为 pending（提交点之前无
+  该操作的提交事件）、事前该资产策略（该事件 seq 之前最后一条
+  `chain_policy`）已启用且链一致、事前最近一条 `chain_adapter_health`
+  快照（seq 严格早于本事件）必须存在且至少有一个 `up` 适配器、记录的
+  `adapter_id` 恰为该快照中 ASCII 最小的 up 适配器；同钱包审批单存在、
+  message 逐字为按 operation_id,dispatch_id,chain_id 序的三键紧凑
+  JSON、状态为 `approved`（其后经 `/sign` 推进为 `signed` 亦认可）。
+  健康快照缺失、无 up 适配器、首选适配器不符、审批单缺失/未批准/
+  message 不符、跨手动/自动重复 dispatch_id 或同操作多条派发、或任何
+  矛盾都 fail-closed（抛 `RecoveryError`）；`details` 键序在审计读取
+  归一化**之前**校验（落盘必须恰为
+  `dispatch_id,operation_id,adapter_id,chain_id,state`，错序即
+  `RecoveryError`，绝不先归一而抹平重排）；审计 JSON 损坏抛
+  `CorruptDataError`、审计文件 I/O 失败抛 `OSError`——三者 HTTP 一律
+  `503`、`serve` 拒绝就绪。重启/灾备/重放不新增事件或 seq，响应、日志、
+  非份额文件绝不泄露份额私钥或份额正文。
+
 ### 跨链派发结果回执（result）
 
 `POST /v1/wallets/{id}/chain/{did}/result`（仅 POST），`did` 为已派发
@@ -1001,7 +1063,8 @@ quorum 后按既有 commit 契约自动提交。
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
 `node_rejoined`、`share_participant_reinstated`、`chain_policy`、
 `chain_report`、`chain_arbitration`、`chain_vote`、
-`chain_dispatch_requested`、`chain_dispatch_result`、
+`chain_dispatch_requested`、`chain_dispatch_auto_requested`、
+`chain_dispatch_result`、
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
 `chain_dispatch_reorged`、`chain_dispatch_taken_over`、
 `chain_dispatch_isolated`、`chain_adapter_health`。
