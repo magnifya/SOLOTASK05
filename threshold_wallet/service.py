@@ -80,6 +80,12 @@ DISPATCH_RESULT_STATES = ("broadcasted", "failed")
 #: 同为终态，其后不再接受任何新进展）
 DISPATCH_CONFIRMATION_STATES = ("confirming", "finalized", "reorged")
 
+#: 钱包安全状态：active 正常（reason 为 null）、frozen 应急冻结。
+#: 状态不由任何状态文件承载，只由 wallet_frozen/wallet_unfrozen 审计
+#: 事件按 seq 折叠恢复，两类事件必须严格交替（首条必为 frozen）。
+WALLET_STATE_ACTIVE = "active"
+WALLET_STATE_FROZEN = "frozen"
+
 #: 审计事件落盘的外层七字段规范键序（audit 写盘按 sort_keys，惟既定
 #: 类型 details 保序）。恢复据此核对事件**外层**未被重排：正常现场恒为
 #: 此序，任何重排都是外部篡改，按不可对账现场 fail-closed。
@@ -377,6 +383,10 @@ class WalletService:
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
+            # 钱包应急冻结/解冻事件（wallet_frozen/wallet_unfrozen）：
+            # 状态只由这两类事件折叠，逐事件严格校验 details 与交替状态
+            # 机；畸形/同态连续 fail-closed，恢复不新增事件、不改 seq。
+            self._freeze_events_strict(wallet_id)
             # 先校验资产账本（形状 + 语义）：账本损坏时任何对账都不可信，
             # 直接 fail-closed。
             self._store.check_asset_ledger_semantics(wallet_id)
@@ -822,6 +832,243 @@ class WalletService:
             raise ServiceError(404, f"wallet {wallet_id!r} not found")
         return wallet
 
+    # ---- 钱包应急冻结/解冻 ----------------------------------------------
+
+    @staticmethod
+    def _validate_freeze_reason(reason: object) -> str:
+        """freeze/unfreeze 请求体 reason：必须是 1..1024 字符的非空白
+        字符串（bool 拒绝；仅空白拒绝）。非法抛 ServiceError(400)。"""
+        if not isinstance(reason, str) or isinstance(reason, bool):
+            raise ServiceError(400, "reason must be a string")
+        if len(reason) < 1 or len(reason) > MAX_REASON_LENGTH:
+            raise ServiceError(
+                400,
+                f"reason must be 1 to {MAX_REASON_LENGTH} characters long",
+            )
+        if not reason.strip():
+            raise ServiceError(400, "reason must be non-blank")
+        return reason
+
+    @staticmethod
+    def _security_state_view(
+        wallet_id: str, state: str, reason: object
+    ) -> dict:
+        """安全状态对外视图，固定键序 wallet_id,state,reason；
+        active 时 reason 恒为 null。"""
+        return {
+            "wallet_id": wallet_id,
+            "state": state,
+            "reason": reason,
+        }
+
+    def _freeze_events_strict(self, wallet_id: str) -> list[dict]:
+        """按 seq 升序返回该钱包全部 wallet_frozen/wallet_unfrozen 事件，
+        逐条严格校验并核对交替状态机（调用方须持钱包事务锁）。
+
+        每条事件的 request_id/actor_id/reason 必须为 null，details 恰为
+        ``{"reason": <1..1024 字符非空白字符串>}``；事件必须严格交替：
+        首条必为 wallet_frozen（active -> frozen），其后 frozen/unfrozen
+        轮流出现（frozen -> active -> frozen ...）。任何畸形或同态连续
+        （重复 freeze / 重复 unfreeze）都是不可对账现场（RecoveryError，
+        fail-closed），绝不静默取最后一条。审计 JSON 损坏由下层抛
+        CorruptDataError，文件 I/O 失败抛 OSError。纯只读，不记事件、
+        不改 seq。"""
+        events = [
+            event
+            for event in self._audit.all_events(wallet_id)
+            if event.get("type")
+            in (audit.TYPE_WALLET_FROZEN, audit.TYPE_WALLET_UNFROZEN)
+        ]
+        expected = audit.TYPE_WALLET_FROZEN
+        for event in events:
+            if (
+                event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a freeze event with "
+                    "request_id/actor_id/reason set"
+                )
+            details = event.get("details")
+            reason = (
+                details.get("reason")
+                if isinstance(details, dict)
+                else None
+            )
+            if (
+                not isinstance(details, dict)
+                or set(details) != {"reason"}
+                or not isinstance(reason, str)
+                or isinstance(reason, bool)
+                or len(reason) < 1
+                or len(reason) > MAX_REASON_LENGTH
+                or not reason.strip()
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed freeze event"
+                )
+            if event.get("type") != expected:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has non-alternating freeze events"
+                )
+            expected = (
+                audit.TYPE_WALLET_UNFROZEN
+                if expected == audit.TYPE_WALLET_FROZEN
+                else audit.TYPE_WALLET_FROZEN
+            )
+        return events
+
+    def _security_state_locked(self, wallet_id: str) -> dict:
+        """按审计事件折叠当前安全状态（调用方须持钱包事务锁）。
+
+        状态只由 wallet_frozen/wallet_unfrozen 事件承载：无事件为
+        active（reason=null）；有事件时末条为 frozen 即 frozen，reason
+        取**最近一次 freeze** 的 reason；末条为 unfrozen 即 active。
+        矛盾/损坏现场 fail-closed。纯只读，不新增事件、不改 seq。"""
+        events = self._freeze_events_strict(wallet_id)
+        if not events or events[-1]["type"] == audit.TYPE_WALLET_UNFROZEN:
+            return self._security_state_view(
+                wallet_id, WALLET_STATE_ACTIVE, None
+            )
+        reason = events[-1]["details"]["reason"]
+        return self._security_state_view(
+            wallet_id, WALLET_STATE_FROZEN, reason
+        )
+
+    def _assert_wallet_active_locked(self, wallet_id: str) -> None:
+        """frozen 钱包的既有写接口统一 409（调用方须持钱包事务锁）。
+
+        在钱包存在性判定之后、任何参数/幂等/业务判定之前调用：冻结是
+        应急闸门，frozen 期间只有查询、审计读取、security-state、
+        freeze 与 unfreeze 可用，故即便请求本来会命中幂等 200 重放也一律
+        409 且零副作用（不触发懒过期、不追加事件、不改现场）。"""
+        if (
+            self._security_state_locked(wallet_id)["state"]
+            == WALLET_STATE_FROZEN
+        ):
+            raise ServiceError(
+                409, f"wallet {wallet_id!r} is frozen"
+            )
+
+    def freeze_wallet(
+        self, wallet_id: str, reason: object
+    ) -> tuple[int, dict]:
+        """POST /v1/wallets/<id>/freeze。返回 (201|200, 安全状态视图)。
+
+        active -> frozen 首次转换 201，在每钱包跨进程事务锁内原子判定并
+        追加唯一 wallet_frozen 事件（details 恰为 {"reason": ...}）；
+        frozen 期间同 reason 重放 200（不复查、不记事件），异 reason
+        409。并发同一操作只有一个 201，其余同参得到 200，审计 seq 连续
+        不重号。reason 非字符串/空白/超长 400；钱包不存在 404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_freeze_reason(reason)
+                state = self._security_state_locked(wallet_id)
+                if state["state"] == WALLET_STATE_FROZEN:
+                    # 已冻结：仅允许与最近一次 freeze 同 reason 的重放
+                    if state["reason"] != reason:
+                        raise ServiceError(
+                            409,
+                            f"wallet {wallet_id!r} is frozen with a "
+                            "different reason",
+                        )
+                    return 200, state
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_WALLET_FROZEN,
+                        details={"reason": reason},
+                    ),
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return 201, self._security_state_view(
+            wallet_id, WALLET_STATE_FROZEN, reason
+        )
+
+    def unfreeze_wallet(
+        self, wallet_id: str, reason: object
+    ) -> tuple[int, dict]:
+        """POST /v1/wallets/<id>/unfreeze。返回 (201|200, 安全状态视图)。
+
+        frozen -> active 首次转换 201，在每钱包跨进程事务锁内原子判定并
+        追加唯一 wallet_unfrozen 事件（details 恰为 {"reason": ...}）；
+        active 期间仅当存在同类转换记录（最近一次 unfreeze）且 reason
+        相同才重放 200，无 unfreeze 记录或异 reason 一律 409。reason
+        非字符串/空白/超长 400；钱包不存在 404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性在锁内、heal 之后先判定
+                self._get_wallet_or_404(wallet_id)
+                self._validate_freeze_reason(reason)
+                events = self._freeze_events_strict(wallet_id)
+                if (
+                    events
+                    and events[-1]["type"] == audit.TYPE_WALLET_FROZEN
+                ):
+                    # 当前 frozen（末条为 freeze）：首提解冻。
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_WALLET_UNFROZEN,
+                            details={"reason": reason},
+                        ),
+                    )
+                    return 201, self._security_state_view(
+                        wallet_id, WALLET_STATE_ACTIVE, None
+                    )
+                # 当前 active（含从未冻结过的天然 active）：必须存在最近
+                # 一次 unfreeze 记录且 reason 相同才允许幂等重放；无
+                # unfreeze 记录或异 reason 一律 409。
+                last_unfrozen = next(
+                    (
+                        event
+                        for event in reversed(events)
+                        if event["type"] == audit.TYPE_WALLET_UNFROZEN
+                    ),
+                    None,
+                )
+                if (
+                    last_unfrozen is not None
+                    and last_unfrozen["details"]["reason"] == reason
+                ):
+                    return 200, self._security_state_view(
+                        wallet_id, WALLET_STATE_ACTIVE, None
+                    )
+                raise ServiceError(
+                    409, f"wallet {wallet_id!r} is not frozen"
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def get_security_state(self, wallet_id: str) -> dict:
+        """GET /v1/wallets/<id>/security-state：始终 200 返回
+        ``{wallet_id,state,reason}``，active 时 reason 为 null。
+
+        纯只读（不触发懒过期、不记事件）；冻结事件损坏/矛盾 fail-closed
+        （由 HTTP 边界转 503）。钱包不存在 404。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在，再折叠冻结事件
+                self._get_wallet_or_404(wallet_id)
+                return self._security_state_locked(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
     def put_policy(
         self,
         wallet_id: str,
@@ -838,6 +1085,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：钱包存在性在锁内先于参数校验
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # bool 是 int 的子类，必须先排除
                 if (
                     not isinstance(required_approvals, int)
@@ -954,6 +1202,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_transaction_policy(mode, max_delta, allowed_assets)
                 # 落盘文件恰含 mode/max_delta/allowed_assets 三项（公开契约）
                 policy = {
@@ -1074,6 +1323,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # bool 必须严格为布尔（拒绝 int/None/字符串）
                 if not isinstance(enabled, bool):
                     raise ServiceError(400, "enabled must be a boolean")
@@ -1247,6 +1497,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在性，再校验请求体
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 normalized = self._normalize_nodes_body(nodes)
                 body = {"nodes": normalized}
                 current = self._health_table_folding_rejoins_locked(wallet_id)
@@ -1652,6 +1903,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先严格复核 node_state / node_rejoined / DKG 现场：
                 # 矛盾现场 fail-closed（503），优先于参数 400/404 判定。
                 self._reconcile_node_rejoins(wallet_id)
@@ -2242,6 +2494,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先严格复核既有绑定/健康/rejoin 现场：矛盾现场
                 # fail-closed（503），优先于参数 400/404 判定。
                 self._reconcile_share_bindings(wallet_id)
@@ -2542,6 +2795,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：钱包存在性在锁内先于请求体/id 校验
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_request_body(request_id, message)
                 # 锁内查重：同 id 同文 200、异文 409 均不记事件、不改状态，
                 # 也不依赖此刻是否仍有策略（既有幂等语义保持）。
@@ -2614,7 +2868,13 @@ class WalletService:
                 # 快照决定 404，也读不到并发事务半完成的审批单状态。
                 self._get_wallet_or_404(wallet_id)
                 record = self._fetch_request_or_404(wallet_id, request_id)
-                record = self._expire_if_needed(wallet_id, record)
+                # 冻结期间查询仍可用但不允许任何写入：跳过懒过期（不记
+                # request_expired 事件），按磁盘现状返回，解冻后再到期。
+                if (
+                    self._security_state_locked(wallet_id)["state"]
+                    != WALLET_STATE_FROZEN
+                ):
+                    record = self._expire_if_needed(wallet_id, record)
                 return self._request_view(record)
         except CorruptDataError:
             raise
@@ -2756,6 +3016,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性先于 rotation_id 校验
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_rotation_id(rotation_id)
                 existing = self._store.get_rotation(wallet_id, rotation_id)
                 if existing is not None:
@@ -2862,6 +3123,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性先于 rotation_id 校验
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_rotation_id(rotation_id)
                 record = self._store.get_rotation(wallet_id, rotation_id)
                 if record is None:
@@ -3041,6 +3303,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性先于 id/delta 校验
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_operation_id(operation_id)
                 self._validate_asset_id(asset_id)
                 self._validate_delta(delta)
@@ -3765,6 +4028,7 @@ class WalletService:
             self._heal_wallet(wallet_id)
             # 404 优先于 400：锁内先判定钱包存在，再校验 operation_id
             self._get_wallet_or_404(wallet_id)
+            self._assert_wallet_active_locked(wallet_id)
             self._validate_operation_id(operation_id)
 
             record = self._store.get_asset_operation(wallet_id, operation_id)
@@ -4370,6 +4634,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_asset_id(asset_id)
                 self._validate_chain_id(chain_id)
                 if not isinstance(enabled, bool):
@@ -4574,6 +4839,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在性，再校验请求体
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 normalized = self._normalize_adapters_body(adapters)
                 body = {"adapters": normalized}
                 current = self._chain_adapters_locked(wallet_id)
@@ -4639,6 +4905,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、票、报告、操作与相邻提交事件
                 # （heal 仅在账本文件存在时覆盖）：矛盾现场 fail-closed，
                 # 优先于参数 400/404 判定。
@@ -5453,6 +5720,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、报告、票、派发、操作与相邻提交事件
                 # （heal 仅在账本文件存在时覆盖）：矛盾现场 fail-closed，
                 # 优先于参数 400/404 判定。
@@ -5637,6 +5905,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、报告、票、手工/自动派发、操作与相邻
                 # 提交事件：矛盾现场 fail-closed，优先于参数 400/404 判定。
                 self._reconcile_chain_state_locked(wallet_id)
@@ -6048,6 +6317,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、报告、票、派发请求/结果、操作与相邻
                 # 提交事件：矛盾现场 fail-closed，优先于参数 400/404 判定。
                 self._reconcile_chain_state_locked(wallet_id)
@@ -6654,6 +6924,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、报告、票、派发请求/结果/确认、操作
                 # 与相邻提交事件：矛盾现场 fail-closed，优先于参数
                 # 400/404 判定。
@@ -7742,6 +8013,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、票、派发请求/结果/确认/结算/重组/
                 # 接管、操作与相邻提交事件：矛盾现场 fail-closed，优先于
                 # 参数 400/404 判定。
@@ -8159,6 +8431,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、票、派发请求/结果/确认/结算/重组/
                 # 接管/隔离、操作与相邻提交事件：矛盾现场 fail-closed。
                 self._reconcile_chain_state_locked(wallet_id)
@@ -8293,6 +8566,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、报告、票、派发请求/结果/确认/结算、
                 # 操作与相邻提交事件：矛盾现场 fail-closed。
                 self._reconcile_chain_state_locked(wallet_id)
@@ -8692,6 +8966,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、票、操作与相邻提交事件：heal 仅在
                 # 账本文件存在时覆盖链/仲裁事件，PUT 不要求账本存在（纯
                 # 策略配置），故在此显式只读重放——账本缺失却残留
@@ -8871,6 +9146,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 # 持锁访问先重放策略、票、操作与相邻提交事件：账本文件
                 # 缺失时 heal 未覆盖的矛盾现场也在此 fail-closed（503），
                 # 优先于任何参数 400/404 判定，绝不据锁外快照继续。
@@ -9239,6 +9515,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性先于 approver/reason 参数校验
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_approver_id(approver_id)
                 self._validate_reason(reason)
                 record = self._fetch_request_or_404(wallet_id, request_id)
@@ -9429,6 +9706,7 @@ class WalletService:
             wallet = self._store.get_wallet(wallet_id)
             if wallet is None:
                 raise ServiceError(404, f"wallet {wallet_id!r} not found")
+            self._assert_wallet_active_locked(wallet_id)
             # 字段校验也在锁内：存在性确认后再判，杜绝锁外快照先行
             if (
                 not isinstance(signing_request_id, str)
@@ -9844,6 +10122,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：钱包存在性在锁内先于参数校验
                 wallet = self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_session_id(session_id)
                 self._validate_session_message(message)
                 self._validate_session_timeout(timeout_seconds)
@@ -9921,7 +10200,15 @@ class WalletService:
                     raise ServiceError(
                         404, f"sign session {session_id!r} not found"
                     )
-                record = self._session_expire_if_needed(wallet_id, record)
+                # 冻结期间查询仍可用但不允许任何写入：跳过懒过期（不记
+                # session_event expired），按磁盘现状返回，解冻后再到期。
+                if (
+                    self._security_state_locked(wallet_id)["state"]
+                    != WALLET_STATE_FROZEN
+                ):
+                    record = self._session_expire_if_needed(
+                        wallet_id, record
+                    )
                 return self._session_view(record)
         except CorruptDataError:
             raise
@@ -10038,6 +10325,7 @@ class WalletService:
             wallet = self._store.get_wallet(wallet_id)
             if wallet is None:
                 raise ServiceError(404, f"wallet {wallet_id!r} not found")
+            self._assert_wallet_active_locked(wallet_id)
             self._validate_session_id(session_id)
             record = self._store.get_sign_session(wallet_id, session_id)
             if record is None:
@@ -10243,6 +10531,7 @@ class WalletService:
                 wallet = self._store.get_wallet(wallet_id)
                 if wallet is None:
                     raise ServiceError(404, f"wallet {wallet_id!r} not found")
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_session_id(session_id)
                 if not isinstance(
                     replacement_id, str
@@ -10422,6 +10711,7 @@ class WalletService:
                 wallet = self._store.get_wallet(wallet_id)
                 if wallet is None:
                     raise ServiceError(404, f"wallet {wallet_id!r} not found")
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_session_id(session_id)
                 if not isinstance(
                     takeover_id, str
@@ -12448,6 +12738,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在性
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_dkg_id(dkg_id)
                 if op not in DKG_OPS:
                     raise ServiceError(
@@ -12696,6 +12987,7 @@ class WalletService:
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：锁内先判定钱包存在性
                 self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
                 self._validate_dkg_id(dkg_id)
                 if (
                     not isinstance(round_no, int)

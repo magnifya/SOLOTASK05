@@ -3,6 +3,9 @@
 路由：
 - POST /v1/wallets                                  建钱包
 - GET  /v1/wallets/<wallet_id>                      查询钱包
+- POST /v1/wallets/<wallet_id>/freeze               应急冻结钱包
+- POST /v1/wallets/<wallet_id>/unfreeze             解除应急冻结
+- GET  /v1/wallets/<wallet_id>/security-state       查询钱包安全状态
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
 - PUT  /v1/wallets/<wallet_id>/transaction-policy   设置冷热钱包交易策略
 - GET  /v1/wallets/<wallet_id>/transaction-policy   查询冷热钱包交易策略
@@ -206,6 +209,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if not rest:
                     self._send_json(200, service.get_wallet(wallet_id))
                     return
+                if rest == ["security-state"]:
+                    self._send_json(
+                        200, service.get_security_state(wallet_id)
+                    )
+                    return
                 if len(rest) == 2 and rest[0] == "sign-requests":
                     self._send_json(
                         200, service.get_sign_request(wallet_id, rest[1])
@@ -377,6 +385,28 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_error(404, "not found")
                     return
                 wallet_id, rest = matched
+
+                if len(rest) == 1 and rest[0] in ("freeze", "unfreeze"):
+                    # 应急冻结/解冻：请求体恰为 {"reason": "..."}，reason
+                    # 须为 1..1024 字符非空白字符串（取值由 service 校验）；
+                    # 缺键/夹带/非对象/非法 JSON 一律 400。frozen 期间只有
+                    # 这两个写接口仍可用（闸门在 service 各写方法内）。
+                    body = self._read_json_body()
+                    if set(body) != {"reason"}:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly reason",
+                        )
+                    if rest[0] == "freeze":
+                        status, result = service.freeze_wallet(
+                            wallet_id, body.get("reason")
+                        )
+                    else:
+                        status, result = service.unfreeze_wallet(
+                            wallet_id, body.get("reason")
+                        )
+                    self._send_json(status, result)
+                    return
 
                 if (
                     len(rest) == 3

@@ -38,6 +38,9 @@ python -m unittest discover -s tests -v
 | ---- | ---- | ---- |
 | POST | `/v1/wallets` | 建钱包 `{"wallet_id", "shares"`，`shares` 必须为 2 |
 | GET  | `/v1/wallets/{id}` | 返回 `public_key` 与 `created_at` |
+| POST | `/v1/wallets/{id}/freeze` | 应急冻结钱包 `{"reason"}` |
+| POST | `/v1/wallets/{id}/unfreeze` | 解除应急冻结 `{"reason"}` |
+| GET  | `/v1/wallets/{id}/security-state` | 查询安全状态 `{wallet_id,state,reason}` |
 | PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
 | PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
@@ -1054,6 +1057,50 @@ quorum 后按既有 commit 契约自动提交。
 
 ### 审计事件
 
+### 钱包应急冻结（freeze / unfreeze）
+
+`POST /v1/wallets/{id}/freeze` 与 `POST /v1/wallets/{id}/unfreeze`
+（仅 POST），请求体**恰为** `{"reason":"..."}`（缺键、夹带其他键、非
+JSON 对象、`reason` 非字符串、空串/纯空白或超过 1024 字符一律 `400`）；
+`reason` 为 1 到 1024 个字符的非空白字符串（首尾允许空白但必须含非空白
+字符）。钱包不存在 `404`。
+
+- `GET /v1/wallets/{id}/security-state` 始终 `200` 返回
+  `{"wallet_id","state","reason"}`，键序固定，`state` 为
+  `active|frozen`；活跃（active）时 `reason` 为 `null`，冻结（frozen）时
+  `reason` 为最近一次冻结的原文。
+- 首次转换 `201`：active 钱包 freeze 转 frozen、frozen 钱包 unfreeze 转
+  active；响应同 security-state 视图。当前状态对应的最近一次**同类转换
+记录**（frozen 时最近 `wallet_frozen`、active 时最近
+  `wallet_unfrozen`）与请求 **同 reason** 时幂等重放 `200`（返回当前视图，
+不复查现场、不记事件）；reason 与该记录不同 `409`。从未冻结过的天然
+active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
+- **冻结闸门**：钱包 frozen 时，该钱包**全部既有写接口**统一返回 `409`，
+  包括审批（建单/批准/拒绝）、`/sign` 与签名会话（建会话/投递/参与者
+  替换与接管）、轮换准备/激活与 share-bind 参与者迁移、资产操作与全部
+  跨链接口（策略/报告/仲裁/派发/回执/确认/接管/隔离/结算）、两方 DKG 与
+  故障轮次、节点健康表/rejoin 与适配器熔断表、三类策略写入——即便请求本
+  来命中幂等 `200` 重放也一律 `409` 且**零副作用**（不触发懒过期、不追加
+  事件、不改现场）；闸门在每钱包事务锁内、钱包存在性判定之后判定。
+  冻结期间只有查询、审计读取、security-state、freeze 与 unfreeze 可用；
+  查询路径上的审批单/签名会话懒过期在冻结期间挂起（不记
+  `request_expired`/`session_event`，按磁盘现状返回），解冻后首次访问再
+  按既有契约到期。未冻结时既有接口的 `201/200/409` 语义完全不变。
+- 状态**只由审计事件承载**，不写任何状态文件：`wallet_frozen` 与
+  `wallet_unfrozen` 是唯一提交点，`request_id`/`actor_id`/`reason` 均为
+  `null`，details 恰为 `{"reason":"..."}`。判定与事件追加在每钱包跨进程
+  事务锁内原子完成：同一操作并发只有一个 `201`，其余同参请求得到 `200`，
+  审计 seq 连续不重号，重放不产生新事件。
+- **崩溃与灾备恢复**：启动、持锁访问与 backup/restore 都按 seq 折叠两类
+  事件重建状态（无事件为 active；事件必须严格交替，首条必为
+  `wallet_frozen`），恢复不新增事件、不改 seq；frozen 状态与冻结闸门在
+  服务重启及快照恢复后继续生效。事件 details 畸形（reason 非 1..1024
+  非空白字符串、夹带字段）、三 id 字段非 null 或同态连续（重复 freeze /
+  重复 unfreeze）等现场自相矛盾一律抛 `RecoveryError`；审计 JSON 损坏抛
+  `CorruptDataError`；文件 I/O 失败抛 `OSError`——三者 HTTP 统一 `503`、
+  `serve` 拒绝就绪，保留现场不猜写。reason 原文只出现在事件 details 与
+  security-state/freeze 响应中，不进入访问日志。
+
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
 `from_seq`/`limit` 为正整数，默认 1/1000，limit 上限 1000；非法 `400`，
 钱包不存在 `404`。纯只读，不触发懒过期、不分配 seq。
@@ -1073,6 +1120,8 @@ quorum 后按既有 commit 契约自动提交。
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
 `chain_dispatch_reorged`、`chain_dispatch_taken_over`、
 `chain_dispatch_isolated`、`chain_adapter_health`。
+钱包应急冻结/解冻另有 `wallet_frozen`、`wallet_unfrozen`（details 恰为
+`{"reason":"..."}`，两类事件严格交替，按 seq 折叠出 active/frozen 状态）。
 
 ## 多进程与故障恢复（保证）
 

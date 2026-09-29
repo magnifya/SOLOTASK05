@@ -105,6 +105,12 @@ TYPE_CHAIN_DISPATCH_ISOLATED = "chain_dispatch_isolated"
 #: 跨链适配器健康熔断表整体快照（details 即 Q={"adapters": {A: up|down}}；
 #: request_id/actor_id/reason 均为 null，取最后一条恢复）
 TYPE_CHAIN_ADAPTER_HEALTH = "chain_adapter_health"
+#: 钱包应急冻结（details 恰为 {"reason": ...}；request_id/actor_id/
+#: reason 均为 null；frozen 状态的唯一提交点，取事件序列折叠恢复）
+TYPE_WALLET_FROZEN = "wallet_frozen"
+#: 钱包应急解冻（details 恰为 {"reason": ...}；request_id/actor_id/
+#: reason 均为 null；回到 active 的唯一提交点，与 wallet_frozen 严格交替）
+TYPE_WALLET_UNFROZEN = "wallet_unfrozen"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -286,6 +292,14 @@ _DETAILS_KEY_ORDER = {
     # 嵌套顺序（与 node_state 同模式）。
     TYPE_CHAIN_ADAPTER_HEALTH: (
         "adapters",
+    ),
+    # wallet_frozen / wallet_unfrozen 的 details 恰为 {"reason": ...}：
+    # 单键，顶层仅 reason，文本原样保序（非 ASCII 不转义由写盘统一处理）。
+    TYPE_WALLET_FROZEN: (
+        "reason",
+    ),
+    TYPE_WALLET_UNFROZEN: (
+        "reason",
     ),
 }
 
