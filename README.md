@@ -38,6 +38,9 @@ python -m unittest discover -s tests -v
 | ---- | ---- | ---- |
 | POST | `/v1/wallets` | 建钱包 `{"wallet_id", "shares"`，`shares` 必须为 2 |
 | GET  | `/v1/wallets/{id}` | 返回 `public_key` 与 `created_at` |
+| POST | `/v1/wallets/{id}/freeze` | 应急冻结，请求体恰为 `{"reason":"..."}` |
+| POST | `/v1/wallets/{id}/unfreeze` | 解除冻结，请求体恰为 `{"reason":"..."}` |
+| GET  | `/v1/wallets/{id}/security-state` | 查询 `{"wallet_id","state","reason"}` |
 | PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
 | PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
@@ -87,6 +90,18 @@ python -m unittest discover -s tests -v
 ID（wallet/rotation/operation/asset/session/dkg/node 等）一律匹配
 `[A-Za-z0-9_-]{1,128}`，非法 `400`；钱包不存在 `404`；请求体须为
 JSON 对象。
+
+### 应急冻结
+
+- `reason` 必须是 1 到 1024 个字符的非空白字符串；请求体不是 JSON
+  对象、缺字段、夹带字段或 `reason` 非法均为 `400`，钱包不存在为 `404`。
+- 活跃钱包首次冻结、冻结钱包首次解冻均为 `201`；状态仅由
+  `wallet_frozen` 与 `wallet_unfrozen` 审计事件提交，重启和灾备恢复后
+  按审计事件折叠。
+- 对当前状态重放最近一次同类转换且 `reason` 相同返回 `200`；
+  `reason` 不同返回 `409`。未发生过冻结时直接解冻返回 `409`。
+- 钱包处于 `frozen` 时，除查询、审计读取、`security-state`、`freeze`
+  与 `unfreeze` 外，既有钱包写接口（含 DKG 路径）一律返回 `409`。
 
 ### 建钱包 / 查询 / 签名
 

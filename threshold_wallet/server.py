@@ -2,7 +2,10 @@
 
 路由：
 - POST /v1/wallets                                  建钱包
+- POST /v1/wallets/<wallet_id>/freeze              应急冻结钱包
+- POST /v1/wallets/<wallet_id>/unfreeze            解除应急冻结
 - GET  /v1/wallets/<wallet_id>                      查询钱包
+- GET  /v1/wallets/<wallet_id>/security-state      查询冻结状态
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
 - PUT  /v1/wallets/<wallet_id>/transaction-policy   设置冷热钱包交易策略
 - GET  /v1/wallets/<wallet_id>/transaction-policy   查询冷热钱包交易策略
@@ -252,6 +255,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200, service.get_sign_session(wallet_id, rest[1])
                     )
                     return
+                if rest == ["security-state"]:
+                    self._send_json(
+                        200, service.get_security_state(wallet_id)
+                    )
+                    return
                 if rest == ["audit-events"]:
                     # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
                     # JSON（非 ASCII 不转义、无末换行）；其余路由不变。
@@ -311,6 +319,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 dkg_failover = self._split_dkg_failover_path(path)
                 if dkg_failover is not None:
                     wallet_id, dkg_id = dkg_failover
+                    service.require_wallet_active(wallet_id)
                     body = self._read_json_body()
                     # 请求体为旧五键，或旧五键 + approval_request_id
                     # 六键（后者仅在 DKG 故障审批策略启用时合法，由
@@ -351,6 +360,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 dkg = self._split_dkg_path(path)
                 if dkg is not None:
                     wallet_id, dkg_id = dkg
+                    service.require_wallet_active(wallet_id)
                     body = self._read_json_body()
                     # 请求体仅允许 op/node/key/hash/peer 五键
                     if set(body) != {"op", "node", "key", "hash", "peer"}:
@@ -377,6 +387,22 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_error(404, "not found")
                     return
                 wallet_id, rest = matched
+
+                if rest in (["freeze"], ["unfreeze"]):
+                    body = self._read_json_body()
+                    if set(body) != {"reason"}:
+                        raise ServiceError(
+                            400, "body must contain exactly reason"
+                        )
+                    status, result = service.set_wallet_frozen(
+                        wallet_id,
+                        rest[0] == "freeze",
+                        body.get("reason"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                service.require_wallet_active(wallet_id)
 
                 if (
                     len(rest) == 3
@@ -871,6 +897,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 matched = self._split_wallet_path(path)
                 if matched is not None:
                     wallet_id, rest = matched
+                    service.require_wallet_active(wallet_id)
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(

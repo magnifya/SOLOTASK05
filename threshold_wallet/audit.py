@@ -105,6 +105,8 @@ TYPE_CHAIN_DISPATCH_ISOLATED = "chain_dispatch_isolated"
 #: 跨链适配器健康熔断表整体快照（details 即 Q={"adapters": {A: up|down}}；
 #: request_id/actor_id/reason 均为 null，取最后一条恢复）
 TYPE_CHAIN_ADAPTER_HEALTH = "chain_adapter_health"
+TYPE_WALLET_FROZEN = "wallet_frozen"
+TYPE_WALLET_UNFROZEN = "wallet_unfrozen"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {

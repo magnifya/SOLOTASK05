@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 
 from . import audit, crypto
@@ -145,20 +146,34 @@ class _WalletTransactionLock:
     释放文件锁，不会被陈旧锁阻塞。
     """
 
-    def __init__(self, thread_lock: threading.Lock, file_lock: FileLock) -> None:
+    def __init__(self, thread_lock: threading.RLock, file_lock: FileLock) -> None:
         self._thread_lock = thread_lock
         self._file_lock = file_lock
+        self._owner: int | None = None
+        self._depth = 0
 
     def __enter__(self) -> "_WalletTransactionLock":
+        ident = threading.get_ident()
+        if self._owner == ident:
+            self._depth += 1
+            return self
         self._thread_lock.acquire()
         try:
             self._file_lock.acquire()
         except BaseException:
             self._thread_lock.release()
             raise
+        self._owner = ident
+        self._depth = 1
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        if self._owner != threading.get_ident() or self._depth <= 0:
+            raise RuntimeError("wallet transaction lock released without ownership")
+        self._depth -= 1
+        if self._depth > 0:
+            return
+        self._owner = None
         try:
             self._file_lock.release()
         finally:
@@ -173,7 +188,7 @@ class WalletService:
         self._audit = AuditStore(store.data_dir)
         # 每钱包一把事务锁：串行化同一钱包的"状态变更 + 审计事件"，
         # ThreadingHTTPServer 并发下保证状态与事件原子、懒过期只记一次。
-        self._wallet_locks: dict[str, threading.Lock] = {}
+        self._wallet_locks: dict[str, _WalletTransactionLock] = {}
         self._wallet_locks_guard = threading.Lock()
         # 离线灾备命令（backup/restore）只操作单个钱包：它们传
         # recover=False 跳过全局启动恢复，自行在该钱包锁内调用
@@ -187,11 +202,14 @@ class WalletService:
             # 判定现场，对方已崩溃时 flock 自动释放、不会阻塞恢复。
             self._recover_on_startup()
 
-    def _thread_lock_for(self, wallet_id: str) -> threading.Lock:
+    def _transaction_lock_for(self, wallet_id: str) -> _WalletTransactionLock:
         with self._wallet_locks_guard:
             lock = self._wallet_locks.get(wallet_id)
             if lock is None:
-                lock = threading.Lock()
+                lock = _WalletTransactionLock(
+                    threading.RLock(),
+                    FileLock(wallet_lock_path(self._store.data_dir, wallet_id)),
+                )
                 self._wallet_locks[wallet_id] = lock
             return lock
 
@@ -200,10 +218,7 @@ class WalletService:
 
         wallet_id 含非法字符时抛 ValueError（与存储层一致）。
         """
-        return _WalletTransactionLock(
-            self._thread_lock_for(wallet_id),
-            FileLock(wallet_lock_path(self._store.data_dir, wallet_id)),
-        )
+        return self._transaction_lock_for(wallet_id)
 
     def _recover_on_startup(self) -> None:
         """启动恢复编排：逐个钱包在其跨进程事务锁内恢复轮换现场与未完成
@@ -377,6 +392,7 @@ class WalletService:
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
+            self._security_state_locked(wallet_id)
             # 先校验资产账本（形状 + 语义）：账本损坏时任何对账都不可信，
             # 直接 fail-closed。
             self._store.check_asset_ledger_semantics(wallet_id)
@@ -691,6 +707,142 @@ class WalletService:
             "public_key": record["public_key"],
             "created_at": record["created_at"],
         }
+
+    @staticmethod
+    def _validate_freeze_reason(reason: object) -> str:
+        if not isinstance(reason, str):
+            raise ServiceError(400, "reason must be a string")
+        if not reason or len(reason) > MAX_REASON_LENGTH or not reason.strip():
+            raise ServiceError(
+                400,
+                "reason must be 1 to 1024 non-whitespace characters",
+            )
+        return reason
+
+    def _security_state_locked(
+        self, wallet_id: str
+    ) -> tuple[str, Optional[str], dict[str, str]]:
+        """按冻结/解冻审计事件折叠安全状态；调用方须持钱包事务锁。"""
+        state = "active"
+        reason: Optional[str] = None
+        latest_reasons: dict[str, str] = {}
+        for event in self._audit.all_events(wallet_id):
+            event_type = event.get("type")
+            if event_type not in (
+                audit.TYPE_WALLET_FROZEN,
+                audit.TYPE_WALLET_UNFROZEN,
+            ):
+                continue
+            details = event.get("details")
+            if (
+                not isinstance(details, dict)
+                or set(details) != {"reason"}
+                or not isinstance(details.get("reason"), str)
+                or not details["reason"]
+                or len(details["reason"]) > MAX_REASON_LENGTH
+                or not details["reason"].strip()
+                or event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise CorruptDataError(
+                    f"audit log for wallet {wallet_id!r} has a malformed "
+                    "wallet security event"
+                )
+            event_reason = details["reason"]
+            if event_type == audit.TYPE_WALLET_FROZEN:
+                if state != "active":
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has consecutive frozen events"
+                    )
+                state = "frozen"
+            else:
+                if state != "frozen":
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} has an unfrozen event without "
+                        "a preceding frozen event"
+                    )
+                state = "active"
+            reason = event_reason
+            latest_reasons[event_type] = event_reason
+        return state, reason if state == "frozen" else None, latest_reasons
+
+    def _require_wallet_active_locked(self, wallet_id: str) -> None:
+        state, _, _ = self._security_state_locked(wallet_id)
+        if state == "frozen":
+            raise ServiceError(409, f"wallet {wallet_id!r} is frozen")
+
+    def get_security_state(self, wallet_id: str) -> dict:
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                state, reason, _ = self._security_state_locked(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return {"wallet_id": wallet_id, "state": state, "reason": reason}
+
+    def require_wallet_active(self, wallet_id: str) -> None:
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                self._require_wallet_active_locked(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    def set_wallet_frozen(
+        self, wallet_id: str, frozen: bool, reason: object
+    ) -> tuple[int, dict]:
+        reason_text = self._validate_freeze_reason(reason)
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                state, _, latest_reasons = self._security_state_locked(wallet_id)
+                desired_state = "frozen" if frozen else "active"
+                event_type = (
+                    audit.TYPE_WALLET_FROZEN
+                    if frozen
+                    else audit.TYPE_WALLET_UNFROZEN
+                )
+                if state == desired_state:
+                    previous_reason = latest_reasons.get(event_type)
+                    if previous_reason is None:
+                        raise ServiceError(
+                            409, f"wallet {wallet_id!r} is not frozen"
+                        )
+                    if previous_reason != reason_text:
+                        raise ServiceError(
+                            409,
+                            "reason does not match the latest security "
+                            "transition",
+                        )
+                    status = 200
+                else:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            event_type,
+                            details={"reason": reason_text},
+                        ),
+                    )
+                    status = 201
+                state, current_reason, _ = self._security_state_locked(wallet_id)
+                body = {
+                    "wallet_id": wallet_id,
+                    "state": state,
+                    "reason": current_reason,
+                }
+                return status, body
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
 
     def share_sign(
         self,
@@ -13103,3 +13255,70 @@ class WalletService:
         except ValueError:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
+
+
+_FROZEN_GUARDED_METHODS = frozenset(
+    (
+        "sign",
+        "put_policy",
+        "put_transaction_policy",
+        "put_dkg_failover_policy",
+        "put_dkg_nodes",
+        "post_node_rejoin",
+        "post_share_bind",
+        "create_sign_request",
+        "approve",
+        "reject",
+        "create_share_rotation",
+        "activate_share_rotation",
+        "create_asset_operation",
+        "commit_asset_operation",
+        "put_chain_policy",
+        "put_chain_arbitration",
+        "put_chain_adapters",
+        "post_chain_report",
+        "observe",
+        "post_chain_dispatch",
+        "post_chain_dispatch_auto",
+        "post_chain_dispatch_result",
+        "post_chain_dispatch_confirmation",
+        "settle_chain_dispatch",
+        "post_chain_dispatch_takeover",
+        "post_chain_dispatch_isolate",
+        "create_sign_session",
+        "submit_sign_session_share",
+        "replace_sign_session_participant",
+        "takeover_sign_session_participant",
+        "post_dkg_stage",
+        "post_dkg_failover",
+    )
+)
+
+
+def _guard_frozen_writes(method):
+    @wraps(method)
+    def guarded(self, wallet_id, *args, **kwargs):
+        try:
+            transaction_lock = self._wallet_lock(wallet_id)
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        with transaction_lock:
+            self._heal_wallet(wallet_id)
+            self._get_wallet_or_404(wallet_id)
+            self._require_wallet_active_locked(wallet_id)
+            return method(self, wallet_id, *args, **kwargs)
+
+    guarded._frozen_guarded = True
+    return guarded
+
+
+for _method_name in _FROZEN_GUARDED_METHODS:
+    _method = getattr(WalletService, _method_name, None)
+    if _method is not None and not getattr(
+        _method, "_frozen_guarded", False
+    ):
+        setattr(
+            WalletService,
+            _method_name,
+            _guard_frozen_writes(_method),
+        )
