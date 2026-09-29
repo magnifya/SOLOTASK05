@@ -383,6 +383,12 @@ class WalletService:
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
+            # 旧审计可能缺防篡改摘要链：在启动读取边界持锁按事件顺序
+            # 补算并持久化 chain 元数据（只新增链对象，绝不改写事件正文、
+            # 不新增审计事件、不改 seq）。chain 已存在但与事件不匹配在
+            # check_log 阶段即 RecoveryError（serve 拒绝就绪/HTTP 503），
+            # 补算写盘 I/O 失败按 OSError 原样上抛。
+            self._audit.backfill_chain(wallet_id)
             # 钱包应急冻结/解冻事件（wallet_frozen/wallet_unfrozen）：
             # 状态只由这两类事件折叠，逐事件严格校验 details 与交替状态
             # 机；畸形/同态连续 fail-closed，恢复不新增事件、不改 seq。
@@ -399,6 +405,10 @@ class WalletService:
             # 意图清零后再做账本 ↔ asset_operation_committed 事件的双向
             # 对账：提交事件与 committed 操作必须一一对应、details 即 R。
             self._reconcile_asset_committed_events(wallet_id)
+            # 账本 cancelled 操作 ↔ asset_operation_cancelled 事件同样
+            # 双向对账：撤销事件是撤销的唯一提交点，与 cancelled 操作
+            # 一一对应、details 即 cancelled 视图。
+            self._reconcile_asset_cancelled_events(wallet_id)
             # 链确认事件（chain_policy/chain_report）与提交门控对账：
             # 报告状态机逐事件重放，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_events(wallet_id)
@@ -3323,6 +3333,40 @@ class WalletService:
         if not isinstance(delta, int) or isinstance(delta, bool) or delta == 0:
             raise ServiceError(400, "delta must be a non-zero integer")
 
+    @staticmethod
+    def _validate_cancel_id(cancel_id: object) -> None:
+        if not isinstance(cancel_id, str) or not ROTATION_ID_RE.match(
+            cancel_id
+        ):
+            raise ServiceError(
+                400, "cancel_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    @staticmethod
+    def _validate_approval_request_id_ref(approval_request_id: object) -> None:
+        if not isinstance(
+            approval_request_id, str
+        ) or not ROTATION_ID_RE.match(approval_request_id):
+            raise ServiceError(
+                400,
+                "approval_request_id must match [A-Za-z0-9_-]{1,128}",
+            )
+
+    @staticmethod
+    def _cancel_approval_message(
+        operation_id: str, cancel_id: str
+    ) -> str:
+        """撤销审批单 message 必须逐字一致的紧凑 JSON（无空格、键序固定
+        为 operation_id,cancel_id）。"""
+        return json.dumps(
+            {
+                "operation_id": operation_id,
+                "cancel_id": cancel_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     def create_asset_operation(
         self,
         wallet_id: str,
@@ -3424,6 +3468,19 @@ class WalletService:
         RecoveryError，由调用方阻止就绪/返回 503，绝不静默跳过。
         """
         for operation_id, intent in self._store.list_asset_intents(wallet_id):
+            # 撤销意图与提交意图共用 asset-intents 目录（同操作在锁内
+            # 互斥，崩溃至多残留其一）：按 kind 分派，未知 kind 是无法
+            # 识别的事务现场，fail-closed 绝不按任一已知事务猜测对账。
+            if isinstance(intent, dict) and intent.get("kind") == "cancel":
+                self._resolve_asset_cancel_intent(
+                    wallet_id, operation_id, intent
+                )
+                continue
+            if isinstance(intent, dict) and "kind" in intent:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset operation {operation_id!r} "
+                    "intent has an unknown kind and cannot be reconciled"
+                )
             self._resolve_asset_commit_intent(wallet_id, operation_id, intent)
 
     def _reconcile_asset_committed_events(self, wallet_id: str) -> None:
@@ -3511,6 +3568,150 @@ class WalletService:
                 f"wallet {wallet_id!r} committed operations {missing!r} have "
                 "no committed event"
             )
+
+    def _reconcile_asset_cancelled_events(self, wallet_id: str) -> None:
+        """账本 cancelled 操作与 asset_operation_cancelled 事件双向对账
+        （调用方须持钱包事务锁；意图残留须已先恢复清零）。
+
+        asset_operation_cancelled 是撤销的唯一提交点：
+
+        - 每条 cancelled 操作必须恰有一条 details 与其视图逐字段一致的
+          事件；事件 request_id 为 cancel_id、actor_id 为
+          approval_request_id（均为非空字符串）；
+        - 每条撤销事件必须对应一条账本 cancelled 操作
+          （有事件无操作＝半应用/历史被删，fail-closed）；
+        - pending/committed 操作不得有撤销事件；
+        - 同一 cancel_id（request_id）出现多条＝重复提交点，fail-closed。
+        """
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        cancelled_ops: dict[str, dict] = {
+            op_id: record
+            for op_id, record in ledger["operations"].items()
+            if record["state"] == "cancelled"
+        }
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_ASSET_OPERATION_CANCELLED
+        )
+        events_by_cancel: dict[str, dict] = {}
+        cancelled_events_by_op: dict[str, dict] = {}
+        for event in events:
+            cancel_id = event.get("request_id")
+            approval_id = event.get("actor_id")
+            details = event.get("details")
+            if not isinstance(cancel_id, str) or not isinstance(
+                approval_id, str
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an asset_operation_"
+                    "cancelled event without cancel/approval identifiers"
+                )
+            if cancel_id in events_by_cancel:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple cancelled events for "
+                    f"cancel_id {cancel_id!r}"
+                )
+            if (
+                not isinstance(details, dict)
+                or details.get("state") != "cancelled"
+                or not isinstance(details.get("operation_id"), str)
+                or not isinstance(details.get("asset_id"), str)
+                or not isinstance(details.get("delta"), int)
+                or isinstance(details.get("delta"), bool)
+                or details.get("delta") == 0
+                or not isinstance(details.get("balance"), int)
+                or isinstance(details.get("balance"), bool)
+                or not isinstance(details.get("version"), int)
+                or isinstance(details.get("version"), bool)
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} cancelled event for "
+                    f"{cancel_id!r} is malformed"
+                )
+            op_id = details["operation_id"]
+            record = ledger["operations"].get(op_id)
+            if record is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a cancelled event for "
+                    f"{op_id!r} but no such ledger operation"
+                )
+            if record["state"] != "cancelled":
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset operation {op_id!r} is "
+                    f"{record['state']} but has a cancelled event"
+                )
+            if details != record:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} cancelled event for {op_id!r} "
+                    "does not match the ledger record"
+                )
+            if op_id in cancelled_events_by_op:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple cancelled events "
+                    f"for asset operation {op_id!r}"
+                )
+            cancelled_events_by_op[op_id] = event
+            events_by_cancel[cancel_id] = event
+        if set(cancelled_events_by_op) != set(cancelled_ops):
+            missing = sorted(
+                set(cancelled_ops) - set(cancelled_events_by_op)
+            )
+            raise RecoveryError(
+                f"wallet {wallet_id!r} cancelled operations {missing!r} "
+                "have no cancelled event"
+            )
+
+    def _resolve_asset_cancel_intent(
+        self, wallet_id: str, operation_id: str, intent: object
+    ) -> None:
+        """对账单条撤销意图：事件在则前滚为 cancelled，否则回滚为
+        pending。调用方须持钱包事务锁。恢复本身不记任何审计事件。"""
+        if not self._store.valid_asset_cancel_intent(operation_id, intent):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset operation {operation_id!r} "
+                "cancel intent is missing or malformed and cannot be "
+                "reconciled"
+            )
+        cancel_id = intent["cancel_id"]
+        approval_request_id = intent["approval_request_id"]
+        pending = intent["pending"]
+        asset_id = intent["asset_id"]
+        old_asset = intent["old_asset"]
+        cancelled_record = dict(pending)
+        cancelled_record["state"] = "cancelled"
+        event = self._audit.find_event_by_request(
+            wallet_id,
+            audit.TYPE_ASSET_OPERATION_CANCELLED,
+            cancel_id,
+        )
+        if event is not None:
+            # 唯一提交点已落盘：严格核对事件就是本意图的撤销事件
+            # （同 cancel_id、同审批单、details 即 cancelled 视图），再
+            # 按事件绝对补齐账本，绝不重复记事件。
+            if (
+                event.get("actor_id") != approval_request_id
+                or event.get("details") != cancelled_record
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset operation "
+                    f"{operation_id!r} cancel intent does not match its "
+                    "cancelled event"
+                )
+            self._store.cancel_asset_operation(
+                wallet_id, operation_id, cancelled_record
+            )
+            self._store.delete_asset_cancel_intent(wallet_id, operation_id)
+            return
+        # 事件未持久化：撤销未生效，凭意图快照把操作恢复为 pending、
+        # 资产原样还原（撤销从不改 balance/version）。事件从未分配 seq，
+        # 故事件与 seq 均无缺口，可重新撤销/提交。
+        self._store.restore_asset_operation(
+            wallet_id,
+            operation_id,
+            pending,
+            asset_id,
+            old_asset if isinstance(old_asset, dict) else None,
+        )
+        self._store.delete_asset_cancel_intent(wallet_id, operation_id)
 
     def _resolve_asset_commit_intent(
         self, wallet_id: str, operation_id: str, intent: object
@@ -4107,6 +4308,226 @@ class WalletService:
                 wallet_id, operation_id, record
             )
         return 201, committed_record
+
+    def cancel_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: object,
+        cancel_id: object,
+        approval_request_id: object,
+    ) -> tuple[int, dict]:
+        """撤销一条 pending 的资产操作（可恢复事务）。
+
+        撤销复用同钱包审批单：approval_request_id 必须指向一条 approved
+        审批单，其 message 必须逐字等于按 operation_id,cancel_id 排列的
+        紧凑 JSON。成功只把操作转为 cancelled（balance/version 不变、
+        未落账不创建资产条目），并在同一钱包跨进程事务锁内追加唯一的
+        asset_operation_cancelled 事件（request_id=cancel_id、
+        actor_id=approval_request_id、details 为 cancelled 操作视图）。
+
+        首次成功 201；同 cancel_id、同操作、同审批参数的重放优先 200。
+        同 cancel_id 异参、撤销 committed/cancelled 操作、同一操作已有
+        其他 cancel_id、或与 commit 并发落败均 409 且账本/version/审计
+        不变。请求体/ID 非法 400；钱包、操作或审批单不存在 404；审批单
+        非 approved、过期或 message 异文 409。冻结钱包沿用 409 闸门。
+        """
+        try:
+            return self._cancel_asset_operation_tx(
+                wallet_id, operation_id, cancel_id, approval_request_id
+            )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _cancel_asset_operation_tx(
+        self,
+        wallet_id: str,
+        operation_id: object,
+        cancel_id: object,
+        approval_request_id: object,
+    ) -> tuple[int, dict]:
+        with self._wallet_lock(wallet_id):
+            # 与提交共用同一把钱包事务锁：取消与提交在锁内竞争，落败方
+            # 基于已收敛账本只能看到 committed/cancelled 终态，得 409。
+            self._heal_wallet(wallet_id)
+            # 404 优先于 400；冻结闸门先于一切业务/幂等判定（冻结期即便
+            # 命中重放也一律 409）。
+            self._get_wallet_or_404(wallet_id)
+            self._assert_wallet_active_locked(wallet_id)
+            self._validate_operation_id(operation_id)
+            self._validate_cancel_id(cancel_id)
+            self._validate_approval_request_id_ref(approval_request_id)
+
+            record = self._store.get_asset_operation(wallet_id, operation_id)
+            if record is None:
+                raise ServiceError(
+                    404, f"asset operation {operation_id!r} not found"
+                )
+            approval = self._store.get_request(
+                wallet_id, approval_request_id
+            )
+            if approval is None:
+                raise ServiceError(
+                    404,
+                    f"approval request {approval_request_id!r} not found",
+                )
+
+            # 失败不写意图、账本或事件：过期判定只读，不在这里懒落
+            # request_expired（与"撤销失败零副作用"契约一致）。
+            approval_state = approval.get("state")
+            if (
+                approval_state == "pending"
+                and datetime.now(timezone.utc)
+                >= _parse_iso(approval["t1"])
+            ):
+                approval_state = "expired"
+            expected_message = self._cancel_approval_message(
+                operation_id, cancel_id
+            )
+            if approval.get("message") != expected_message:
+                raise ServiceError(
+                    409,
+                    "approval request message does not match this cancel",
+                )
+            if approval_state != "approved":
+                raise ServiceError(
+                    409,
+                    f"approval request {approval_request_id!r} is "
+                    f"{approval_state}, not approved",
+                )
+
+            cancel_events = {
+                event.get("request_id"): event
+                for event in self._audit.events_by_type(
+                    wallet_id, audit.TYPE_ASSET_OPERATION_CANCELLED
+                )
+            }
+            prior_for_cancel = cancel_events.get(cancel_id)
+            if record["state"] == "cancelled":
+                # 幂等重放要求同 cancel_id、同操作、同审批参数；该操作
+                # 已由其他 cancel_id 撤销，或本 cancel_id 属于他操作/他
+                # 审批单，均为 409。
+                op_event = next(
+                    (
+                        event
+                        for event in cancel_events.values()
+                        if event["details"]["operation_id"] == operation_id
+                    ),
+                    None,
+                )
+                if (
+                    op_event is not None
+                    and op_event.get("request_id") == cancel_id
+                    and op_event.get("actor_id") == approval_request_id
+                    and prior_for_cancel is op_event
+                ):
+                    return 200, record
+                raise ServiceError(
+                    409,
+                    f"asset operation {operation_id!r} is already cancelled",
+                )
+            if record["state"] == "committed":
+                # 与提交并发落败或撤销已落账操作：409 且零副作用
+                raise ServiceError(
+                    409,
+                    f"asset operation {operation_id!r} is committed and "
+                    "cannot be cancelled",
+                )
+            if prior_for_cancel is not None:
+                # cancel_id 已用于他操作（或他参数）：异参重放 409
+                raise ServiceError(
+                    409,
+                    f"cancel_id {cancel_id!r} was already used with "
+                    "different parameters",
+                )
+            cancelled_record = self._cancel_asset_operation_locked(
+                wallet_id,
+                operation_id,
+                record,
+                cancel_id,
+                approval_request_id,
+            )
+        return 201, cancelled_record
+
+    def _cancel_asset_operation_locked(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        record: dict,
+        cancel_id: str,
+        approval_request_id: str,
+    ) -> dict:
+        """在每钱包事务锁内撤销一条 pending 操作，返回 cancelled 视图。
+
+        调用方须已持锁、已 heal、已判定 record 为 pending 且审批门控通过。
+        事务顺序：
+
+            1. 写撤销意图（记录 pending 快照与资产快照 old_asset）
+            2. 原子置操作状态为 cancelled（balance/version/资产条目不动）
+            3. 追加唯一的 asset_operation_cancelled 事件（唯一提交点）
+            4. 删除撤销意图
+
+        崩溃恢复以事件是否落盘为准：事件在前滚为 cancelled，事件不在
+        回滚为 pending，账本余额/version 始终不变。
+        """
+        asset_id = record["asset_id"]
+        asset = self._store.get_asset(wallet_id, asset_id)
+        cancelled_record = dict(record)
+        cancelled_record["state"] = "cancelled"
+        intent = {
+            "kind": "cancel",
+            "operation_id": operation_id,
+            "asset_id": asset_id,
+            "cancel_id": cancel_id,
+            "approval_request_id": approval_request_id,
+            "pending": record,
+            "old_asset": asset,
+        }
+        try:
+            self._store.write_asset_cancel_intent(
+                wallet_id, operation_id, intent
+            )
+            self._store.cancel_asset_operation(
+                wallet_id, operation_id, cancelled_record
+            )
+            self._emit(
+                wallet_id,
+                self._audit_event(
+                    audit.TYPE_ASSET_OPERATION_CANCELLED,
+                    request_id=cancel_id,
+                    actor_id=approval_request_id,
+                    details=cancelled_record,
+                ),
+            )
+        except BaseException:
+            # 与提交同构：事件真正落盘（如落盘成功但返回阶段报错）则
+            # 前滚为唯一 cancelled，绝不重复记事件；否则回滚 pending。
+            landed = self._audit.find_event_by_request(
+                wallet_id,
+                audit.TYPE_ASSET_OPERATION_CANCELLED,
+                cancel_id,
+            )
+            if (
+                landed is not None
+                and landed.get("actor_id") == approval_request_id
+                and landed.get("details") == cancelled_record
+            ):
+                self._store.cancel_asset_operation(
+                    wallet_id, operation_id, cancelled_record
+                )
+                self._store.delete_asset_cancel_intent(
+                    wallet_id, operation_id
+                )
+                return cancelled_record
+            self._store.restore_asset_operation(
+                wallet_id, operation_id, record, asset_id, asset
+            )
+            self._store.delete_asset_cancel_intent(wallet_id, operation_id)
+            raise
+        self._store.delete_asset_cancel_intent(wallet_id, operation_id)
+        return cancelled_record
 
     def _commit_asset_operation_locked(
         self,

@@ -648,6 +648,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "share_rotation_prepared",
         "share_rotation_activated",
         "asset_operation_committed",
+        "asset_operation_cancelled",
         "transaction_policy_updated",
         "session_event",
         "session_participant_replaced",

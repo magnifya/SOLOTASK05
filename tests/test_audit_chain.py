@@ -248,7 +248,7 @@ class AuditIntegrityHttpTest(unittest.TestCase):
             )
             self.assertEqual(status, 503, body)
 
-    def test_missing_chain_metadata_returns_503(self):
+    def test_missing_chain_metadata_is_backfilled_on_startup(self):
         with http_server(self.tmp) as srv:
             self._wallet_with_event(srv)
         log = _load_audit(self.tmp)
@@ -258,7 +258,14 @@ class AuditIntegrityHttpTest(unittest.TestCase):
             status, body = srv.request(
                 "GET", "/v1/wallets/w1/audit-integrity", None
             )
-            self.assertEqual(status, 503, body)
+            # 启动读取边界持锁按事件顺序补链：恢复不新增审计事件，
+            # seq/事件正文不变，完整性随即转为 valid。
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["state"], "valid")
+            self.assertEqual(body["count"], 1)
+        restored = _load_audit(self.tmp)
+        self.assertEqual(restored["chain"]["count"], 1)
+        self.assertEqual(len(restored["events"]), 1)
 
 
 class AuditChainBackupRestoreTest(unittest.TestCase):

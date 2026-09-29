@@ -247,8 +247,8 @@ def dispatch_reorg_confirmation_shape_ok(
 
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
-    delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
-    balance/version 快照，若存在则同样必须为非布尔整数。"""
+    delta、state 只能为 pending/committed/cancelled；服务正常写入还带
+    非布尔整数 balance/version 快照，若存在则同样必须为非布尔整数。"""
     if not isinstance(record, dict):
         return False
     operation_id = record.get("operation_id")
@@ -259,7 +259,7 @@ def _asset_operation_shape_ok(key: str, record: object) -> bool:
         return False
     if not _is_plain_int(record.get("delta")) or record.get("delta") == 0:
         return False
-    if record.get("state") not in ("pending", "committed"):
+    if record.get("state") not in ("pending", "committed", "cancelled"):
         return False
     for optional_int in ("balance", "version"):
         if optional_int in record and not _is_plain_int(
@@ -826,7 +826,8 @@ class WalletStore:
         （ValueError 子类），绝不把文件静默归一为空账本：
         JSON 不可解析、顶层不是对象、缺少 operations/assets、二者类型
         不是对象、操作条目字段形状非法（operation_id/asset_id 合法、
-        delta/balance/version 为非布尔整数、state 仅 pending/committed）、
+        delta/balance/version 为非布尔整数、state 仅
+        pending/committed/cancelled）、
         资产条目 balance/version 不是非布尔整数。
         """
         path = self._assets_path(wallet_id)
@@ -886,9 +887,11 @@ class WalletStore:
           delta 逐条累加，每个前缀余额都必须非负、与记录快照一致；
         - K>=1 时资产条目必须恰为 {balance: 末态, version: K}；
           K=0（只有/没有 pending）时不得存在资产条目；
-        - pending 操作的 (balance, version) 快照必须等于该资产某条已提交
-          前缀（version 在 0..K 内且余额与重算前缀一致）——快照是创建
-          时刻的账本状态，提交交错时它可能落后于当前末态。
+        - pending/cancelled 操作的 (balance, version) 快照必须等于该资产
+          某条已提交前缀（version 在 0..K 内且余额与重算前缀一致）
+          ——快照是创建时刻的账本状态，提交交错时它可能落后于当前末态；
+          cancelled 操作从未落账，余额/version 不变，快照语义与 pending
+          相同。
 
         任一矛盾抛 CorruptDataError（fail-closed，保留现场），绝不带
         矛盾账本继续创建/提交/查询。返回校验后的账本供上层与审计对账。
@@ -915,6 +918,8 @@ class WalletStore:
             if record["state"] == "committed":
                 committed_by_asset.setdefault(asset_id, []).append(record)
             else:
+                # pending 与 cancelled 都从未落账：不占 version、不改余额，
+                # 二者快照都必须落在某条已提交前缀上。
                 pending_by_asset.setdefault(asset_id, []).append(record)
 
         for asset_id, entry in assets.items():
@@ -1082,6 +1087,22 @@ class WalletStore:
                 ledger["assets"][asset_id] = asset_record
             self._atomic_write(path, ledger)
 
+    def cancel_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        operation_record: dict,
+    ) -> None:
+        """原子地把一条资产操作置为 cancelled：只替换操作记录，绝不改
+        资产 balance/version（撤销从未落账，也不创建/删除资产条目）。
+        调用方须持有该钱包事务锁。"""
+        _check_id("operation_id", operation_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger["operations"][operation_id] = operation_record
+            self._atomic_write(path, ledger)
+
     def remove_asset_operation(
         self,
         wallet_id: str,
@@ -1141,6 +1162,30 @@ class WalletStore:
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+    def write_asset_cancel_intent(
+        self, wallet_id: str, operation_id: str, intent: dict
+    ) -> None:
+        """原子写入一条资产撤销意图（cancel 事务第一步）。
+
+        与提交意图同目录（asset-intents/<wallet>/<operation_id>.json）：
+        同一操作的撤销与提交在每钱包事务锁内互斥，崩溃至多残留其一，
+        故按 operation_id 命名不会冲突。意图以 ``"kind": "cancel"`` 与
+        提交意图区分，只含标识与整数，不含任何私钥材料。
+        """
+        self.write_asset_commit_intent(wallet_id, operation_id, intent)
+
+    def get_asset_cancel_intent(
+        self, wallet_id: str, operation_id: str
+    ) -> Optional[dict]:
+        """返回某操作的撤销意图，不存在返回 None。"""
+        return self.get_asset_commit_intent(wallet_id, operation_id)
+
+    def delete_asset_cancel_intent(
+        self, wallet_id: str, operation_id: str
+    ) -> None:
+        """删除撤销意图（cancel 事务完成/中止的最后一步）。"""
+        self.delete_asset_commit_intent(wallet_id, operation_id)
 
     def list_asset_intent_wallet_ids(self) -> list[str]:
         """返回存在提交意图目录的全部 wallet_id。"""
@@ -1246,6 +1291,46 @@ class WalletStore:
         return (
             new_balance == old_balance + delta
             and new_version == old_version + 1
+        )
+
+    @staticmethod
+    def valid_asset_cancel_intent(operation_id: str, intent: object) -> bool:
+        """校验撤销意图是否具备安全回滚/前滚所需的全部标识与快照。
+
+        正常撤销写入的意图含 kind="cancel"、operation_id/asset_id、
+        cancel_id/approval_request_id（均为安全标识）、pending 操作记录
+        （state 必为 pending、标识/delta/快照一致）与 old_asset
+        （None 或 {balance,version}）。撤销从不改余额/version，故
+        old_asset 仅用于崩溃回滚时原样还原资产条目。任一缺失、类型
+        错误、布尔冒整或标识不匹配都判定无效：调用方必须 fail-closed
+        （保留意图现场，不回滚/前滚/清理）。
+        """
+        if not isinstance(intent, dict):
+            return False
+        if intent.get("kind") != "cancel":
+            return False
+        if intent.get("operation_id") != operation_id:
+            return False
+        asset_id = intent.get("asset_id")
+        if not _valid_safe_id(asset_id):
+            return False
+        if not _valid_safe_id(intent.get("cancel_id")):
+            return False
+        if not _valid_safe_id(intent.get("approval_request_id")):
+            return False
+        old_asset = intent.get("old_asset")
+        if old_asset is not None and not _asset_entry_shape_ok(old_asset):
+            return False
+        pending = intent.get("pending")
+        if not _asset_operation_shape_ok(operation_id, pending):
+            return False
+        if not _is_plain_int(pending.get("balance")) or not (
+            _is_plain_int(pending.get("version"))
+        ):
+            return False
+        return (
+            pending["state"] == "pending"
+            and pending["asset_id"] == asset_id
         )
 
     def list_asset_intents(self, wallet_id: str) -> list[tuple[str, Optional[dict]]]:

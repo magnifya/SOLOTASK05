@@ -64,6 +64,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/share-bind` | 绑定 DKG 复职节点到轮换份额槽位 `{"id","rotation","dkg","round","node","slot","approval"}` |
 | POST | `/v1/wallets/{id}/asset-operations` | 建资产操作 `{"operation_id","asset_id","delta"}` |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
+| POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version` |
 | PUT  | `/v1/wallets/{id}/chain/{asset_id}` | 跨链确认策略 `{"chain_id","enabled","required_confirmations","reorg_window"}` |
 | GET  | `/v1/wallets/{id}/chain/{asset_id}` | 查询跨链确认策略（未配置 404） |
@@ -554,8 +555,8 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 
 ### 资产账本
 
-每钱包一本账（`assets/<id>.json`），操作状态机 `pending|committed`，
-原子写入，只含标识与整数。
+每钱包一本账（`assets/<id>.json`），操作状态机
+`pending|committed|cancelled`，原子写入，只含标识与整数。
 
 - `POST asset-operations`：两个 ID 为安全标识，`delta` 为非布尔非零
   整数；非法 `400`，钱包不存在 `404`。首建 `201` 返回
@@ -566,13 +567,32 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   （状态不变、可重试）；成功原子改余额、`version+1`、转 committed，
   `201` 返回 R。并发恰一个 `201`，其余幂等 `200`；committed 重放
   `200` 同体不重复改账。操作不存在 `404`。
+- `POST cancel`：请求体恰为 `{"cancel_id","approval_request_id"}`，
+  两个标识沿用安全标识；请求体/ID 非法 `400`，钱包/操作/审批单不存在
+  `404`。仅撤销 pending 操作：成功后转 cancelled，余额与 version 不变、
+  未落账前不创建资产条目，`201` 返回既有操作视图（state=cancelled）。
+  撤销复用同钱包审批：审批单必须 `approved`，message 必须逐字等于按
+  `operation_id,cancel_id` 排列的紧凑 JSON
+  （`{"operation_id":"...","cancel_id":"..."}`）；审批单非 approved、
+  过期或 message 异文 `409`。同 cancel_id、同操作、同审批参数重放优先
+  `200`；同 cancel_id 异参、撤销 committed/cancelled 操作、同一操作已有
+  其他 cancel_id、或与 commit 在同钱包事务锁内并发落败均 `409` 且账本、
+  version、审计不变（失败不写意图，也不懒落过期事件）。冻结钱包撤销
+  沿用 `409` 闸门。
+- 撤销事务可恢复（意图与提交意图共用 `asset-intents/`，以
+  `kind:"cancel"` 区分）：唯一提交点是审计事件
+  `asset_operation_cancelled`（`request_id` 为 cancel_id、`actor_id` 为
+  approval_request_id、details 为 cancelled 操作视图，仅首次撤销记
+  一次）；崩溃按事件是否落盘前滚为 cancelled 或回滚为 pending，
+  恢复不新增审计。
 - `GET assets/{asset_id}`：返回 `{asset_id,balance,version}`；资产无
   已提交操作 `404`。
 - 重启后 pending/committed 与幂等保持，version 单调不回退、不重号。
   账本或提交意图损坏/矛盾时 fail-closed（常驻 `503`、阻止就绪），绝不
   归一为空或覆盖删除。
 - 审计事件 `asset_operation_committed`（details 即 committed 视图 R，
-  仅首次提交记一次）与 `transaction_policy_updated`。
+  仅首次提交记一次）、`asset_operation_cancelled` 与
+  `transaction_policy_updated`。
 
 ### 跨链资产确认（可选）
 
@@ -1111,6 +1131,8 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
 `policy_updated`、`request_created/approved/rejected/expired/signed`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
+`asset_operation_cancelled`（`request_id` 为 cancel_id、`actor_id` 为
+approval_request_id、details 即 cancelled 操作视图）、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
@@ -1130,9 +1152,11 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 字段（含 `details`）按审计读取归一化后的形态取键升序编码为 UTF-8 紧凑
 JSON（无空白、非 ASCII 不转义），先算事件 SHA-256（64 位小写十六进制），
 再以"前序摘要文本 + 事件摘要文本"计算下一个链头。旧记录缺链时按事件
-顺序补算（追加/出包迁移点），不改写事件正文；链元数据缺失（文件存在
-却无 `chain`）或不匹配、事件被改动、seq 不连续、details 形状矛盾一律
-fail-closed（`503`、serve 拒绝就绪、保留现场不覆盖）。
+顺序补算（启动读取边界、事件追加与出包迁移点），不改写事件正文；
+启动恢复对缺链审计持锁补算并持久化后才对外服务（恢复不新增审计事件、
+seq 与事件正文不变）。链元数据存在却不匹配、事件被改动、seq 不连续、
+details 形状矛盾一律 fail-closed（`503`、serve 拒绝就绪、保留现场
+不覆盖）。
 
 `GET /v1/wallets/{id}/audit-integrity` 只接受 GET（其他方法 `405`），
 成功返回 `{"wallet_id","state","count","head"}`，`state` 恒为 `valid`，

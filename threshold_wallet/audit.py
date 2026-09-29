@@ -145,6 +145,9 @@ TYPE_REQUEST_SIGNED = "request_signed"
 TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
+#: 撤销未落账的 pending 资产操作（唯一提交点；request_id 为 cancel_id、
+#: actor_id 为 approval_request_id，details 即 cancelled 操作视图）
+TYPE_ASSET_OPERATION_CANCELLED = "asset_operation_cancelled"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
