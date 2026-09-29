@@ -27,6 +27,7 @@
 - POST /v1/wallets/<wallet_id>/share-rotations/<id>/activate  激活轮换
 - POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
+- POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
 - PUT  /v1/wallets/<wallet_id>/chain/<asset_id>            设置跨链确认策略
 - GET  /v1/wallets/<wallet_id>/chain/<asset_id>            查询跨链确认策略
@@ -629,6 +630,31 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 ):
                     status, result = service.commit_asset_operation(
                         wallet_id, rest[1]
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "asset-operations"
+                    and rest[2] == "cancel"
+                ):
+                    body = self._read_json_body()
+                    # 请求体仅允许 cancel_id/approval_request_id 两键
+                    if set(body) != {
+                        "cancel_id",
+                        "approval_request_id",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly cancel_id and "
+                            "approval_request_id",
+                        )
+                    status, result = service.cancel_asset_operation(
+                        wallet_id,
+                        rest[1],
+                        body.get("cancel_id"),
+                        body.get("approval_request_id"),
                     )
                     self._send_json(status, result)
                     return

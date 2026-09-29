@@ -248,17 +248,35 @@ class AuditIntegrityHttpTest(unittest.TestCase):
             )
             self.assertEqual(status, 503, body)
 
-    def test_missing_chain_metadata_returns_503(self):
+    def test_legacy_missing_chain_is_backfilled_at_startup(self):
         with http_server(self.tmp) as srv:
             self._wallet_with_event(srv)
         log = _load_audit(self.tmp)
+        expected_head = log["chain"]["head"]
         del log["chain"]
         _dump_audit(self.tmp, log)
         with http_server(self.tmp) as srv:
             status, body = srv.request(
                 "GET", "/v1/wallets/w1/audit-integrity", None
             )
-            self.assertEqual(status, 503, body)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["state"], "valid")
+            self.assertEqual(body["head"], expected_head)
+        # 启动补链只新增 chain 对象：事件正文、seq 与事件数不变
+        migrated = _load_audit(self.tmp)
+        self.assertEqual(migrated["chain"]["head"], expected_head)
+        self.assertEqual(migrated["chain"]["count"], 1)
+        self.assertEqual(len(migrated["events"]), 1)
+
+    def test_mismatched_chain_refuses_readiness(self):
+        with http_server(self.tmp) as srv:
+            self._wallet_with_event(srv)
+        log = _load_audit(self.tmp)
+        log["chain"]["head"] = "0" * 64
+        _dump_audit(self.tmp, log)
+        # chain 与事件重算结果不符：serve 必须拒绝就绪
+        with self.assertRaises(RecoveryError):
+            WalletService(WalletStore(self.tmp))
 
 
 class AuditChainBackupRestoreTest(unittest.TestCase):

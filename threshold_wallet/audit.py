@@ -145,6 +145,9 @@ TYPE_REQUEST_SIGNED = "request_signed"
 TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
+#: pending 操作被撤销（details 即 cancelled 操作视图 R；request_id 为
+#: cancel_id，actor_id 为 approval_request_id）
+TYPE_ASSET_OPERATION_CANCELLED = "asset_operation_cancelled"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"
@@ -510,6 +513,12 @@ _ASSET_OPERATION_R_KEY_ORDER = (
     "version",
 )
 
+#: asset_operation_cancelled 的 details 即 cancelled 操作视图 R，落盘与
+#: 读取归一都按 R 固定键序（与视图 _asset_operation_view 一致）。
+_DETAILS_KEY_ORDER[TYPE_ASSET_OPERATION_CANCELLED] = (
+    _ASSET_OPERATION_R_KEY_ORDER
+)
+
 
 def _reorg_compensation_commit(events: list, index: int) -> bool:
     """判定物理序列 index 处的 asset_operation_committed 事件是否为重组补偿
@@ -768,9 +777,9 @@ class AuditStore:
         _order_reorg_committed_details(events)
         # 防篡改摘要链：按读取归一化后的事件（七字段含 details，键升序
         # 紧凑 JSON）重算链头，与顶层 chain 对象对账。旧记录可能缺链
-        # （只读路径容忍，由追加/备份持锁补算，不改写事件正文）；链一旦
-        # 存在，任何元数据形状或摘要矛盾都 fail-closed（RecoveryError），
-        # 绝不覆盖现场。
+        # （纯读取路径容忍，由启动读取边界、追加与出包持锁补算，不改写
+        # 事件正文）；链一旦存在，任何元数据形状或摘要矛盾都
+        # fail-closed（RecoveryError），绝不覆盖现场。
         try:
             count, head = compute_chain_head(events)
         except (TypeError, KeyError, ValueError) as exc:
@@ -809,9 +818,12 @@ class AuditStore:
     def backfill_chain(self, wallet_id: str) -> None:
         """为缺链的旧记录补算并持久化 chain 元数据（迁移点）。
 
-        仅在 chain 缺失时按事件顺序一次性重算写入，绝不改写事件正文；
-        chain 已存在（严格加载已验通）时为无操作；chain 存在但不匹配时
-        抛 RecoveryError 且绝不覆盖现场。调用方须持该钱包事务锁。"""
+        三个持钱包事务锁的迁移点调用本方法：启动读取边界
+        （_recover_wallet）、追加事件（append_events 随新事件重算）与
+        出包备份。仅在 chain 缺失时按事件顺序一次性重算写入，绝不改写
+        事件正文、不新增审计事件、不改 seq；chain 已存在（严格加载已验
+        通）时为无操作；chain 存在但不匹配时抛 RecoveryError 且绝不覆盖
+        现场。调用方须持该钱包事务锁。"""
         path = self._path(wallet_id)
         with self._lock:
             data = self._read_strict(wallet_id)

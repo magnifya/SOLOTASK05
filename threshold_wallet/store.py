@@ -16,13 +16,14 @@
     audit/<wallet_id>.json          该钱包的审计事件日志（seq 从 1 起仅追加，
                                     由 audit.AuditStore 维护）
     assets/<wallet_id>.json         该钱包的资产账本：asset-operations（操作
-                                    状态机 pending/committed）与 assets（每个
-                                    资产的 balance/version），同一文件原子写入
+                                    状态机 pending/committed/cancelled）与
+                                    assets（每个资产的 balance/version），
+                                    同一文件原子写入
     asset-intents/<wallet_id>/<operation_id>.json
-                                    资产提交的"提交意图"（可恢复事务日志）：
-                                    仅在 commit 事务窗口内存在，提交完成即删；
-                                    崩溃后启动恢复据此判定提交是否已落事件，
-                                    决定补齐账本或回滚为 pending
+                                    资产提交/撤销的"事务意图"（可恢复事务
+                                    日志）：仅在 commit/cancel 事务窗口内存在，
+                                    完成即删；崩溃后启动恢复据此判定事件是否
+                                    已落盘，决定补齐账本或回滚为 pending
     transaction-policies/<wallet_id>.json
                                     该钱包的冷热钱包交易策略
                                     （mode/max_delta/allowed_assets），
@@ -247,8 +248,8 @@ def dispatch_reorg_confirmation_shape_ok(
 
 def _asset_operation_shape_ok(key: str, record: object) -> bool:
     """资产操作条目形状：必须含合法 operation_id/asset_id、非布尔整数
-    delta、state 只能为 pending/committed；服务正常写入还带非布尔整数
-    balance/version 快照，若存在则同样必须为非布尔整数。"""
+    delta、state 只能为 pending/committed/cancelled；服务正常写入还带
+    非布尔整数 balance/version 快照，若存在则同样必须为非布尔整数。"""
     if not isinstance(record, dict):
         return False
     operation_id = record.get("operation_id")
@@ -259,7 +260,7 @@ def _asset_operation_shape_ok(key: str, record: object) -> bool:
         return False
     if not _is_plain_int(record.get("delta")) or record.get("delta") == 0:
         return False
-    if record.get("state") not in ("pending", "committed"):
+    if record.get("state") not in ("pending", "committed", "cancelled"):
         return False
     for optional_int in ("balance", "version"):
         if optional_int in record and not _is_plain_int(
@@ -915,6 +916,8 @@ class WalletStore:
             if record["state"] == "committed":
                 committed_by_asset.setdefault(asset_id, []).append(record)
             else:
+                # pending 与 cancelled 都不进余额/version：cancelled 的
+                # balance/version 快照同样必须等于某条已提交前缀。
                 pending_by_asset.setdefault(asset_id, []).append(record)
 
         for asset_id, entry in assets.items():
@@ -1080,6 +1083,22 @@ class WalletStore:
                 ledger["assets"].pop(asset_id, None)
             else:
                 ledger["assets"][asset_id] = asset_record
+            self._atomic_write(path, ledger)
+
+    def cancel_asset_operation(
+        self,
+        wallet_id: str,
+        operation_id: str,
+        cancelled_record: dict,
+    ) -> None:
+        """原子地把一条操作记录置为 cancelled（调用方须持有该钱包事务
+        锁）。撤销不动资产条目：balance/version 与 assets 映射原样保留，
+        pending 操作在落账前本来就没有资产条目，故此处只改 operations。"""
+        _check_id("operation_id", operation_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger["operations"][operation_id] = cancelled_record
             self._atomic_write(path, ledger)
 
     def remove_asset_operation(
@@ -1276,6 +1295,54 @@ class WalletStore:
                 data = None
             result.append((operation_id, data if isinstance(data, dict) else None))
         return sorted(result, key=lambda item: item[0])
+
+    @staticmethod
+    def valid_asset_cancel_intent(
+        operation_id: str, intent: object
+    ) -> bool:
+        """校验撤销意图是否具备安全回滚/前滚所需的全部标识。
+
+        撤销意图只含标识与整数（绝无私钥材料）：operation_id/asset_id/
+        delta 与撤销前 pending 记录，以及
+        cancel={cancel_id,approval_request_id} 两个安全标识。撤销不改变
+        余额/version，故不需要 old_asset/new_* 字段。任一字段缺失、类型
+        错误、布尔冒整、标识不匹配或 pending 记录不自洽都判定为无效：
+        调用方必须 fail-closed（保留意图现场，不回滚/前滚/清理）。
+        """
+        if not isinstance(intent, dict):
+            return False
+        if intent.get("operation_id") != operation_id:
+            return False
+        asset_id = intent.get("asset_id")
+        if not _valid_safe_id(asset_id):
+            return False
+        delta = intent.get("delta")
+        if not _is_plain_int(delta) or delta == 0:
+            return False
+        pending = intent.get("pending")
+        if not _asset_operation_shape_ok(operation_id, pending):
+            return False
+        if not _is_plain_int(pending.get("balance")) or not (
+            _is_plain_int(pending.get("version"))
+        ):
+            return False
+        if pending["state"] != "pending" or pending["asset_id"] != asset_id:
+            return False
+        if pending["delta"] != delta:
+            return False
+        # 撤销意图不得携带提交事务的字段：两种事务共用 asset-intents
+        # 目录，以 cancel 标记区分，混入即损坏现场。
+        if "old_asset" in intent or "new_balance" in intent:
+            return False
+        cancel = intent.get("cancel")
+        if (
+            not isinstance(cancel, dict)
+            or set(cancel) != {"cancel_id", "approval_request_id"}
+            or not _valid_safe_id(cancel.get("cancel_id"))
+            or not _valid_safe_id(cancel.get("approval_request_id"))
+        ):
+            return False
+        return True
 
     # ---- 份额文件与钱包元数据（轮换激活用）--------------------------------
 

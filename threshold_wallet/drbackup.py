@@ -290,8 +290,8 @@ def _iter_whitelist_files(data_dir: str, wallet_id: str) -> list[str]:
 
     覆盖：wallets/W.json、shares/W/*、业务目录 W（审计/审批/签名/策略/
     交易策略/资产/会话/轮换）、rotation-staging/W/*（递归）。锁文件
-    （locks/）、资产提交意图（asset-intents/，恢复后必为空）、灾备事务
-    目录与原子写临时文件均不在白名单。
+    （locks/）、资产提交/撤销事务意图（asset-intents/，恢复后必为空）、
+    灾备事务目录与原子写临时文件均不在白名单。
     """
     members: list[str] = []
     # wallets/ 与每个业务共享根目录都要严格扫描：任何原子写临时文件、
@@ -648,6 +648,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "share_rotation_prepared",
         "share_rotation_activated",
         "asset_operation_committed",
+        "asset_operation_cancelled",
         "transaction_policy_updated",
         "session_event",
         "session_participant_replaced",
