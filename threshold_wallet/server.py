@@ -20,6 +20,7 @@
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
 - GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
+- GET  /v1/wallets/<wallet_id>/audit-integrity      校验审计防篡改摘要链
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
 - POST /v1/wallets/<wallet_id>/share-rotations             准备份额轮换
@@ -273,6 +274,24 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         ),
                     )
                     return
+                if rest == ["audit-integrity"]:
+                    # 审计防篡改摘要链：仅接受 GET（其余方法见
+                    # do_POST/do_PUT/do_DELETE 等的 405 分支）。成功体为
+                    # 常规 JSON；expected_head 缺省时只校验链。
+                    expected_values = parse_qs(
+                        parsed.query, keep_blank_values=True
+                    ).get("expected_head")
+                    expected = (
+                        expected_values[0] if expected_values else None
+                    )
+                    self._send_json(
+                        200,
+                        service.get_audit_integrity(
+                            wallet_id,
+                            expected_head=expected,
+                        ),
+                    )
+                    return
                 if rest == ["transaction-policy"]:
                     self._send_json(
                         200, service.get_transaction_policy(wallet_id)
@@ -385,6 +404,10 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_error(404, "not found")
                     return
                 wallet_id, rest = matched
+
+                if rest == ["audit-integrity"]:
+                    # 摘要链端点只读：POST 一律 405（不读体）。
+                    raise ServiceError(405, "method not allowed")
 
                 if len(rest) == 1 and rest[0] in ("freeze", "unfreeze"):
                     # 应急冻结/解冻：请求体恰为 {"reason": "..."}，reason
@@ -901,6 +924,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 matched = self._split_wallet_path(path)
                 if matched is not None:
                     wallet_id, rest = matched
+                    if rest == ["audit-integrity"]:
+                        # 摘要链端点只读：PUT 一律 405（不读体）。
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(
@@ -1017,6 +1043,38 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 # 都转 JSON 503 泛化文案，绝不抛 traceback 或断连，绝不
                 # 暴露半完成公钥、余额、version、策略或私钥。
                 self._send_failure(exc)
+
+        def _audit_integrity_not_allowed(self) -> bool:
+            """非 GET 方法命中 audit-integrity 路由时统一 405；返回是否
+            已处理。其余路径回到调用方的未匹配行为。"""
+            path = urlparse(self.path).path
+            matched = self._split_wallet_path(path)
+            self._compact_response = False
+            if matched is not None and matched[1] == ["audit-integrity"]:
+                self._send_failure(ServiceError(405, "method not allowed"))
+                return True
+            return False
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            if not self._audit_integrity_not_allowed():
+                self._compact_response = False
+                self._send_error(404, "not found")
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            if not self._audit_integrity_not_allowed():
+                self._compact_response = False
+                self._send_error(404, "not found")
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            if not self._audit_integrity_not_allowed():
+                self._compact_response = False
+                self._send_error(404, "not found")
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            # audit-integrity 只接受 GET：HEAD 也 405（带 JSON 错误体）。
+            if not self._audit_integrity_not_allowed():
+                self._compact_response = False
+                self._send_error(404, "not found")
 
         # ---- 路径匹配 ---------------------------------------------------
 

@@ -627,8 +627,9 @@ _AUDIT_EVENT_KEYS = frozenset(
     ("seq", "type", "at", "request_id", "actor_id", "reason", "details")
 )
 
-#: 审计日志顶层允许的契约键
-_AUDIT_LOG_KEYS = frozenset(("wallet_id", "next_seq", "events"))
+#: 审计日志顶层允许的契约键（chain 为防篡改摘要链元数据，恰含
+#: algorithm/head/count；旧快照可缺 chain，恢复后由线上补算）
+_AUDIT_LOG_KEYS = frozenset(("wallet_id", "next_seq", "events", "chain"))
 
 #: manifest v1 契约内全部已知审计事件类型（封闭集合，未知类型拒绝）
 _KNOWN_AUDIT_TYPES = frozenset(
@@ -672,11 +673,14 @@ _KNOWN_AUDIT_TYPES = frozenset(
 
 
 def _verify_audit_contract(wallet_id: str, files: dict[str, bytes]) -> None:
-    """审计日志契约校验：顶层契约键、事件恰七字段、类型为封闭已知集合。
+    """审计日志契约校验：顶层契约键（含 chain 形状）、事件恰七字段、类型
+    为封闭已知集合。
 
-    seq 连续性与各类型的语义对账由线上恢复器（check_log/轮换链/账本/会话/
-    审批单对账）负责；这里拦住夹带额外字段或未知事件类型的日志——审计是
-    恢复提交点的唯一依据，未识别类型不得静默带入恢复后的系统。
+    seq 连续性、chain 链头重算与各类型的语义对账由线上恢复器
+    （check_log/ensure_chain/轮换链/账本/会话/审批单对账）在 scratch 中
+    执行（摘要不符即 RecoveryError→503）；这里拦住夹带额外字段、未知
+    事件类型或 chain 形状明显非法的日志——审计是恢复提交点的唯一依据，
+    未识别类型/不完整摘要不得静默带入恢复后的系统。
     """
     rel = f"audit/{wallet_id}.json"
     if rel not in files:
@@ -690,6 +694,29 @@ def _verify_audit_contract(wallet_id: str, files: dict[str, bytes]) -> None:
     events = log.get("events")
     if not isinstance(events, list):
         raise BackupError(503, "audit file events must be a list")
+    chain = log.get("chain")
+    if chain is not None:
+        # 旧快照允许缺 chain（恢复后由 heal 补算）；chain 一旦存在就必须
+        # 完整且自洽：恰含 algorithm/head/count，algorithm 恒为 sha256，
+        # count 等于事件数，head 为 64 位小写 hex。链头与事件正文的逐
+        # 条重算由 scratch 上的严格加载完成（不符即 503）。
+        if not isinstance(chain, dict) or set(chain) != {
+            "algorithm",
+            "count",
+            "head",
+        }:
+            raise BackupError(503, "audit chain metadata is malformed")
+        if chain.get("algorithm") != "sha256":
+            raise BackupError(503, "audit chain algorithm is not sha256")
+        count = chain.get("count")
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count != len(events)
+        ):
+            raise BackupError(503, "audit chain count does not match events")
+        if not _is_sha256_hex(chain.get("head")):
+            raise BackupError(503, "audit chain head is malformed")
     for event in events:
         if not isinstance(event, dict) or set(event) != _AUDIT_EVENT_KEYS:
             raise BackupError(503, "audit event has an unexpected shape")
@@ -1376,6 +1403,7 @@ def _verify_snapshot(
 
         # 恢复后业务文件必须与快照逐字节一致：合法快照是静止已对账现场，
         # 恢复器不应做任何归一化/前滚/回滚/清理。
+        audit_rel = f"audit/{wallet_id}.json"
         for rel, original in files.items():
             if rel == MANIFEST_MEMBER:
                 continue
@@ -1385,9 +1413,26 @@ def _verify_snapshot(
                     recovered = f.read()
             except OSError as exc:
                 raise BackupError(503, "snapshot is not a settled scene") from exc
-            if json.loads(recovered.decode("utf-8")) != json.loads(
-                original.decode("utf-8")
-            ):
+            recovered_obj = json.loads(recovered.decode("utf-8"))
+            original_obj = json.loads(original.decode("utf-8"))
+            # 旧快照允许没有 chain 元数据：scratch 恢复会按事件顺序补算
+            # chain（只新增顶层 chain 对象，事件正文不动），这是唯一允许
+            # 的差异；chain 内容已由严格加载按事件重算核验。其余任何文件
+            # 或审计字段的差异都说明快照夹带半状态，拒绝。
+            chain_backfill = (
+                rel == audit_rel
+                and isinstance(original_obj, dict)
+                and isinstance(recovered_obj, dict)
+                and "chain" not in original_obj
+                and set(recovered_obj) - set(original_obj) == {"chain"}
+            )
+            if chain_backfill:
+                recovered_obj = {
+                    key: value
+                    for key, value in recovered_obj.items()
+                    if key != "chain"
+                }
+            if recovered_obj != original_obj:
                 raise BackupError(503, "snapshot captures an unsettled scene")
 
         _verify_historical_signatures(wallet_id, files, scratch_store)

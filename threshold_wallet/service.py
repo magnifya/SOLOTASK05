@@ -383,6 +383,10 @@ class WalletService:
             # 审计是轮换激活/资产提交/会话动作的唯一提交点：日志形状或
             # seq 连续性损坏时任何前滚/回滚判定都不可信，最先 fail-closed。
             self._audit.check_log(wallet_id)
+            # 旧记录缺 chain 元数据时按事件顺序补算落盘（只补 chain 对象，
+            # 不新增事件、不改事件正文）；chain 存在但不完整/链头不符由
+            # 严格加载判为 RecoveryError，保留现场、阻止就绪。
+            self._audit.ensure_chain(wallet_id)
             # 钱包应急冻结/解冻事件（wallet_frozen/wallet_unfrozen）：
             # 状态只由这两类事件折叠，逐事件严格校验 details 与交替状态
             # 机；畸形/同态连续 fail-closed，恢复不新增事件、不改 seq。
@@ -510,6 +514,10 @@ class WalletService:
                     f"wallet {wallet_id!r} restore records cannot be "
                     f"reconciled: {exc.message}"
                 ) from exc
+            # 审计严格形状/seq/摘要链校验：旧记录缺 chain 时补算（只加
+            # chain 元数据，不改事件正文、不新增事件）；链头不符或元数据
+            # 不完整即 RecoveryError，任何查询都 fail-closed。
+            self._audit.ensure_chain(wallet_id)
             # 资产账本是所有创建/提交/查询/审计读路径的依赖：形状或语义
             # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
             # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
@@ -2977,6 +2985,54 @@ class WalletService:
         # 不分配 seq、不改存储内存现场。
         events = [self._public_audit_event_view(event) for event in events]
         return {"wallet_id": wallet_id, "events": events}
+
+    @staticmethod
+    def _is_expected_head(value: object) -> bool:
+        """expected_head 必须是 64 位小写十六进制字符串。"""
+        return _is_lower_hex_32(value)
+
+    def get_audit_integrity(
+        self,
+        wallet_id: str,
+        expected_head: object = None,
+    ) -> dict:
+        """返回 {wallet_id,state,count,head}：state 恒为 "valid"。
+
+        纯只读（heal 可能为旧记录补算 chain 元数据，但绝不新增审计
+        事件）。链元数据缺失/不匹配、事件被改动、seq 不连续或 details
+        形状矛盾均在严格加载阶段 fail-closed（HTTP 503，保留现场）。
+
+        expected_head 给定时必须为 64 位小写 hex，否则 400；与链头不符
+        409。与 audit-events 同一存在性/参数顺序：锁内先判钱包存在
+        （404），再校 expected_head 格式（400）。冻结钱包同样可查。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                if expected_head is not None and not self._is_expected_head(
+                    expected_head
+                ):
+                    raise ServiceError(
+                        400,
+                        "expected_head must be 64 lowercase hex characters",
+                    )
+                count, head = self._audit.chain_state(wallet_id)
+                if expected_head is not None and expected_head != head:
+                    raise ServiceError(
+                        409, "expected_head does not match the chain head"
+                    )
+        except ServiceError:
+            raise
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return {
+            "wallet_id": wallet_id,
+            "state": "valid",
+            "count": count,
+            "head": head,
+        }
 
     # ---- 份额轮换 ---------------------------------------------------------
 

@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -44,6 +45,92 @@ from .store import (
 
 def _safe_id_match(value: str) -> bool:
     return bool(_SAFE_ID.match(value))
+
+#: 审计防篡改摘要链算法名（chain.algorithm 固定值）。
+CHAIN_ALGORITHM = "sha256"
+#: 首条事件的前序摘要：64 个零字符。
+CHAIN_GENESIS_HEAD = "0" * 64
+
+
+def _is_chain_head(value: object) -> bool:
+    """链头必须是 64 位小写十六进制字符串。"""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def _event_digest(event: dict) -> str:
+    """单条事件摘要：七字段与 details 按审计读取归一化后的形态，把全部
+    键升序、UTF-8 紧凑 JSON（非 ASCII 不转义）后取 SHA-256 小写 hex。
+
+    调用方须保证事件已经过与 _read_strict 相同的读取归一化
+    （_order_event_details 与 _order_reorg_committed_details）；外层与
+    details 键序最终都由 sort_keys 统一拉平为升序，故归一化只负责
+    fail-closed 的既定键序核对（在更上层完成）。"""
+    payload = json.dumps(
+        event,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _compute_chain_head(events: list) -> str:
+    """从 64 零前序摘要起，按 seq 升序逐条计算链头。
+
+    下一个链头 = SHA-256(前序摘要文本 + 本条事件摘要文本) 的小写 hex。"""
+    head = CHAIN_GENESIS_HEAD
+    for event in sorted(events, key=lambda e: e["seq"]):
+        head = hashlib.sha256(
+            (head + _event_digest(event)).encode("utf-8")
+        ).hexdigest()
+    return head
+
+
+def _verify_chain_meta(data: dict, events: list, path: str) -> None:
+    """校验顶层 chain 元数据；chain 缺省（旧记录）不在此处理。
+
+    chain 恰含 algorithm/head/count：algorithm 固定 sha256，count 为非
+    布尔整数且等于事件数，head 为 64 位小写 hex 且与按事件重算的链头
+    一致。任何不完整/不匹配都是不可对账现场（RecoveryError），调用方
+    必须保留现场、绝不覆盖。"""
+    chain = data.get("chain")
+    if chain is None:
+        return
+    if not isinstance(chain, dict) or set(chain) != {
+        "algorithm",
+        "count",
+        "head",
+    }:
+        raise RecoveryError(
+            f"audit log {path!r} chain metadata is incomplete or malformed"
+        )
+    if chain.get("algorithm") != CHAIN_ALGORITHM:
+        raise RecoveryError(
+            f"audit log {path!r} chain algorithm is not sha256"
+        )
+    count = chain.get("count")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(events)
+    ):
+        raise RecoveryError(
+            f"audit log {path!r} chain count does not match its events"
+        )
+    head = chain.get("head")
+    if not _is_chain_head(head):
+        raise RecoveryError(
+            f"audit log {path!r} chain head is not 64 lowercase hex chars"
+        )
+    if _compute_chain_head(events) != head:
+        raise RecoveryError(
+            f"audit log {path!r} chain head does not match its events"
+        )
 
 #: 审计事件类型
 TYPE_POLICY_UPDATED = "policy_updated"
@@ -676,6 +763,11 @@ class AuditStore:
         # 重组补偿提交事件的 details 在内存视图中同样归一为 R 序（落盘与
         # 恢复一致）；普通提交事件维持既有 sort_keys 序不变。
         _order_reorg_committed_details(events)
+        # 防篡改摘要链（chain）：旧记录可能没有 chain（缺省时由
+        # ensure_chain/追加路径补算，不改写事件正文）；chain 一旦存在就
+        # 必须恰为 algorithm/head/count 且与按 seq 重算的链头一致，事件
+        # 正文任何改动都会令链头不符——矛盾即 RecoveryError，绝不覆盖。
+        _verify_chain_meta(data, events, path)
         return data
 
     def check_log(self, wallet_id: str) -> None:
@@ -683,6 +775,43 @@ class AuditStore:
         文件不存在（尚无事件）视为正常空状态。"""
         _check_id("wallet_id", wallet_id)
         self._read_strict(wallet_id)
+
+    def ensure_chain(self, wallet_id: str) -> None:
+        """旧记录缺 chain 时按事件顺序补算并原子落盘，绝不改写事件正文。
+
+        文件不存在（尚无事件）或 chain 已存在（严格加载已验其与事件
+        一致）时均为无操作。chain 缺失的旧文件只补写顶层 chain 对象
+        （algorithm/head/count），事件正文与 seq 一律不动；损坏或现场
+        矛盾时按异常类型原样上抛（CorruptDataError/RecoveryError/
+        OSError），保留现场不覆盖。"""
+        _check_id("wallet_id", wallet_id)
+        path = self._path(wallet_id)
+        with self._lock:
+            data = self._read_strict(wallet_id)
+            if data is None or "chain" in data:
+                return
+            events = data["events"]
+            data["chain"] = {
+                "algorithm": CHAIN_ALGORITHM,
+                "head": _compute_chain_head(events),
+                "count": len(events),
+            }
+            _atomic_write_log(path, data)
+
+    def chain_state(self, wallet_id: str) -> tuple[int, str]:
+        """返回 (事件数, 当前链头)。文件不存在视为空链（count=0、链头为
+        64 个零）；文件存在却缺 chain 元数据属不可对账现场
+        （RecoveryError），由调用方转 503。"""
+        _check_id("wallet_id", wallet_id)
+        data = self._read_strict(wallet_id)
+        if data is None:
+            return 0, CHAIN_GENESIS_HEAD
+        chain = data.get("chain")
+        if not isinstance(chain, dict):
+            raise RecoveryError(
+                f"audit log for wallet {wallet_id!r} is missing chain metadata"
+            )
+        return chain["count"], chain["head"]
 
     def list_audit_wallet_ids(self) -> list[str]:
         """返回存在审计文件的全部 wallet_id（启动恢复扫描用）。"""
@@ -745,6 +874,16 @@ class AuditStore:
                 stamped_events.append(stamped)
                 next_seq += 1
             data["next_seq"] = next_seq
+            # 与读取同口径归一重组补偿提交事件 details 后重算摘要链：
+            # 旧记录缺 chain 时在此随本次追加一并补算（只加 chain 对象，
+            # 历史事件正文不动）；已有 chain 在严格加载时已验过历史链头，
+            # 这里对全量事件重算，覆盖新增事件。
+            _order_reorg_committed_details(existing)
+            data["chain"] = {
+                "algorithm": CHAIN_ALGORITHM,
+                "head": _compute_chain_head(existing),
+                "count": len(existing),
+            }
             _atomic_write_log(path, data)
             return stamped_events
 
