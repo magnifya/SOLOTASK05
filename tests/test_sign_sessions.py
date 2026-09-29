@@ -19,6 +19,7 @@ import unittest
 
 from tests.helpers import http_server, make_harness
 from threshold_wallet import crypto
+from threshold_wallet import audit as audit_mod
 from threshold_wallet.service import ServiceError
 from threshold_wallet.store import CorruptDataError, RecoveryError
 
@@ -1023,6 +1024,14 @@ class SignSessionStrictRecoveryTest(unittest.TestCase):
         for i, event in enumerate(audit["events"], 1):
             event["seq"] = i
         audit["next_seq"] = len(audit["events"]) + 1
+        # 崩溃窗口只可能发生在事件原子落盘之前：磁盘上的链头只覆盖仍
+        # 在日志中的事件，按截断后的事件序列重算 chain（不改写事件正文）。
+        count, head = audit_mod.compute_chain_head(audit["events"])
+        audit["chain"] = {
+            "algorithm": audit_mod.CHAIN_ALGORITHM,
+            "head": head,
+            "count": count,
+        }
         with open(self._audit_path(d), "w", encoding="utf-8") as f:
             json.dump(audit, f)
         h2 = make_harness(d)

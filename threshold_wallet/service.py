@@ -2978,6 +2978,55 @@ class WalletService:
         events = [self._public_audit_event_view(event) for event in events]
         return {"wallet_id": wallet_id, "events": events}
 
+    # ---- 审计完整性（摘要链） -------------------------------------------
+
+    #: expected_head 必须为 64 位小写十六进制
+    _EXPECTED_HEAD_RE = re.compile(r"^[0-9a-f]{64}$")
+
+    def get_audit_integrity(
+        self, wallet_id: str, expected_head: object = None
+    ) -> dict:
+        """返回 {wallet_id, state, count, head}，state 恒为 "valid"。
+
+        纯只读：在该钱包事务锁内先自愈，再按审计读取归一化后的事件重放
+        防篡改摘要链并与审计文件顶层 chain 元数据严格对账。事件被改动、
+        链元数据缺失/不匹配、seq 不连续、details 形状矛盾一律
+        RecoveryError/CorruptDataError/OSError（由 HTTP 边界转 503），
+        保留现场不覆盖。
+
+        expected_head 缺省时只校验链；给定时还须与链头逐字一致，不一致
+        抛 ServiceError(409)，格式非法抛 ServiceError(400)。钱包标识
+        非法 400、钱包不存在 404（沿用锁内 404 优先于查询参数 400 的
+        既有次序）。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                if expected_head is not None and (
+                    not isinstance(expected_head, str)
+                    or not self._EXPECTED_HEAD_RE.match(expected_head)
+                ):
+                    raise ServiceError(
+                        400,
+                        "expected_head must be 64-char lowercase hex",
+                    )
+                # 与 audit-events 同一套 DKG 事件严格对账：details 形状
+                # 矛盾在此即 fail-closed，绝不返回"链有效"的假结论。
+                self._reconcile_dkg_events_locked(wallet_id)
+                count, head = self._audit.integrity(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        if expected_head is not None and expected_head != head:
+            raise ServiceError(409, "expected_head does not match chain head")
+        return {
+            "wallet_id": wallet_id,
+            "state": "valid",
+            "count": count,
+            "head": head,
+        }
+
     # ---- 份额轮换 ---------------------------------------------------------
 
     @staticmethod

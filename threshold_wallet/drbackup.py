@@ -430,6 +430,10 @@ def backup(
             # 持锁自愈：先把他进程崩溃遗留的半完成轮换/提交/会话对账干净，
             # 绝不打包半状态；恢复失败直接向上抛（fail-closed）。
             service._heal_wallet(wallet_id)
+            # 旧记录可能缺防篡改摘要链：出包前持锁按事件顺序补算 chain
+            # 元数据（只新增链对象，绝不改写事件正文、不新增审计事件），
+            # 使快照始终携带可校验链；链已存在但不匹配则 fail-closed。
+            service._audit.backfill_chain(wallet_id)
             if service._store.get_wallet(wallet_id) is None:
                 raise BackupError(404, f"wallet {wallet_id!r} not found")
             manifest, payloads = _build_manifest(
@@ -628,7 +632,9 @@ _AUDIT_EVENT_KEYS = frozenset(
 )
 
 #: 审计日志顶层允许的契约键
-_AUDIT_LOG_KEYS = frozenset(("wallet_id", "next_seq", "events"))
+_AUDIT_LOG_KEYS = frozenset(
+    ("wallet_id", "next_seq", "events", "chain")
+)
 
 #: manifest v1 契约内全部已知审计事件类型（封闭集合，未知类型拒绝）
 _KNOWN_AUDIT_TYPES = frozenset(
@@ -677,7 +683,14 @@ def _verify_audit_contract(wallet_id: str, files: dict[str, bytes]) -> None:
     seq 连续性与各类型的语义对账由线上恢复器（check_log/轮换链/账本/会话/
     审批单对账）负责；这里拦住夹带额外字段或未知事件类型的日志——审计是
     恢复提交点的唯一依据，未识别类型不得静默带入恢复后的系统。
+
+    防篡改摘要链随快照一起校验：chain 必须恰含 algorithm/head/count，
+    algorithm 固定 sha256，count 等于事件数，head 为 64 位小写十六进制
+    且与按事件重算的链头一致；摘要缺失、不完整或被篡改一律拒绝，恢复
+    绝不写目标数据。
     """
+    from . import audit as audit_mod
+
     rel = f"audit/{wallet_id}.json"
     if rel not in files:
         return
@@ -695,6 +708,28 @@ def _verify_audit_contract(wallet_id: str, files: dict[str, bytes]) -> None:
             raise BackupError(503, "audit event has an unexpected shape")
         if event.get("type") not in _KNOWN_AUDIT_TYPES:
             raise BackupError(503, "audit file has an unknown event type")
+    chain = log.get("chain")
+    if (
+        not isinstance(chain, dict)
+        or set(chain) != {"algorithm", "head", "count"}
+        or chain.get("algorithm") != audit_mod.CHAIN_ALGORITHM
+    ):
+        raise BackupError(503, "audit chain metadata is missing or malformed")
+    try:
+        count, head = audit_mod.compute_chain_head(events)
+    except (TypeError, KeyError, ValueError) as exc:
+        raise BackupError(503, "audit chain cannot be recomputed") from exc
+    stored_count = chain.get("count")
+    stored_head = chain.get("head")
+    if (
+        not isinstance(stored_count, int)
+        or isinstance(stored_count, bool)
+        or stored_count != count
+        or not isinstance(stored_head, str)
+        or not audit_mod._HEAD_RE.match(stored_head)
+        or stored_head != head
+    ):
+        raise BackupError(503, "audit chain does not match its events")
 
 
 def _validate_manifest_shape(

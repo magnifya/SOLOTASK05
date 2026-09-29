@@ -273,6 +273,17 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         ),
                     )
                     return
+                if rest == ["audit-integrity"]:
+                    # 审计完整性（防篡改摘要链）：仅接受 GET；
+                    # expected_head 缺省只校验链，给定时比对链头（409）。
+                    self._send_json(
+                        200,
+                        service.get_audit_integrity(
+                            wallet_id,
+                            query.get("expected_head", [None])[0],
+                        ),
+                    )
+                    return
                 if rest == ["transaction-policy"]:
                     self._send_json(
                         200, service.get_transaction_policy(wallet_id)
@@ -385,6 +396,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_error(404, "not found")
                     return
                 wallet_id, rest = matched
+
+                if rest == ["audit-integrity"]:
+                    # audit-integrity 只接受 GET：其他方法抛 ServiceError
+                    # （405），由统一失败边界按对应状态返回。
+                    raise ServiceError(405, "method not allowed")
 
                 if len(rest) == 1 and rest[0] in ("freeze", "unfreeze"):
                     # 应急冻结/解冻：请求体恰为 {"reason": "..."}，reason
@@ -901,6 +917,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 matched = self._split_wallet_path(path)
                 if matched is not None:
                     wallet_id, rest = matched
+                    if rest == ["audit-integrity"]:
+                        # audit-integrity 只接受 GET
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(
@@ -1016,6 +1035,43 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 # 文件系统 / 持久化 JSON 解析或形状异常 / 任何未预期错误
                 # 都转 JSON 503 泛化文案，绝不抛 traceback 或断连，绝不
                 # 暴露半完成公钥、余额、version、策略或私钥。
+                self._send_failure(exc)
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._reject_unsupported_method()
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._reject_unsupported_method()
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self._reject_unsupported_method()
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            # HEAD 语义不返回响应体：audit-integrity 上仅给 405 状态头。
+            self._compact_response = False
+            path = urlparse(self.path).path
+            matched = self._split_wallet_path(path)
+            if matched is not None and matched[1] == ["audit-integrity"]:
+                self.send_response(405)
+                self.send_header("Allow", "GET")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_error(404, "not found")
+
+        def _reject_unsupported_method(self) -> None:
+            """audit-integrity 资源上的 DELETE/PATCH/OPTIONS/HEAD 一律
+            抛 ServiceError(405)；其余路径保持 404。"""
+            self._compact_response = False
+            try:
+                path = urlparse(self.path).path
+                matched = self._split_wallet_path(path)
+                if matched is not None and matched[1] == [
+                    "audit-integrity"
+                ]:
+                    raise ServiceError(405, "method not allowed")
+                self._send_error(404, "not found")
+            except Exception as exc:
                 self._send_failure(exc)
 
         # ---- 路径匹配 ---------------------------------------------------

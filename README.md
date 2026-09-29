@@ -56,6 +56,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/reject` | 拒绝 |
 | GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`） |
+| GET  | `/v1/wallets/{id}/audit-integrity` | 审计防篡改摘要链校验（可带 `expected_head`） |
 | POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
 | POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
 | GET  | `/v1/wallets/{id}/share-rotations/{rid}` | 查轮换状态 |
@@ -1122,6 +1123,23 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 `chain_dispatch_isolated`、`chain_adapter_health`。
 钱包应急冻结/解冻另有 `wallet_frozen`、`wallet_unfrozen`（details 恰为
 `{"reason":"..."}`，两类事件严格交替，按 seq 折叠出 active/frozen 状态）。
+
+### 审计完整性（摘要链）
+审计文件顶层携带顺序摘要链 `chain`，恰含 `algorithm`/`head`/`count`，
+`algorithm` 固定 `sha256`。首条前序摘要为 64 个零字符；每条事件把七个
+字段（含 `details`）按审计读取归一化后的形态取键升序编码为 UTF-8 紧凑
+JSON（无空白、非 ASCII 不转义），先算事件 SHA-256（64 位小写十六进制），
+再以"前序摘要文本 + 事件摘要文本"计算下一个链头。旧记录缺链时按事件
+顺序补算（追加/出包迁移点），不改写事件正文；链元数据缺失（文件存在
+却无 `chain`）或不匹配、事件被改动、seq 不连续、details 形状矛盾一律
+fail-closed（`503`、serve 拒绝就绪、保留现场不覆盖）。
+
+`GET /v1/wallets/{id}/audit-integrity` 只接受 GET（其他方法 `405`），
+成功返回 `{"wallet_id","state","count","head"}`，`state` 恒为 `valid`，
+`count` 为事件数、`head` 为 64 位小写十六进制（无事件时为 64 个零）。
+可带 `expected_head`：格式或钱包标识非法 `400`，钱包不存在 `404`，
+期望摘要与链头不符 `409`；不带该参数时只校验链。审计记录及链元数据
+随灾备快照校验，摘要不完整或被篡改时恢复失败且不写目标数据。
 
 ## 多进程与故障恢复（保证）
 
