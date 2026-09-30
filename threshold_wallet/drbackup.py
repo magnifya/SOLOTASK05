@@ -645,6 +645,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "request_rejected",
         "request_expired",
         "request_signed",
+        "request_cancelled",
         "share_rotation_prepared",
         "share_rotation_activated",
         "asset_operation_committed",
@@ -830,7 +831,7 @@ def _request_shape_ok(key: str, record: object) -> bool:
     if not isinstance(record.get("message"), str):
         return False
     if record.get("state") not in (
-        "pending", "approved", "rejected", "expired", "signed",
+        "pending", "approved", "rejected", "expired", "signed", "cancelled",
     ):
         return False
     approvers = record.get("approvers")
@@ -1127,10 +1128,13 @@ def _verify_requests_against_audit(
     signed = audit_store.events_by_type(
         wallet_id, audit_mod.TYPE_REQUEST_SIGNED
     )
+    cancelled = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_CANCELLED
+    )
     by_rid: dict[str, dict[str, list[dict]]] = {}
     for kind, evs in (
         ("created", created), ("approved", approved), ("rejected", rejected),
-        ("expired", expired), ("signed", signed),
+        ("expired", expired), ("signed", signed), ("cancelled", cancelled),
     ):
         for ev in evs:
             rid = ev.get("request_id")
@@ -1153,7 +1157,8 @@ def _verify_requests_against_audit(
         # 记录终态与审计终态必须严格一致，不允许多余/缺失
         expected_terminal = {
             "pending": None, "approved": None,
-            "signed": "signed", "expired": "expired", "rejected": "rejected",
+            "signed": "signed", "expired": "expired",
+            "rejected": "rejected", "cancelled": None,
         }[state]
         for kind, count in terminal_events.items():
             want = 1 if kind == expected_terminal else 0
@@ -1161,6 +1166,34 @@ def _verify_requests_against_audit(
                 raise BackupError(
                     503, "request terminal state disagrees with its events"
                 )
+        # cancelled 的唯一提交点是 request_cancelled 事件：恰一条，
+        # actor_id 即 cancel_id，reason 原文与 details 两键一致，且
+        # 记录 reason 与事件 reason 逐字一致。
+        cancel_evs = (groups or {}).get("cancelled", [])
+        if state == "cancelled":
+            if len(cancel_evs) != 1:
+                raise BackupError(
+                    503, "cancelled request disagrees with its cancel event"
+                )
+            cancel_ev = cancel_evs[0]
+            cancel_details = cancel_ev.get("details")
+            cancel_id = cancel_ev.get("actor_id")
+            if (
+                not isinstance(cancel_id, str)
+                or not _SAFE_ID.match(cancel_id)
+                or not isinstance(cancel_details, dict)
+                or set(cancel_details) != {"cancel_id", "reason"}
+                or cancel_details.get("cancel_id") != cancel_id
+                or cancel_details.get("reason") != cancel_ev.get("reason")
+                or record["reason"] != cancel_ev.get("reason")
+            ):
+                raise BackupError(
+                    503, "request_cancelled event is malformed"
+                )
+        elif cancel_evs:
+            raise BackupError(
+                503, "non-cancelled request has a request_cancelled event"
+            )
         # 审批人集合（去重）与计数必须和 request_approved 事件一致；
         # pending 允许已有部分批准但未达门槛，approved 必须恰达门槛。
         approver_ids = [
@@ -1179,6 +1212,11 @@ def _verify_requests_against_audit(
         rid = ev.get("request_id")
         if rid not in requests:
             raise BackupError(503, "created event has no request record")
+    # 反向：每个 request_cancelled 事件都必须有对应审批单。
+    for ev in cancelled:
+        rid = ev.get("request_id")
+        if rid not in requests:
+            raise BackupError(503, "cancel event has no request record")
 
 
 def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:

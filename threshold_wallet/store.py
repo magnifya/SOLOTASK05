@@ -511,6 +511,30 @@ class WalletStore:
             return None
         return all_records.get(signing_request_id)
 
+    def get_requests(self, wallet_id: str) -> dict[str, dict]:
+        """返回该钱包全部签名请求审批单（副本），文件不存在返回空映射。"""
+        _check_id("wallet_id", wallet_id)
+        all_records = self._read_json(self._requests_path(wallet_id))
+        return dict(all_records) if all_records else {}
+
+    def requests_file_exists(self, wallet_id: str) -> bool:
+        """该钱包的审批单文件是否存在（存在即需与撤销事件对账）。"""
+        _check_id("wallet_id", wallet_id)
+        return os.path.exists(self._requests_path(wallet_id))
+
+    def list_request_wallet_ids(self) -> list[str]:
+        """返回存在审批单文件的全部 wallet_id（启动恢复扫描用）。"""
+        try:
+            names = os.listdir(self._requests_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
+
     def update_request(
         self, wallet_id: str, signing_request_id: str, record: dict
     ) -> None:

@@ -24,6 +24,7 @@
 - GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
+- POST /v1/wallets/<wallet_id>/sign-requests/<id>/cancel   主动撤销
 - POST /v1/wallets/<wallet_id>/share-rotations             准备份额轮换
 - GET  /v1/wallets/<wallet_id>/share-rotations/<id>        查询轮换
 - POST /v1/wallets/<wallet_id>/share-rotations/<id>/activate  激活轮换
@@ -927,9 +928,27 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if (
                     len(rest) == 3
                     and rest[0] == "sign-requests"
-                    and rest[2] in ("approve", "reject")
+                    and rest[2] in ("approve", "reject", "cancel")
                 ):
                     body = self._read_json_body()
+                    if rest[2] == "cancel":
+                        # 主动撤销：请求体恰为 {"cancel_id","reason"}；
+                        # cancel_id 为安全标识、reason 为 1..1024 字符
+                        # 非空白字符串（取值由 service 校验）。
+                        if set(body) != {"cancel_id", "reason"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly cancel_id "
+                                "and reason",
+                            )
+                        status, result = service.cancel_sign_request(
+                            wallet_id,
+                            rest[1],
+                            body.get("cancel_id"),
+                            body.get("reason"),
+                        )
+                        self._send_json(status, result)
+                        return
                     decide = (
                         service.approve if rest[2] == "approve" else service.reject
                     )

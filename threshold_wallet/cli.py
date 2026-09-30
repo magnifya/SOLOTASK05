@@ -118,6 +118,17 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--approver-id", required=True)
         p.add_argument("--reason", default=None)
 
+    # request-cancel  <-> POST .../sign-requests/{rid}/cancel
+    p_rcancel = sub.add_parser(
+        "request-cancel",
+        help="主动撤销审批单（POST .../sign-requests/{id}/cancel）",
+    )
+    p_rcancel.add_argument("--url", default=DEFAULT_URL)
+    p_rcancel.add_argument("--wallet-id", required=True)
+    p_rcancel.add_argument("--signing-request-id", required=True)
+    p_rcancel.add_argument("--cancel-id", required=True)
+    p_rcancel.add_argument("--reason", required=True)
+
     # share-sign（份额持有方本地辅助命令）
     p_ss = sub.add_parser(
         "share-sign",
@@ -287,6 +298,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{args.url}/v1/wallets/{args.wallet_id}"
                 f"/sign-requests/{args.signing_request_id}/{args.command}",
                 payload,
+            )
+
+        elif args.command == "request-cancel":
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/sign-requests/{args.signing_request_id}/cancel",
+                {"cancel_id": args.cancel_id, "reason": args.reason},
             )
 
         elif args.command == "share-sign":

@@ -142,6 +142,9 @@ TYPE_REQUEST_APPROVED = "request_approved"
 TYPE_REQUEST_REJECTED = "request_rejected"
 TYPE_REQUEST_EXPIRED = "request_expired"
 TYPE_REQUEST_SIGNED = "request_signed"
+#: 主动撤销审批单（唯一提交点；request_id 为审批单 id、actor_id 为
+#: cancel_id、reason 保留撤销原文，details 恰含 cancel_id 与 reason）
+TYPE_REQUEST_CANCELLED = "request_cancelled"
 TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
@@ -399,6 +402,12 @@ _DETAILS_KEY_ORDER = {
     ),
     TYPE_APPROVAL_ROSTER_UPDATED: (
         "allowed_approvers",
+    ),
+    # request_cancelled 的 details 恰为 {cancel_id, reason}：撤销是
+    # 审批单转 cancelled 的唯一提交点，reason 原文保序。
+    TYPE_REQUEST_CANCELLED: (
+        "cancel_id",
+        "reason",
     ),
 }
 

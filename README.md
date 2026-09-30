@@ -56,6 +56,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/reject` | 拒绝 |
+| POST | `/v1/wallets/{id}/sign-requests/{rid}/cancel` | 主动撤销 `{"cancel_id","reason"}` |
 | GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`） |
 | GET  | `/v1/wallets/{id}/audit-integrity` | 审计防篡改摘要链校验（可带 `expected_head`） |
 | POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
@@ -118,8 +119,8 @@ JSON 对象。
 - `POST sign-requests`：`id`、`message` 非空；未设策略 `409`；首建
   `201`；同 id 同文幂等 `200`；同 id 异文 `409`。
 - 审批单视图 `{id,message,state,approvers,count,req,t0,t1,reason}`，
-  `state` 为 `pending|approved|rejected|expired|signed`；操作前懒过期
-  到点的 pending 单为 `expired`。
+  `state` 为 `pending|approved|rejected|expired|signed|cancelled`；
+  操作前懒过期到点的 pending 单为 `expired`。
 - `approve`/`reject`：`approver_id` 为非空白字符串，`reason` 可选且
   ≤1024 字符；非法 `400`。pending 单批准 `200`（同一 approver 重复
   批准不计数，达门槛转 `approved`），拒绝转 `rejected`；对终态单操作
@@ -127,6 +128,18 @@ JSON 对象。
   名单后，只有名单成员可作出新的批准或拒绝决定，名单外为 `409`；
   名单变更不追溯既有批准，冷签名、资产撤销、节点复职、份额绑定和
   跨链接管等入口的审批单门控不变。
+- `cancel`：请求体恰为 `{"cancel_id","reason"}`，`cancel_id` 为安全
+  标识，`reason` 为 1..1024 字符的非空白字符串（原文保留）；非 JSON
+  对象、缺字段、夹带字段、标识非法、reason 空白或超长为 `400`，钱包
+  或审批单不存在为 `404`。只有 pending 且未过期的审批单可撤销：首次
+  成功 `201` 并转 `cancelled`，以一条 `request_cancelled` 事件作为唯一
+  提交点（`request_id` 绑定审批单、`actor_id` 记 `cancel_id`、`reason`
+  保留原文、details 只含 `cancel_id` 与 `reason`、seq 连续）；同 rid 用
+  同 `cancel_id` 同 `reason` 重放为 `200`；`cancel_id` 复用、参数变化，
+  或对 `approved|rejected|expired|signed|cancelled` 再撤销为 `409`。
+  冻结钱包的撤销写入为 `409`。撤销后 `approve`/`reject`/`sign` 及依赖
+  该审批单的高风险写操作一律 `409`。崩溃后按事件前滚或回滚（恢复不
+  新增事件、不改 seq），事件与审批单现场互相矛盾则 fail-closed。
 - 设策略后 `/sign` 须存在同 id、同 message 且 `approved` 的审批单，
   两份额齐备 `201` 并推进审批单为 `signed`；未设策略时行为不变。
 
@@ -1148,7 +1161,8 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 每条事件七字段 `seq,type,at,request_id,actor_id,reason,details`，
 `at` 为 UTC（`...Z`），不适用字段为 `null`。seq 从 1 起、落盘后单调
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
-`policy_updated`、`request_created/approved/rejected/expired/signed`、
+`policy_updated`、
+`request_created/approved/rejected/expired/signed/cancelled`、
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `asset_operation_cancelled`（`request_id` 为 cancel_id、`actor_id` 为
 approval_request_id、details 即 cancelled 操作视图）、
@@ -1198,7 +1212,7 @@ details 形状矛盾一律 fail-closed（`503`、serve 拒绝就绪、保留现�
 ## 命令行
 
 `create`/`sign`/`show` 及 `policy`/`request-create`/`request-show`/
-`approve`/`reject` 与 HTTP 接口一一对应，成功打印单行 JSON 到 stdout，
+`approve`/`reject`/`request-cancel` 与 HTTP 接口一一对应，成功打印单行 JSON 到 stdout，
 失败打印单行 `{"error":...}` 到 stderr 并非零退出；客户端命令用 `--url`
 （默认 `http://127.0.0.1:8080`）。
 
