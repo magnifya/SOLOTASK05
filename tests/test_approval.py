@@ -219,9 +219,10 @@ class ApprovalHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["state"], "rejected")
         self.assertEqual(body["reason"], "suspicious")
-        # 终态后再操作：409
-        self.assertEqual(self.reject()[0], 409)
-        self.assertEqual(self.approve()[0], 409)
+        # 同人同决定重放 200；其他人的新决定仍为终态冲突 409
+        self.assertEqual(self.reject(approver="alice")[0], 200)
+        self.assertEqual(self.reject(approver="bob")[0], 409)
+        self.assertEqual(self.approve(approver="bob")[0], 409)
 
     def test_reason_validation_400(self):
         self.put_policy()

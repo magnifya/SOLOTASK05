@@ -243,8 +243,8 @@ class AuditHttpTest(unittest.TestCase):
         self.assertEqual(rejected[0]["reason"], "nope")
         self.assertEqual(rejected[0]["details"]["state"], "rejected")
         n = len(self.events()["events"])
-        # 终态后再 reject/approve 均不记事件
-        self.assertEqual(self.reject()[0], 409)
+        # 同人同拒绝重放为 200；不同决定仍为 409，均不记事件
+        self.assertEqual(self.reject(approver="alice")[0], 200)
         self.assertEqual(self.approve()[0], 409)
         self.assertEqual(len(self.events()["events"]), n)
 

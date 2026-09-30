@@ -7,6 +7,8 @@
 - POST /v1/wallets/<wallet_id>/unfreeze             解除应急冻结
 - GET  /v1/wallets/<wallet_id>/security-state       查询钱包安全状态
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
+- PUT  /v1/wallets/<wallet_id>/approval-roster      设置钱包级审批人名单
+- GET  /v1/wallets/<wallet_id>/approval-roster      查询钱包级审批人名单
 - PUT  /v1/wallets/<wallet_id>/transaction-policy   设置冷热钱包交易策略
 - GET  /v1/wallets/<wallet_id>/transaction-policy   查询冷热钱包交易策略
 - PUT  /v1/wallets/<wallet_id>/dkg-failover-policy  设置 DKG 故障审批开关
@@ -214,6 +216,11 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if rest == ["security-state"]:
                     self._send_json(
                         200, service.get_security_state(wallet_id)
+                    )
+                    return
+                if rest == ["approval-roster"]:
+                    self._send_json(
+                        200, service.get_approval_roster(wallet_id)
                     )
                     return
                 if len(rest) == 2 and rest[0] == "sign-requests":
@@ -959,6 +966,18 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             wallet_id,
                             body.get("required_approvals"),
                             body.get("timeout_seconds"),
+                        )
+                        self._send_json(200, result)
+                        return
+                    if rest == ["approval-roster"]:
+                        body = self._read_json_body()
+                        if set(body) != {"allowed_approvers"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly allowed_approvers",
+                            )
+                        result = service.put_approval_roster(
+                            wallet_id, body.get("allowed_approvers")
                         )
                         self._send_json(200, result)
                         return

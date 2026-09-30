@@ -44,6 +44,9 @@ TRANSACTION_POLICY_MODES = ("hot", "cold")
 #: approve/reject 附言 reason 的最大长度
 MAX_REASON_LENGTH = 1024
 
+#: 钱包级审批人名单成员的最大长度（按 Unicode 码点计）
+MAX_APPROVER_LENGTH = 128
+
 #: rotation_id 允许的字符（与存储层安全 id 一致）
 ROTATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -393,6 +396,9 @@ class WalletService:
             # 状态只由这两类事件折叠，逐事件严格校验 details 与交替状态
             # 机；畸形/同态连续 fail-closed，恢复不新增事件、不改 seq。
             self._freeze_events_strict(wallet_id)
+            # 钱包审批人名单仅由 approval_roster_updated 事件承载：逐事件
+            # 校验成员形状/去重/码点升序，取最后一条重建，不新增事件。
+            self._approval_roster_events_strict(wallet_id)
             # 先校验资产账本（形状 + 语义）：账本损坏时任何对账都不可信，
             # 直接 fail-closed。
             self._store.check_asset_ledger_semantics(wallet_id)
@@ -1149,6 +1155,128 @@ class WalletService:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
         return policy
+
+    # ---- 钱包级审批人名单 ------------------------------------------------
+
+    @staticmethod
+    def _normalize_allowed_approvers(allowed_approvers: object) -> list[str]:
+        if not isinstance(allowed_approvers, list):
+            raise ValueError("allowed_approvers must be an array")
+        result = []
+        for approver in allowed_approvers:
+            if (
+                not isinstance(approver, str)
+                or isinstance(approver, bool)
+                or len(approver) < 1
+                or len(approver) > MAX_APPROVER_LENGTH
+                or not approver.strip()
+            ):
+                raise ValueError(
+                    "each allowed approver must be a 1 to "
+                    f"{MAX_APPROVER_LENGTH} character non-blank string"
+                )
+            if approver in result:
+                raise ValueError(
+                    "allowed_approvers must not contain duplicates"
+                )
+            result.append(approver)
+        return sorted(result)
+
+    @staticmethod
+    def _validate_allowed_approvers(allowed_approvers: object) -> list[str]:
+        try:
+            return WalletService._normalize_allowed_approvers(
+                allowed_approvers
+            )
+        except ValueError as exc:
+            raise ServiceError(400, str(exc)) from exc
+
+    def _approval_roster_events_strict(self, wallet_id: str) -> list[str]:
+        """按 seq 重放审批人名单事件并返回当前名单。
+
+        名单只由 approval_roster_updated 事件承载。每条事件的
+        request_id/actor_id/reason 必须为 null，details 恰含
+        allowed_approvers；数组每项为 1..128 字符非空白字符串，无重复且
+        已按 Unicode 码点升序排列。当前状态取最后一条事件；无事件为空
+        名单（不限制审批人）。纯只读，不新增事件、不改 seq。
+        """
+        current: list[str] = []
+        for event in self._audit.all_events(wallet_id):
+            if event.get("type") != audit.TYPE_APPROVAL_ROSTER_UPDATED:
+                continue
+            if (
+                event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an approval roster event "
+                    "with request_id/actor_id/reason set"
+                )
+            details = event.get("details")
+            if not isinstance(details, dict) or set(details) != {
+                "allowed_approvers"
+            }:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed approval roster "
+                    "event"
+                )
+            roster = details["allowed_approvers"]
+            try:
+                normalized = self._normalize_allowed_approvers(roster)
+            except ValueError as exc:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed approval roster "
+                    "event"
+                ) from exc
+            if roster != normalized:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an approval roster event "
+                    "with duplicate or out-of-order approvers"
+                )
+            current = list(normalized)
+        return current
+
+    @staticmethod
+    def _approval_roster_view(allowed_approvers: list[str]) -> dict:
+        return {"allowed_approvers": list(allowed_approvers)}
+
+    def put_approval_roster(
+        self, wallet_id: str, allowed_approvers: object
+    ) -> dict:
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
+                self._approval_roster_events_strict(wallet_id)
+                roster = self._validate_allowed_approvers(allowed_approvers)
+                # 首次设置、修改、清空和同值更新都以最后一条快照事件为
+                # 提交点，并各记一条事件。
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_APPROVAL_ROSTER_UPDATED,
+                        details={"allowed_approvers": roster},
+                    ),
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return self._approval_roster_view(roster)
+
+    def get_approval_roster(self, wallet_id: str) -> dict:
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                roster = self._approval_roster_events_strict(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return self._approval_roster_view(roster)
 
     # ---- 冷热钱包交易策略 -------------------------------------------------
 
@@ -10046,17 +10174,40 @@ class WalletService:
                 record = self._fetch_request_or_404(wallet_id, request_id)
                 # 懒过期可能在此原子记一次 E；过期后操作落入终态分支（409、不记 A/R）
                 record = self._expire_if_needed(wallet_id, record)
+                roster = self._approval_roster_events_strict(wallet_id)
+                # 同人同决定重放优先，返回 200、不计数、不复查当前名单：
+                # 批准人已在审批单 approvers 中即同批准重放；拒绝重放由
+                # request_rejected 事件的 actor_id 认定。
+                if (
+                    action == "approve"
+                    and approver_id in record["approvers"]
+                ):
+                    return self._request_view(record)
+                if (
+                    action == "reject"
+                    and record["state"] == "rejected"
+                    and any(
+                        event.get("request_id") == request_id
+                        and event.get("actor_id") == approver_id
+                        for event in self._audit.events_by_type(
+                            wallet_id,
+                            audit.TYPE_REQUEST_REJECTED,
+                        )
+                    )
+                ):
+                    return self._request_view(record)
                 if record["state"] != "pending":
                     raise ServiceError(
                         409,
                         f"signing request {request_id!r} is {record['state']}, "
                         "not pending",
                     )
+                if roster and approver_id not in roster:
+                    raise ServiceError(
+                        409, "approver is not in the wallet approval roster"
+                    )
 
                 if action == "approve":
-                    # 同一 approver 重复批准不计数、不记事件（幂等 200）
-                    if approver_id in record["approvers"]:
-                        return self._request_view(record)
                     new_record = dict(record)
                     new_record["approvers"] = list(record["approvers"])
                     new_record["approvers"].append(approver_id)

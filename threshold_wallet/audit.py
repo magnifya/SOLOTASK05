@@ -204,6 +204,9 @@ TYPE_WALLET_FROZEN = "wallet_frozen"
 #: 钱包应急解冻（details 恰为 {"reason": ...}；request_id/actor_id/
 #: reason 均为 null；回到 active 的唯一提交点，与 wallet_frozen 严格交替）
 TYPE_WALLET_UNFROZEN = "wallet_unfrozen"
+#: 钱包级审批人名单整体快照（details 恰为 {"allowed_approvers": [...]}；
+#: 数组成员按 Unicode 码点升序，空数组表示取消限制，取最后一条恢复）
+TYPE_APPROVAL_ROSTER_UPDATED = "approval_roster_updated"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -393,6 +396,9 @@ _DETAILS_KEY_ORDER = {
     ),
     TYPE_WALLET_UNFROZEN: (
         "reason",
+    ),
+    TYPE_APPROVAL_ROSTER_UPDATED: (
+        "allowed_approvers",
     ),
 }
 
