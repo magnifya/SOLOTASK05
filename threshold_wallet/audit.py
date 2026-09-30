@@ -820,6 +820,60 @@ class AuditStore:
         chain = data["chain"]
         return chain["count"], chain["head"]
 
+    def range_evidence(
+        self, wallet_id: str, from_seq: int, to_seq: int
+    ) -> tuple[int, list[dict], str, str]:
+        """纯只读计算区间 ``[from_seq, to_seq]`` 的局部链头证据。
+
+        返回 ``(total, events, start_head, end_head)``：
+
+        - ``total`` 为日志现有事件总数（链头计数）；
+        - ``events`` 为区间内事件（按 seq 升序的副本，形态为读取归一化后
+          的七字段视图），逐条事件摘要由调用方按
+          :func:`_event_digest` 与对外公开视图一一对应计算；
+        - ``start_head`` 为 from_seq 前一事件后的链头（from_seq 为 1 时
+          是 64 个零）；
+        - ``end_head`` 为 to_seq 后的链头，可由 start_head 与区间逐条
+          摘要按既有递推规则（"前序摘要文本 + 事件摘要文本"）复算。
+
+        调用方负责区间参数（正整数、from_seq <= to_seq、上限）与
+        total=0 / to_seq > total 的语义判定。与 integrity 同一对账标准：
+        chain 元数据缺失/不匹配、事件被改动等现场抛
+        RecoveryError/CorruptDataError/OSError，绝不返回未对账证据。
+        """
+        data = self._read_strict(wallet_id)
+        if data is None:
+            return 0, [], GENESIS_HEAD, GENESIS_HEAD
+        if "chain" not in data:
+            raise RecoveryError(
+                f"audit log for wallet {wallet_id!r} is missing its chain "
+                "metadata"
+            )
+        ordered = sorted(data["events"], key=lambda e: e["seq"])
+        total = len(ordered)
+        head = GENESIS_HEAD
+        start_head = GENESIS_HEAD
+        selected: list[dict] = []
+        for event in ordered:
+            # 进入 from_seq 事件之前的链头即"from_seq 前一事件后的链头"
+            # （from_seq=1 时循环开始前 head 就是 64 个零）。
+            if event["seq"] == from_seq:
+                start_head = head
+            digest = _event_digest(event)
+            head = hashlib.sha256(
+                (head + digest).encode("ascii")
+            ).hexdigest()
+            if from_seq <= event["seq"] <= to_seq:
+                selected.append(dict(event))
+        # end_head 由 start_head 与区间逐条摘要按既有递推规则复算（与从头
+        # 重放到 to_seq 的结果一致），保证审计方仅凭三者即可复验。
+        end_head = start_head
+        for event in selected:
+            end_head = hashlib.sha256(
+                (end_head + _event_digest(event)).encode("ascii")
+            ).hexdigest()
+        return total, selected, start_head, end_head
+
     def backfill_chain(self, wallet_id: str) -> None:
         """为缺链的旧记录补算并持久化 chain 元数据（迁移点）。
 

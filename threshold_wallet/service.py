@@ -3373,6 +3373,10 @@ class WalletService:
     #: expected_head 必须为 64 位小写十六进制
     _EXPECTED_HEAD_RE = re.compile(r"^[0-9a-f]{64}$")
 
+    #: 区间证据 from_seq/to_seq 必须为一个或多个 ASCII 十进制数字（不允许
+    #: 空白、符号、小数点或 Unicode 数字；"0" 由取值正整数判定拒绝）。
+    _EVIDENCE_SEQ_RE = re.compile(r"^[0-9]+$")
+
     def get_audit_integrity(
         self, wallet_id: str, expected_head: object = None
     ) -> dict:
@@ -3416,6 +3420,133 @@ class WalletService:
             "count": count,
             "head": head,
         }
+
+    # ---- 审计区间证据（逐条摘要 + 局部链头） -----------------------------
+
+    #: 区间证据一次至多覆盖的事件条数
+    AUDIT_EVIDENCE_MAX_RANGE = 1000
+
+    def get_audit_evidence(
+        self, wallet_id: str, query: object
+    ) -> dict:
+        """返回区间 ``[from_seq, to_seq]`` 的逐条摘要与前后局部链头。
+
+        成功体::
+
+            {"wallet_id", "range": {"from_seq", "to_seq"}, "events",
+             "event_digests", "start_head", "end_head", "count", "state"}
+
+        events 按 seq 升序、沿用 audit-events 公开视图（绝不含份额私钥或
+        任何中间值）；event_digests 按既有七字段摘要规则与 events 一一
+        对应；start_head 为 from_seq 前一事件后的链头（from_seq=1 时为
+        64 个零），end_head 为 to_seq 后的链头，可凭 start_head 与逐条
+        摘要按既有递推规则复算；state 恒为 "valid"，count 为区间事件数。
+        证据与灾备快照同一对账标准（chain 元数据必须存在且匹配）。
+
+        纯只读：不分配 seq、不改状态、不写文件；故追加新事件后，以旧
+        end_head 作为 expected_head 查询旧区间仍然成立。
+
+        参数校验严格按以下次序（均在钱包事务锁内、钱包存在性与 DKG
+        对账之后）：
+
+        - from_seq/to_seq 缺一：400 missing evidence parameters；
+        - from_seq/to_seq/expected_head 任一重复：400 duplicate evidence
+          parameters；
+        - from_seq/to_seq 非正整数：400 invalid from_seq / invalid to_seq；
+        - expected_head 非 64 位小写十六进制：400 invalid expected_head；
+        - from_seq > to_seq 或区间超过 1000 条：400 invalid evidence range；
+        - 空钱包：404 empty evidence range；
+        - to_seq 超出已有事件：404 evidence range out of bounds；
+        - expected_head 与区间 end_head 不符：409 expected_head does not
+          match chain head。
+        """
+        if not isinstance(query, dict):
+            query = {}
+
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：先判定钱包存在，再校验区间参数。
+                self._get_wallet_or_404(wallet_id)
+                # 与 audit-events / audit-integrity 同一套 DKG 重放对账：
+                # details 形状矛盾在此即 fail-closed，绝不返回未对账证据。
+                self._reconcile_dkg_events_locked(wallet_id)
+
+                if "from_seq" not in query or "to_seq" not in query:
+                    raise ServiceError(400, "missing evidence parameters")
+                duplicated = any(
+                    not isinstance(query.get(name), list)
+                    or len(query[name]) > 1
+                    for name in ("from_seq", "to_seq", "expected_head")
+                    if name in query
+                )
+                if duplicated:
+                    raise ServiceError(400, "duplicate evidence parameters")
+                from_raw = query["from_seq"][0]
+                to_raw = query["to_seq"][0]
+                expected_head = (
+                    query["expected_head"][0]
+                    if "expected_head" in query
+                    else None
+                )
+                from_seq = self._parse_evidence_seq(from_raw, "from_seq")
+                to_seq = self._parse_evidence_seq(to_raw, "to_seq")
+                if expected_head is not None and (
+                    not isinstance(expected_head, str)
+                    or not self._EXPECTED_HEAD_RE.match(expected_head)
+                ):
+                    raise ServiceError(400, "invalid expected_head")
+                if (
+                    from_seq > to_seq
+                    or to_seq - from_seq + 1 > self.AUDIT_EVIDENCE_MAX_RANGE
+                ):
+                    raise ServiceError(400, "invalid evidence range")
+
+                total, stored_events, start_head, end_head = (
+                    self._audit.range_evidence(
+                        wallet_id, from_seq, to_seq
+                    )
+                )
+                if total == 0:
+                    raise ServiceError(404, "empty evidence range")
+                if to_seq > total:
+                    raise ServiceError(404, "evidence range out of bounds")
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        if expected_head is not None and expected_head != end_head:
+            raise ServiceError(409, "expected_head does not match chain head")
+        events = [
+            self._public_audit_event_view(event) for event in stored_events
+        ]
+        event_digests = [audit._event_digest(event) for event in events]
+        return {
+            "wallet_id": wallet_id,
+            "range": {"from_seq": from_seq, "to_seq": to_seq},
+            "events": events,
+            "event_digests": event_digests,
+            "start_head": start_head,
+            "end_head": end_head,
+            "count": len(events),
+            "state": "valid",
+        }
+
+    @staticmethod
+    def _parse_evidence_seq(value: object, name: str) -> int:
+        """区间证据的 from_seq/to_seq：必须为十进制正整数（bool、浮点、
+        带符号、空白、Unicode 数字、缺省均拒绝），非法抛 ServiceError(400)，
+        错误文案为路由契约固定的 invalid from_seq / invalid to_seq。"""
+        if (
+            not isinstance(value, str)
+            or not WalletService._EVIDENCE_SEQ_RE.match(value)
+        ):
+            raise ServiceError(400, f"invalid {name}")
+        number = int(value)
+        if number < 1:
+            raise ServiceError(400, f"invalid {name}")
+        return number
 
     # ---- 份额轮换 ---------------------------------------------------------
 

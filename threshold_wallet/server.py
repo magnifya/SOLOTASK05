@@ -22,6 +22,7 @@
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
 - GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
+- GET  /v1/wallets/<wallet_id>/audit-evidence       查询区间逐条摘要与局部链头证据
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/approve  批准
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/reject   拒绝
 - POST /v1/wallets/<wallet_id>/sign-requests/<id>/cancel   撤销审批单
@@ -300,6 +301,20 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         ),
                     )
                     return
+                if rest == ["audit-evidence"]:
+                    # 区间逐条摘要与局部链头证据：仅接受 GET；
+                    # from_seq/to_seq 必填、expected_head 可选。重复参数
+                    # 400；空值（from_seq=）保留为空串交由 service 判为
+                    # 非法取值，而非被 parse_qs 当成缺参；其余 400/404/
+                    # 409/503 全在 service 锁内判定。
+                    evidence_query = parse_qs(
+                        parsed.query, keep_blank_values=True
+                    )
+                    self._send_json(
+                        200,
+                        service.get_audit_evidence(wallet_id, evidence_query),
+                    )
+                    return
                 if rest == ["transaction-policy"]:
                     self._send_json(
                         200, service.get_transaction_policy(wallet_id)
@@ -416,6 +431,10 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if rest == ["audit-integrity"]:
                     # audit-integrity 只接受 GET：其他方法抛 ServiceError
                     # （405），由统一失败边界按对应状态返回。
+                    raise ServiceError(405, "method not allowed")
+
+                if rest == ["audit-evidence"]:
+                    # audit-evidence 只接受 GET
                     raise ServiceError(405, "method not allowed")
 
                 if len(rest) == 1 and rest[0] in ("freeze", "unfreeze"):
@@ -969,6 +988,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     if rest == ["audit-integrity"]:
                         # audit-integrity 只接受 GET
                         raise ServiceError(405, "method not allowed")
+                    if rest == ["audit-evidence"]:
+                        # audit-evidence 只接受 GET
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(
@@ -1108,11 +1130,15 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             self._reject_unsupported_method()
 
         def do_HEAD(self) -> None:  # noqa: N802
-            # HEAD 语义不返回响应体：audit-integrity 上仅给 405 状态头。
+            # HEAD 语义不返回响应体：audit-integrity / audit-evidence 上仅
+            # 给 405 状态头。
             self._compact_response = False
             path = urlparse(self.path).path
             matched = self._split_wallet_path(path)
-            if matched is not None and matched[1] == ["audit-integrity"]:
+            if matched is not None and matched[1] in (
+                ["audit-integrity"],
+                ["audit-evidence"],
+            ):
                 self.send_response(405)
                 self.send_header("Allow", "GET")
                 self.send_header("Content-Length", "0")
@@ -1121,15 +1147,17 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 self._send_error(404, "not found")
 
         def _reject_unsupported_method(self) -> None:
-            """audit-integrity 资源上的 DELETE/PATCH/OPTIONS/HEAD 一律
-            抛 ServiceError(405)；其余路径保持 404。"""
+            """audit-integrity / audit-evidence 资源上的
+            DELETE/PATCH/OPTIONS/HEAD 一律抛 ServiceError(405)；其余路径
+            保持 404。"""
             self._compact_response = False
             try:
                 path = urlparse(self.path).path
                 matched = self._split_wallet_path(path)
-                if matched is not None and matched[1] == [
-                    "audit-integrity"
-                ]:
+                if matched is not None and matched[1] in (
+                    ["audit-integrity"],
+                    ["audit-evidence"],
+                ):
                     raise ServiceError(405, "method not allowed")
                 self._send_error(404, "not found")
             except Exception as exc:

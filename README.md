@@ -58,6 +58,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/reject` | 拒绝 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/cancel` | 撤销审批单 `{"cancel_id","reason"}` |
 | GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`） |
+| GET  | `/v1/wallets/{id}/audit-evidence` | 区间逐条摘要与前后局部链头证据（`from_seq`/`to_seq`/`expected_head`） |
 | GET  | `/v1/wallets/{id}/audit-integrity` | 审计防篡改摘要链校验（可带 `expected_head`） |
 | POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
 | POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
@@ -1191,6 +1192,35 @@ details 形状矛盾一律 fail-closed（`503`、serve 拒绝就绪、保留现�
 可带 `expected_head`：格式或钱包标识非法 `400`，钱包不存在 `404`，
 期望摘要与链头不符 `409`；不带该参数时只校验链。审计记录及链元数据
 随灾备快照校验，摘要不完整或被篡改时恢复失败且不写目标数据。
+
+### 审计区间证据（逐条摘要 + 局部链头）
+`GET /v1/wallets/{id}/audit-evidence?from_seq=<正整数>&to_seq=<正整数>[&expected_head=<64位小写十六进制>]`
+供审计方取得区间逐条摘要及前后局部链头，**入口与审计查询同路径族、纯只读**：
+不分配 seq、不改状态、不写文件，故追加新事件后以旧 `end_head` 作为
+`expected_head` 重查旧区间仍然成立。
+
+- `from_seq`/`to_seq` 必填、为正整数且 `from_seq <= to_seq`，区间至多
+  1000 条；`expected_head` 可省，提供时须为 64 位小写十六进制且等于
+  范围结束后的摘要头。
+- 成功返回
+  `{"wallet_id","range":{"from_seq","to_seq"},"events","event_digests","start_head","end_head","count","state"}`：
+  `events` 按 seq 升序并沿用 audit-events 公开视图（不含份额私钥或任何
+  中间值）；`event_digests` 按既有七字段摘要规则与 `events` 一一对应；
+  `start_head` 为 `from_seq` 前一事件后的链头（`from_seq=1` 时是 64 个
+  零），`end_head` 为 `to_seq` 后的链头，可由 `start_head` 与
+  `event_digests` 按既有递推规则复算；`count` 为区间事件数，`state`
+  恒为 `valid`。证据与灾备快照同一对账标准。
+- 错误：非 GET 方法 `405`（`method not allowed`）；钱包不存在 `404`；
+  缺参 `400 missing evidence parameters`、参数重复
+  `400 duplicate evidence parameters`、`from_seq` 非法
+  `400 invalid from_seq`、`to_seq` 非法 `400 invalid to_seq`、
+  `expected_head` 格式非法 `400 invalid expected_head`、
+  `from_seq > to_seq` 或区间超过 1000 条
+  `400 invalid evidence range`；空钱包 `404 empty evidence range`、
+  `to_seq` 越界 `404 evidence range out of bounds`；`expected_head` 与
+  区间 `end_head` 不符 `409 expected_head does not match chain head`；
+  审计不可对账（链元数据缺失/不匹配、事件被篡改等）一律 `503 service
+  temporarily unavailable`，保留现场不覆盖。
 
 ## 多进程与故障恢复（保证）
 
