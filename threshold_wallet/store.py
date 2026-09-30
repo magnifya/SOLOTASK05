@@ -7,6 +7,12 @@
                                     单个份额（份额私钥以 hex 保存），一份一个文件
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
     policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
+    approval-rosters/<wallet_id>.json
+                                    该钱包的钱包级审批人名单
+                                    （allowed_approvers 码点升序；空数列为
+                                    清空事件后的重建结果），只含标识与
+                                    字符串，不含任何私钥材料；审计事件是
+                                    唯一提交点，恢复取最后一条事件重建
     requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
     rotations/<wallet_id>.json      该钱包的份额轮换记录（prepared/activating/active）
     rotation-staging/<wallet_id>/<rotation_id>/
@@ -128,6 +134,31 @@ def approval_policy_shape_ok(policy: object) -> bool:
         return False
     timeout = policy.get("timeout_seconds")
     return _is_plain_int(timeout) and timeout > 0
+
+
+def approval_roster_member_ok(member: object) -> bool:
+    """审批人名单成员形状：1..128 字符的非空白字符串（bool 排除）。"""
+    return (
+        isinstance(member, str)
+        and not isinstance(member, bool)
+        and 1 <= len(member) <= 128
+        and bool(member.strip())
+    )
+
+
+def approval_roster_shape_ok(roster: object) -> bool:
+    """钱包级审批人名单形状：wallet_id 为合法标识、allowed_approvers 为
+    数组，每项为 1..128 字符非空白字符串且按码点升序、无重复。"""
+    if not isinstance(roster, dict):
+        return False
+    if not _valid_safe_id(roster.get("wallet_id")):
+        return False
+    members = roster.get("allowed_approvers")
+    if not isinstance(members, list):
+        return False
+    if not all(approval_roster_member_ok(member) for member in members):
+        return False
+    return members == sorted(members) and len(set(members)) == len(members)
 
 
 def transaction_policy_shape_ok(policy: object) -> bool:
@@ -300,6 +331,9 @@ class WalletStore:
         self._shares_dir = os.path.join(data_dir, "shares")
         self._signatures_dir = os.path.join(data_dir, "signatures")
         self._policies_dir = os.path.join(data_dir, "policies")
+        self._approval_rosters_dir = os.path.join(
+            data_dir, "approval-rosters"
+        )
         self._requests_dir = os.path.join(data_dir, "requests")
         self._rotations_dir = os.path.join(data_dir, "rotations")
         self._rotation_staging_dir = os.path.join(data_dir, "rotation-staging")
@@ -313,6 +347,7 @@ class WalletStore:
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
         os.makedirs(self._policies_dir, exist_ok=True)
+        os.makedirs(self._approval_rosters_dir, exist_ok=True)
         os.makedirs(self._requests_dir, exist_ok=True)
         os.makedirs(self._rotations_dir, exist_ok=True)
         os.makedirs(self._rotation_staging_dir, exist_ok=True)
@@ -532,6 +567,62 @@ class WalletStore:
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+    # ---- 钱包级审批人名单 -----------------------------------------------
+
+    def _approval_roster_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(
+            self._approval_rosters_dir, wallet_id + ".json"
+        )
+
+    def save_approval_roster(self, wallet_id: str, roster: dict) -> None:
+        """原子地写入（或覆盖）钱包的审批人名单。
+
+        文件只含 wallet_id 与 allowed_approvers（标识/字符串），不含任何
+        私钥材料。"""
+        path = self._approval_roster_path(wallet_id)
+        with self._lock:
+            self._atomic_write(path, roster)
+
+    def get_approval_roster(self, wallet_id: str) -> Optional[dict]:
+        """返回钱包的审批人名单，未设置返回 None。
+
+        文件存在但 JSON 损坏抛 CorruptDataError；形状损坏（成员类型/长度
+        非法、重复或未按码点升序）同样抛 CorruptDataError，绝不把残缺
+        名单交给上层做门控判定。"""
+        roster = self._read_json(self._approval_roster_path(wallet_id))
+        if roster is not None and not approval_roster_shape_ok(roster):
+            raise CorruptDataError(
+                f"approval roster for wallet {wallet_id!r} is malformed"
+            )
+        return roster
+
+    def delete_approval_roster(self, wallet_id: str) -> None:
+        """删除钱包的审批人名单文件（名单事件追加失败时回滚用）。"""
+        path = self._approval_roster_path(wallet_id)
+        with self._lock:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def approval_roster_file_exists(self, wallet_id: str) -> bool:
+        """该钱包的审批人名单文件是否存在（存在即需与审计对账）。"""
+        return os.path.exists(self._approval_roster_path(wallet_id))
+
+    def list_approval_roster_wallet_ids(self) -> list[str]:
+        """返回存在审批人名单文件的全部 wallet_id（启动恢复扫描用）。"""
+        try:
+            names = os.listdir(self._approval_rosters_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and _SAFE_ID.match(name[: -len(".json")])
+        )
 
     # ---- 冷热钱包交易策略 -----------------------------------------------
 

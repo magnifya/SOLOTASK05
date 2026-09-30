@@ -42,6 +42,8 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/unfreeze` | 解除应急冻结 `{"reason"}` |
 | GET  | `/v1/wallets/{id}/security-state` | 查询安全状态 `{wallet_id,state,reason}` |
 | PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
+| PUT  | `/v1/wallets/{id}/approval-roster` | 钱包级审批人名单 `{"allowed_approvers":[...]}` |
+| GET  | `/v1/wallets/{id}/approval-roster` | 查询审批人名单（未设置为空数组，始终 200） |
 | PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
 | PUT  | `/v1/wallets/{id}/dkg-failover-policy` | DKG 故障审批开关 `{"enabled":bool}` |
@@ -107,6 +109,19 @@ JSON 对象。
 
 - `PUT approval-policy`：`required_approvals` 为 1 或 2，
   `timeout_seconds` 为正整数；成功 `200`，非法 `400`，钱包不存在 `404`。
+- `PUT/GET approval-roster`：请求体只允许
+  `{"allowed_approvers":[...]}`；每项为 1..128 字符非空白字符串，重复
+  成员 `400`；缺字段/夹带字段/成员类型或长度非法/路径标识非法均为
+  `400`，钱包不存在 `404`，冻结钱包写入 `409`（查询可用）。响应恒为
+  `{"allowed_approvers":[...]}`，成员按码点升序；空数组表示取消限制。
+  首次设置、修改、清空与同值更新都 `200` 且各记一条
+  `approval_roster_updated`（details 只含当前名单）；`GET` 对已存在
+  钱包始终 `200`，未设置为空数组，读取不记事件。
+- 名单启用（非空）后，只有名单内的 `approver_id` 可以批准或拒绝签名单
+  （含冷签名、资产撤销、节点复职、份额绑定、跨链接管等复用审批单的
+  入口，均沿用原有门控）；名单外提交决定为 `409`。名单变更只约束其后
+  的新决定：已有批准继续有效；同一 approver 同决定重放仍 `200` 且不
+  计数，不复查名单。未配置名单时审批行为不变。
 - `POST sign-requests`：`id`、`message` 非空；未设策略 `409`；首建
   `201`；同 id 同文幂等 `200`；同 id 异文 `409`。
 - 审批单视图 `{id,message,state,approvers,count,req,t0,t1,reason}`，

@@ -137,6 +137,10 @@ def _safe_id_match(value: str) -> bool:
 
 #: 审计事件类型
 TYPE_POLICY_UPDATED = "policy_updated"
+#: 钱包级审批人名单整体快照（details 恰为 {"allowed_approvers": [...]}，
+#: 成员按码点升序、无重复；空数组表示取消限制；request_id/actor_id/
+#: reason 均为 null，取最后一条事件重建名单）
+TYPE_APPROVAL_ROSTER_UPDATED = "approval_roster_updated"
 TYPE_REQUEST_CREATED = "request_created"
 TYPE_REQUEST_APPROVED = "request_approved"
 TYPE_REQUEST_REJECTED = "request_rejected"

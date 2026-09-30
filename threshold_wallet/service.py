@@ -227,6 +227,7 @@ class WalletService:
             | set(self._store.list_staging_wallet_ids())
             | set(self._store.list_asset_intent_wallet_ids())
             | set(self._store.list_asset_ledger_wallet_ids())
+            | set(self._store.list_approval_roster_wallet_ids())
             | set(self._store.list_sign_session_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
             | set(self._list_restore_txn_wallet_ids())
@@ -393,6 +394,10 @@ class WalletService:
             # 状态只由这两类事件折叠，逐事件严格校验 details 与交替状态
             # 机；畸形/同态连续 fail-closed，恢复不新增事件、不改 seq。
             self._freeze_events_strict(wallet_id)
+            # 钱包级审批人名单（approval_roster_updated）：取最后一条事件
+            # 重建名单文件并严格对账事件形状/成员顺序/文件关系；矛盾或
+            # 损坏 fail-closed；重建不新增事件、不改 seq。
+            self._reconcile_approval_roster_locked(wallet_id)
             # 先校验资产账本（形状 + 语义）：账本损坏时任何对账都不可信，
             # 直接 fail-closed。
             self._store.check_asset_ledger_semantics(wallet_id)
@@ -524,6 +529,11 @@ class WalletService:
             # 损坏时无法与意图/事件对账，绝不能静默当成空账本。任何持锁
             # 访问都先校验账本，损坏即由 _recover_wallet 统一 fail-closed。
             self._store.check_asset_ledger_semantics(wallet_id)
+            # 审批人名单文件形状损坏同样 fail-closed，绝不把坏名单当未
+            # 配置空名单；文件存在即与最后一条事件严格对账（缺失文件
+            # 时由启动全量恢复按事件重建）。
+            if self._store.approval_roster_file_exists(wallet_id):
+                self._reconcile_approval_roster_locked(wallet_id)
             # 签名会话文件形状损坏同样 fail-closed，绝不把坏会话当空会话。
             # 这里只做形状校验；会话对账必须排在轮换/资产恢复之后——会话
             # 迁移依据"当前在用份额"，而他进程崩溃遗留的半完成激活可能仍
@@ -1149,6 +1159,212 @@ class WalletService:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
         return policy
+
+    # ---- 钱包级审批人名单 -----------------------------------------------
+
+    @staticmethod
+    def _validate_approval_roster(allowed_approvers: object) -> list[str]:
+        """校验审批人名单：须为数组，每项 1..128 字符非空白字符串，
+        重复成员拒绝；返回按码点升序排列的新列表。非法一律 400。"""
+        if not isinstance(allowed_approvers, list):
+            raise ServiceError(
+                400, "allowed_approvers must be a list"
+            )
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for index, member in enumerate(allowed_approvers):
+            if (
+                not isinstance(member, str)
+                or isinstance(member, bool)
+                or not (1 <= len(member) <= 128)
+                or not member.strip()
+            ):
+                raise ServiceError(
+                    400,
+                    f"allowed_approvers[{index}] must be a non-blank "
+                    "string of 1 to 128 characters",
+                )
+            if member in seen:
+                raise ServiceError(
+                    400,
+                    f"allowed_approvers[{index}] duplicates a prior member",
+                )
+            seen.add(member)
+            normalized.append(member)
+        return sorted(normalized)
+
+    def _approval_roster_events_strict(
+        self, wallet_id: str
+    ) -> list[dict]:
+        """按 seq 升序返回该钱包全部 approval_roster_updated 事件并逐条
+        严格校验（调用方须持钱包事务锁）。
+
+        每条事件的 request_id/actor_id/reason 必须为 null；details 恰含
+        allowed_approvers 单键；名单为数组、每项 1..128 字符非空白字符
+        串、无重复且按码点升序。事件形状或成员顺序矛盾都是不可对账现场
+        （RecoveryError）；审计 JSON 损坏抛 CorruptDataError、I/O 失败抛
+        OSError。纯只读，不记事件、不改 seq。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_APPROVAL_ROSTER_UPDATED
+        )
+        for event in events:
+            if (
+                event.get("request_id") is not None
+                or event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an approval_roster_updated "
+                    "event with request_id/actor_id/reason set"
+                )
+            details = event.get("details")
+            if not isinstance(details, dict) or set(details) != {
+                "allowed_approvers"
+            }:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed "
+                    "approval_roster_updated event"
+                )
+            members = details["allowed_approvers"]
+            if not isinstance(members, list) or any(
+                (
+                    not isinstance(member, str)
+                    or isinstance(member, bool)
+                    or not (1 <= len(member) <= 128)
+                    or not member.strip()
+                )
+                for member in members
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an approval_roster_updated "
+                    "event with a malformed member"
+                )
+            if members != sorted(members) or len(set(members)) != len(
+                members
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an approval_roster_updated "
+                    "event whose members are not in strictly ascending "
+                    "codepoint order"
+                )
+        return events
+
+    def _reconcile_approval_roster_locked(self, wallet_id: str) -> None:
+        """对账并按最后一条事件重建钱包级审批人名单（调用方须持锁）。
+
+        - 无事件且无名单文件：空现场，空数组（不限制）；
+        - 无事件却有名单文件：恢复关系矛盾，RecoveryError；
+        - 有事件而名单文件缺失：取最后一条事件重建名单文件（不新增
+          事件、不改 seq）；
+        - 事件与文件都在：文件 wallet_id 与成员（含顺序）须与最后一条
+          事件逐字一致，否则 RecoveryError。
+
+        名单 JSON 损坏抛 CorruptDataError、I/O 失败抛 OSError。"""
+        events = self._approval_roster_events_strict(wallet_id)
+        roster = self._store.get_approval_roster(wallet_id)
+        if not events:
+            if roster is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an approval roster file "
+                    "without an approval_roster_updated event"
+                )
+            return
+        expected_members = events[-1]["details"]["allowed_approvers"]
+        if roster is None:
+            # 取最后一条事件重建名单文件：事件是唯一提交点
+            self._store.save_approval_roster(
+                wallet_id,
+                {
+                    "wallet_id": wallet_id,
+                    "allowed_approvers": expected_members,
+                },
+            )
+            return
+        if roster.get("wallet_id") != wallet_id or roster.get(
+            "allowed_approvers"
+        ) != expected_members:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} approval roster does not match its "
+                "last approval_roster_updated event"
+            )
+
+    def _approval_roster_members_locked(self, wallet_id: str) -> list[str]:
+        """当前生效的审批人名单（调用方须持钱包事务锁）。
+
+        名单文件经启动/持锁恢复与最后一条 approval_roster_updated 事件
+        严格对账；未设置（含已清空）返回空列表（不限制）。名单文件损坏
+        fail-closed（由 HTTP 边界转 503）。"""
+        roster = self._store.get_approval_roster(wallet_id)
+        if roster is None:
+            return []
+        return list(roster["allowed_approvers"])
+
+    def get_approval_roster(self, wallet_id: str) -> dict:
+        """GET /v1/wallets/<id>/approval-roster：对已存在钱包始终 200
+        返回 ``{"allowed_approvers": [...]}``，未设置/已清空为空数组。
+
+        纯只读，不记事件；冻结钱包也可查询。钱包不存在 404，损坏/矛盾
+        现场 fail-closed（由 HTTP 边界转 503）。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：锁内先判定钱包存在
+                self._get_wallet_or_404(wallet_id)
+                members = self._approval_roster_members_locked(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return {"allowed_approvers": members}
+
+    def put_approval_roster(
+        self, wallet_id: str, allowed_approvers: object
+    ) -> dict:
+        """PUT /v1/wallets/<id>/approval-roster：设置/覆盖/清空钱包级
+        审批人名单。
+
+        成功 200 返回 ``{"allowed_approvers": [...]}``（按码点升序），
+        空数组表示取消限制。首次设置、修改、清空与同值更新都各记一条
+        approval_roster_updated 事件（request_id/actor_id/reason 为
+        null，details 只含当前 allowed_approvers）。读取、校验、状态
+        写入与事件追加全部在每钱包事务锁内线性化；冻结钱包 409，钱包
+        不存在 404，参数非法 400。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：钱包存在性在锁内先于参数校验
+                self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
+                members = self._validate_approval_roster(allowed_approvers)
+                roster = {
+                    "wallet_id": wallet_id,
+                    "allowed_approvers": members,
+                }
+                old_roster = self._store.get_approval_roster(wallet_id)
+                # 状态/事件原子：先写状态文件，事件追加失败则回滚（旧
+                # 文件不存在时删除新文件），绝不留无事件支撑的名单。
+                self._store.save_approval_roster(wallet_id, roster)
+                event = self._audit_event(
+                    audit.TYPE_APPROVAL_ROSTER_UPDATED,
+                    details={"allowed_approvers": members},
+                )
+                try:
+                    self._emit(wallet_id, event)
+                except BaseException:
+                    if old_roster is None:
+                        self._store.delete_approval_roster(wallet_id)
+                    else:
+                        self._store.save_approval_roster(
+                            wallet_id, old_roster
+                        )
+                    raise
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return {"allowed_approvers": members}
 
     # ---- 冷热钱包交易策略 -------------------------------------------------
 
@@ -10057,6 +10273,16 @@ class WalletService:
                     # 同一 approver 重复批准不计数、不记事件（幂等 200）
                     if approver_id in record["approvers"]:
                         return self._request_view(record)
+                    # 钱包级审批人名单：仅名单内 approver_id 可作出新决定。
+                    # 名单为空（未设置/已清空）不限制；名单变更只约束其后
+                    # 的新决定——上面的同人重放直接 200 返回，不复查名单。
+                    roster = self._approval_roster_members_locked(wallet_id)
+                    if roster and approver_id not in roster:
+                        raise ServiceError(
+                            409,
+                            f"approver {approver_id!r} is not on the "
+                            "wallet approval roster",
+                        )
                     new_record = dict(record)
                     new_record["approvers"] = list(record["approvers"])
                     new_record["approvers"].append(approver_id)
@@ -10085,6 +10311,15 @@ class WalletService:
                     return self._request_view(new_record)
 
                 # reject：任何一名审批人拒绝即终态（首批）
+                # 同 approve：名单外的新拒绝一律 409；终态后的重放此前
+                # 已按非 pending 返回 409，不会走到这里。
+                roster = self._approval_roster_members_locked(wallet_id)
+                if roster and approver_id not in roster:
+                    raise ServiceError(
+                        409,
+                        f"approver {approver_id!r} is not on the "
+                        "wallet approval roster",
+                    )
                 new_record = dict(record)
                 new_record["state"] = "rejected"
                 if reason is not None:

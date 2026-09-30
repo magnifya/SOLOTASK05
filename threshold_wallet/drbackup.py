@@ -63,6 +63,7 @@ _BUSINESS_FILE_DIRS = (
     "audit",
     "signatures",
     "policies",
+    "approval-rosters",
     "requests",
     "rotations",
     "assets",
@@ -621,6 +622,7 @@ _SIGNATURE_RECORD_KEYS = frozenset(("message", "signature"))
 _APPROVAL_POLICY_KEYS = frozenset(
     ("wallet_id", "required_approvals", "timeout_seconds")
 )
+_APPROVAL_ROSTER_KEYS = frozenset(("wallet_id", "allowed_approvers"))
 _TRANSACTION_POLICY_KEYS = frozenset(("mode", "max_delta", "allowed_assets"))
 
 #: 非份额文件中绝不得出现的私钥字段名
@@ -640,6 +642,7 @@ _AUDIT_LOG_KEYS = frozenset(
 _KNOWN_AUDIT_TYPES = frozenset(
     (
         "policy_updated",
+        "approval_roster_updated",
         "request_created",
         "request_approved",
         "request_rejected",
@@ -1188,7 +1191,11 @@ def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
     会话/暂存份额由线上恢复器做严格对账；此处补齐恢复器不逐键覆盖的
     文件，保证非份额文件不含任何 private_key 字段、每类文件只含契约键。
     """
-    from .store import approval_policy_shape_ok, transaction_policy_shape_ok
+    from .store import (
+        approval_policy_shape_ok,
+        approval_roster_shape_ok,
+        transaction_policy_shape_ok,
+    )
 
     rel = f"policies/{wallet_id}.json"
     if rel in files:
@@ -1197,6 +1204,13 @@ def _verify_business_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
             policy
         ):
             raise BackupError(503, "approval policy file is malformed")
+    rel = f"approval-rosters/{wallet_id}.json"
+    if rel in files:
+        roster = _load_json_object(files[rel], "approval roster file")
+        if set(roster) != _APPROVAL_ROSTER_KEYS or not approval_roster_shape_ok(
+            roster
+        ):
+            raise BackupError(503, "approval roster file is malformed")
     rel = f"transaction-policies/{wallet_id}.json"
     if rel in files:
         policy = _load_json_object(files[rel], "transaction policy file")

@@ -7,6 +7,8 @@
 - POST /v1/wallets/<wallet_id>/unfreeze             解除应急冻结
 - GET  /v1/wallets/<wallet_id>/security-state       查询钱包安全状态
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
+- PUT  /v1/wallets/<wallet_id>/approval-roster      设置钱包级审批人名单
+- GET  /v1/wallets/<wallet_id>/approval-roster      查询钱包级审批人名单
 - PUT  /v1/wallets/<wallet_id>/transaction-policy   设置冷热钱包交易策略
 - GET  /v1/wallets/<wallet_id>/transaction-policy   查询冷热钱包交易策略
 - PUT  /v1/wallets/<wallet_id>/dkg-failover-policy  设置 DKG 故障审批开关
@@ -300,6 +302,13 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if rest == ["dkg-failover-policy"]:
                     self._send_json(
                         200, service.get_dkg_failover_policy(wallet_id)
+                    )
+                    return
+                if rest == ["approval-roster"]:
+                    # 已存在钱包始终 200：未设置/已清空返回空数组；纯
+                    # 只读，不记事件，冻结钱包也可查询。
+                    self._send_json(
+                        200, service.get_approval_roster(wallet_id)
                     )
                     return
                 if rest == ["nodes"]:
@@ -959,6 +968,21 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                             wallet_id,
                             body.get("required_approvals"),
                             body.get("timeout_seconds"),
+                        )
+                        self._send_json(200, result)
+                        return
+                    if rest == ["approval-roster"]:
+                        body = self._read_json_body()
+                        # PUT 仅收 {"allowed_approvers": [...]}：缺字段、
+                        # 夹带字段一律 400；成员类型/长度/重复由 service
+                        # 严格校验（400）。
+                        if set(body) != {"allowed_approvers"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly allowed_approvers",
+                            )
+                        result = service.put_approval_roster(
+                            wallet_id, body.get("allowed_approvers")
                         )
                         self._send_json(200, result)
                         return
