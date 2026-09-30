@@ -142,6 +142,7 @@ TYPE_REQUEST_APPROVED = "request_approved"
 TYPE_REQUEST_REJECTED = "request_rejected"
 TYPE_REQUEST_EXPIRED = "request_expired"
 TYPE_REQUEST_SIGNED = "request_signed"
+TYPE_REQUEST_CANCELLED = "request_cancelled"
 TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
@@ -221,6 +222,10 @@ EVENT_TYPES = {
 #: details 键序须按 README 既定顺序在落盘/查询/灾备保序的事件类型。
 #: 其余事件类型的 details 仍按 sort_keys 规范序落盘（行为不变）。
 _DETAILS_KEY_ORDER = {
+    TYPE_REQUEST_CANCELLED: (
+        "cancel_id",
+        "reason",
+    ),
     TYPE_SESSION_PARTICIPANT_REPLACED: (
         "session_id",
         "old_share_id",

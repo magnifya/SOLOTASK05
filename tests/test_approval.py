@@ -60,6 +60,15 @@ class ApprovalHttpTest(unittest.TestCase):
             "POST", f"/v1/wallets/{wallet}/sign-requests/{rid}/reject", body
         )
 
+    def cancel(
+        self, rid="r1", cancel_id="c1", reason="changed my mind", wallet="w1"
+    ):
+        return self.request(
+            "POST",
+            f"/v1/wallets/{wallet}/sign-requests/{rid}/cancel",
+            {"cancel_id": cancel_id, "reason": reason},
+        )
+
     # ---- PUT approval-policy -------------------------------------------
 
     def test_put_policy_200(self):
@@ -266,6 +275,131 @@ class ApprovalHttpTest(unittest.TestCase):
         self.assertEqual(self.approve()[0], 409)
         self.assertEqual(self.reject()[0], 409)
 
+    # ---- 撤销 ------------------------------------------------------------
+
+    def test_cancel_pending_201_replay_200_and_audit_event(self):
+        self.put_policy()
+        self.create_request()
+        status, body = self.cancel(reason="撤回")
+        self.assertEqual(status, 201)
+        self.assertEqual(body["state"], "cancelled")
+        self.assertEqual(body["reason"], "撤回")
+        status, body = self.cancel(reason="撤回")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "cancelled")
+        status, events = self.request("GET", "/v1/wallets/w1/audit-events")
+        self.assertEqual(status, 200)
+        cancel_events = [
+            event
+            for event in events["events"]
+            if event["type"] == "request_cancelled"
+        ]
+        self.assertEqual(len(cancel_events), 1)
+        self.assertEqual(cancel_events[0]["request_id"], "r1")
+        self.assertEqual(cancel_events[0]["actor_id"], "c1")
+        self.assertEqual(cancel_events[0]["reason"], "撤回")
+        self.assertEqual(
+            cancel_events[0]["details"],
+            {"cancel_id": "c1", "reason": "撤回"},
+        )
+
+    def test_cancel_conflicts_and_later_lifecycle_409(self):
+        self.put_policy(req=2)
+        self.create_request()
+        self.assertEqual(self.cancel()[0], 201)
+        self.assertEqual(self.approve(approver="alice")[0], 409)
+        self.assertEqual(self.reject(approver="alice")[0], 409)
+        status, _ = self.request(
+            "POST", "/v1/wallets/w1/sign", self._sign_body("w1", "r1", "pay-100")
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(self.cancel(reason="different")[0], 409)
+        self.assertEqual(self.cancel(cancel_id="c2")[0], 409)
+
+    def test_cancel_rejects_terminal_requests_and_reused_cancel_id(self):
+        self.put_policy(req=1)
+        self.create_request(rid="r1")
+        self.create_request(rid="r2")
+        self.approve(rid="r1")
+        self.assertEqual(self.cancel(rid="r1")[0], 409)
+        self.assertEqual(self.cancel(rid="r2", cancel_id="c2")[0], 201)
+        self.create_request(rid="r3", message="pay-300")
+        self.assertEqual(self.cancel(rid="r3", cancel_id="c2")[0], 409)
+
+    def test_cancel_expired_request_is_409(self):
+        self.put_policy(timeout=3600)
+        self.create_request()
+        self._expire_request()
+        self.assertEqual(self.cancel()[0], 409)
+
+    def test_cancel_body_validation_400(self):
+        self.put_policy()
+        self.create_request()
+        bodies = (
+            {},
+            {"cancel_id": "c1"},
+            {"reason": "x"},
+            {"cancel_id": "c1", "reason": "x", "extra": 1},
+            {"cancel_id": "bad/id", "reason": "x"},
+            {"cancel_id": "c1", "reason": ""},
+            {"cancel_id": "c1", "reason": "   "},
+            {"cancel_id": "c1", "reason": "x" * 1025},
+            {"cancel_id": 1, "reason": "x"},
+        )
+        for body in bodies:
+            status, resp = self.request(
+                "POST", "/v1/wallets/w1/sign-requests/r1/cancel", body
+            )
+            self.assertEqual(status, 400, body)
+            self.assertIn("error", resp)
+
+    def test_cancel_missing_wallet_or_request_404(self):
+        self.put_policy()
+        self.create_request()
+        self.assertEqual(self.cancel(wallet="ghost")[0], 404)
+        self.assertEqual(self.cancel(rid="ghost")[0], 404)
+
+    def test_cancel_frozen_wallet_409(self):
+        self.put_policy()
+        self.create_request()
+        self.request("POST", "/v1/wallets/w1/freeze", {"reason": "incident"})
+        self.assertEqual(self.cancel()[0], 409)
+
+    def test_request_cancel_crash_recovery_forward_and_rollback(self):
+        from threshold_wallet.service import WalletService
+
+        self.put_policy()
+        self.create_request()
+        store = self.srv.harness.store
+        original = store.get_request("w1", "r1")
+        cancelled = dict(original, state="cancelled", reason="撤回")
+
+        store.save_request_cancel_intent("w1", "r1", "c1", "撤回", original)
+        store.update_request("w1", "r1", cancelled)
+        WalletService(store, recover=True)
+        recovered = store.get_request("w1", "r1")
+        self.assertEqual(recovered["state"], "pending")
+        self.assertEqual(recovered["reason"], original["reason"])
+        self.assertEqual(store.get_request_cancel_intents("w1"), {})
+
+        store.save_request_cancel_intent("w1", "r1", "c1", "撤回", original)
+        store.update_request("w1", "r1", original)
+        service = WalletService(store, recover=False)
+        with service._wallet_lock("w1"):
+            service._emit(
+                "w1",
+                service._audit_event(
+                    "request_cancelled",
+                    request_id="r1",
+                    actor_id="c1",
+                    reason="撤回",
+                    details={"cancel_id": "c1", "reason": "撤回"},
+                ),
+            )
+        WalletService(store, recover=True)
+        self.assertEqual(store.get_request("w1", "r1"), cancelled)
+        self.assertEqual(store.get_request_cancel_intents("w1"), {})
+
     # ---- 签名门控 ---------------------------------------------------------
 
     def _sign_body(self, wallet, srid, message):
@@ -396,6 +530,23 @@ class ApprovalCliTest(unittest.TestCase):
         body = json.loads(out)
         self.assertEqual(body["state"], "rejected")
         self.assertEqual(body["reason"], "no")
+
+    def test_request_cancel_via_cli(self):
+        self.run_cli(
+            "policy", "--url", self.url, "--wallet-id", "w1",
+            "--required-approvals", "1", "--timeout-seconds", "60",
+        )
+        self.run_cli(
+            "request-create", "--url", self.url, "--wallet-id", "w1",
+            "--signing-request-id", "r1", "--message", "m",
+        )
+        code, out, err = self.run_cli(
+            "request-cancel", "--url", self.url, "--wallet-id", "w1",
+            "--signing-request-id", "r1", "--cancel-id", "c1",
+            "--reason", "cancel now",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["state"], "cancelled")
 
     def test_cli_error_exit_1_json_on_stderr(self):
         # 无策略时创建请求：409 -> 退出码 1，stderr 为单行 JSON

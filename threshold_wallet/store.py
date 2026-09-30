@@ -309,6 +309,9 @@ class WalletStore:
             data_dir, "transaction-policies"
         )
         self._sign_sessions_dir = os.path.join(data_dir, "sign-sessions")
+        self._request_cancel_intents_dir = os.path.join(
+            data_dir, "request-cancel-intents"
+        )
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -320,6 +323,7 @@ class WalletStore:
         os.makedirs(self._asset_intents_dir, exist_ok=True)
         os.makedirs(self._transaction_policies_dir, exist_ok=True)
         os.makedirs(self._sign_sessions_dir, exist_ok=True)
+        os.makedirs(self._request_cancel_intents_dir, exist_ok=True)
         self._lock = threading.Lock()
 
     @property
@@ -350,6 +354,12 @@ class WalletStore:
     def _requests_path(self, wallet_id: str) -> str:
         _check_id("wallet_id", wallet_id)
         return os.path.join(self._requests_dir, wallet_id + ".json")
+
+    def _request_cancel_intents_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(
+            self._request_cancel_intents_dir, wallet_id + ".json"
+        )
 
     @staticmethod
     def _atomic_write(path: str, data: dict) -> None:
@@ -521,6 +531,79 @@ class WalletStore:
             all_records = self._read_json(path) or {}
             all_records[signing_request_id] = record
             self._atomic_write(path, all_records)
+
+    def list_requests(self, wallet_id: str) -> dict:
+        """返回该钱包全部审批单记录（恢复对账用）。"""
+        return self._read_json(self._requests_path(wallet_id)) or {}
+
+    def request_file_exists(self, wallet_id: str) -> bool:
+        return os.path.exists(self._requests_path(wallet_id))
+
+    def list_request_wallet_ids(self) -> list[str]:
+        try:
+            names = os.listdir(self._requests_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and bool(_SAFE_ID.match(name[: -len(".json")]))
+        )
+
+    def save_request_cancel_intent(
+        self,
+        wallet_id: str,
+        request_id: str,
+        cancel_id: str,
+        reason: str,
+        previous: dict,
+    ) -> None:
+        """持久化审批单撤销事务的提交前快照。"""
+        _check_id("signing_request_id", request_id)
+        path = self._request_cancel_intents_path(wallet_id)
+        intent = {
+            "request_id": request_id,
+            "cancel_id": cancel_id,
+            "reason": reason,
+            "previous": previous,
+        }
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            all_records[request_id] = intent
+            self._atomic_write(path, all_records)
+
+    def get_request_cancel_intents(self, wallet_id: str) -> dict:
+        return self._read_json(self._request_cancel_intents_path(wallet_id)) or {}
+
+    def delete_request_cancel_intent(
+        self, wallet_id: str, request_id: str
+    ) -> None:
+        path = self._request_cancel_intents_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or request_id not in all_records:
+                return
+            del all_records[request_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    def list_request_cancel_intent_wallet_ids(self) -> list[str]:
+        try:
+            names = os.listdir(self._request_cancel_intents_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and bool(_SAFE_ID.match(name[: -len(".json")]))
+        )
 
     # ---- 回滚（状态/事件原子性用）----------------------------------------
 

@@ -645,6 +645,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "request_rejected",
         "request_expired",
         "request_signed",
+        "request_cancelled",
         "share_rotation_prepared",
         "share_rotation_activated",
         "asset_operation_committed",
@@ -830,7 +831,7 @@ def _request_shape_ok(key: str, record: object) -> bool:
     if not isinstance(record.get("message"), str):
         return False
     if record.get("state") not in (
-        "pending", "approved", "rejected", "expired", "signed",
+        "pending", "approved", "rejected", "expired", "signed", "cancelled",
     ):
         return False
     approvers = record.get("approvers")
@@ -1127,10 +1128,14 @@ def _verify_requests_against_audit(
     signed = audit_store.events_by_type(
         wallet_id, audit_mod.TYPE_REQUEST_SIGNED
     )
+    cancelled = audit_store.events_by_type(
+        wallet_id, audit_mod.TYPE_REQUEST_CANCELLED
+    )
     by_rid: dict[str, dict[str, list[dict]]] = {}
     for kind, evs in (
-        ("created", created), ("approved", approved), ("rejected", rejected),
-        ("expired", expired), ("signed", signed),
+        ("created", created), ("approved", approved),
+        ("rejected", rejected), ("expired", expired),
+        ("signed", signed), ("cancelled", cancelled),
     ):
         for ev in evs:
             rid = ev.get("request_id")
@@ -1148,12 +1153,13 @@ def _verify_requests_against_audit(
         state = record["state"]
         terminal_events = {
             kind: len(groups.get(kind, [])) if groups else 0
-            for kind in ("signed", "expired", "rejected")
+            for kind in ("signed", "expired", "rejected", "cancelled")
         }
         # 记录终态与审计终态必须严格一致，不允许多余/缺失
         expected_terminal = {
-            "pending": None, "approved": None,
-            "signed": "signed", "expired": "expired", "rejected": "rejected",
+            "pending": None, "approved": None, "signed": "signed",
+            "expired": "expired", "rejected": "rejected",
+            "cancelled": "cancelled",
         }[state]
         for kind, count in terminal_events.items():
             want = 1 if kind == expected_terminal else 0
@@ -1172,6 +1178,17 @@ def _verify_requests_against_audit(
             raise BackupError(503, "request approvers do not match its events")
         if state == "approved" and len(record["approvers"]) != record["req"]:
             raise BackupError(503, "approved request never reached its quorum")
+        if state == "cancelled":
+            event = (groups or {}).get("cancelled", [None])[0]
+            details = event.get("details") if event else None
+            if (
+                not isinstance(details, dict)
+                or set(details) != {"cancel_id", "reason"}
+                or details.get("cancel_id") != event.get("actor_id")
+                or details.get("reason") != event.get("reason")
+                or record.get("reason") != event.get("reason")
+            ):
+                raise BackupError(503, "cancelled request disagrees with its event")
     # 反向：每个 request_created 事件都必须有审批单。注意无审批策略时
     # /sign 可直接产生 request_signed 事件而没有审批单/created 事件，
     # 那种单不在此对账范围内（其连续性由历史签名校验负责）。

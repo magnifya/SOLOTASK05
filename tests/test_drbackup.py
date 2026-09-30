@@ -176,6 +176,31 @@ class BackupTest(unittest.TestCase):
         self.assertFalse(any("locks/" in p for p in paths))
         self.assertFalse(any("asset-intents/" in p for p in paths))
 
+    def test_cancelled_request_survives_backup_restore(self):
+        svc = self.h.service
+        svc.put_policy("alice", 1, 3600)
+        svc.create_sign_request("alice", "r1", "hello")
+        status, cancelled = svc.cancel_sign_request(
+            "alice", "r1", {"cancel_id": "c1", "reason": "撤回"}
+        )
+        self.assertEqual(status, 201)
+
+        drbackup.backup(self.data, "alice", "S1", self.out)
+        dst = os.path.join(self.tmp, "restored")
+        status, _ = drbackup.restore(dst, "alice", self.out)
+        self.assertEqual(status, 201)
+
+        restored_store = WalletStore(dst)
+        self.assertEqual(
+            restored_store.get_request("alice", "r1")["state"], "cancelled"
+        )
+        events = AuditStore(dst).events_by_type(
+            "alice", "request_cancelled"
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["details"]["reason"], "撤回")
+        self.assertEqual(cancelled["state"], "cancelled")
+
     def test_backup_refuses_corrupt_wallet(self):
         svc = self.h.service
         svc.create_asset_operation("alice", "op1", "BTC", 5)

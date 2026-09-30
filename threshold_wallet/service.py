@@ -25,6 +25,7 @@ from .store import (
     DuplicateWalletError,
     RecoveryError,
     WalletStore,
+    _SAFE_ID,
     _SAFE_SHARE_ID,
     parse_utc_iso,
 )
@@ -231,6 +232,8 @@ class WalletService:
             | set(self._store.list_asset_intent_wallet_ids())
             | set(self._store.list_asset_ledger_wallet_ids())
             | set(self._store.list_sign_session_wallet_ids())
+            | set(self._store.list_request_wallet_ids())
+            | set(self._store.list_request_cancel_intent_wallet_ids())
             | set(self._audit.list_audit_wallet_ids())
             | set(self._list_restore_txn_wallet_ids())
             | set(self._list_restore_records_wallet_ids())
@@ -399,6 +402,9 @@ class WalletService:
             # 钱包审批人名单仅由 approval_roster_updated 事件承载：逐事件
             # 校验成员形状/去重/码点升序，取最后一条重建，不新增事件。
             self._approval_roster_events_strict(wallet_id)
+            # 审批单撤销以 request_cancelled 为唯一提交点：凭提交前意图
+            # 前滚/回滚崩溃窗口，并双向对账已 settled 的 cancelled 现场。
+            self._recover_request_cancellations(wallet_id)
             # 先校验资产账本（形状 + 语义）：账本损坏时任何对账都不可信，
             # 直接 fail-closed。
             self._store.check_asset_ledger_semantics(wallet_id)
@@ -536,6 +542,10 @@ class WalletService:
             # 持有错误的钱包份额，必须先按激活事件前滚/回滚确定在用份额，
             # 再对账会话，避免把会话迁移到未提交轮换的份额上。
             self._store.check_sign_sessions(wallet_id)
+            if self._store.get_request_cancel_intents(
+                wallet_id
+            ) or self._store.request_file_exists(wallet_id):
+                self._recover_request_cancellations(wallet_id)
             if self._store.list_asset_intents(wallet_id):
                 self._recover_wallet(wallet_id)
                 return
@@ -2864,6 +2874,146 @@ class WalletService:
             "reason": record["reason"],
         }
 
+    @staticmethod
+    def _valid_request_cancel_reason(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and not isinstance(value, bool)
+            and bool(value.strip())
+            and len(value) <= MAX_REASON_LENGTH
+        )
+
+    def _request_cancel_events_strict(
+        self, wallet_id: str
+    ) -> dict[str, dict]:
+        """严格读取并按 request_id 索引全部 request_cancelled 事件。"""
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_REQUEST_CANCELLED
+        )
+        by_request: dict[str, dict] = {}
+        cancel_ids: dict[str, str] = {}
+        terminal_types = {
+            audit.TYPE_REQUEST_APPROVED,
+            audit.TYPE_REQUEST_REJECTED,
+            audit.TYPE_REQUEST_EXPIRED,
+            audit.TYPE_REQUEST_SIGNED,
+        }
+        for event in events:
+            rid = event.get("request_id")
+            cancel_id = event.get("actor_id")
+            reason = event.get("reason")
+            details = event.get("details")
+            if not isinstance(rid, str) or not _SAFE_ID.match(rid):
+                raise RecoveryError("request_cancelled event has a bad request_id")
+            if not isinstance(cancel_id, str) or not _SAFE_ID.match(cancel_id):
+                raise RecoveryError("request_cancelled event has a bad cancel_id")
+            if not self._valid_request_cancel_reason(reason):
+                raise RecoveryError("request_cancelled event has a bad reason")
+            if not isinstance(details, dict) or set(details) != {
+                "cancel_id",
+                "reason",
+            }:
+                raise RecoveryError("request_cancelled event has bad details")
+            if details.get("cancel_id") != cancel_id or details.get("reason") != reason:
+                raise RecoveryError("request_cancelled event identifiers disagree")
+            if rid in by_request:
+                raise RecoveryError(
+                    f"request {rid!r} has multiple cancellation events"
+                )
+            previous_rid = cancel_ids.get(cancel_id)
+            if previous_rid is not None and previous_rid != rid:
+                raise RecoveryError(
+                    f"cancel_id {cancel_id!r} was reused across requests"
+                )
+            cancel_ids[cancel_id] = rid
+            by_request[rid] = event
+        for event in self._audit.all_events(wallet_id):
+            rid = event.get("request_id")
+            if (
+                isinstance(rid, str)
+                and rid in by_request
+                and event.get("type") in terminal_types
+                and event["seq"] > by_request[rid]["seq"]
+            ):
+                raise RecoveryError(
+                    f"cancelled request {rid!r} has a later lifecycle event"
+                )
+        return by_request
+
+    def _recover_request_cancellations(self, wallet_id: str) -> None:
+        """按 request_cancelled 事件前滚/回滚审批单撤销事务。
+
+        事件是唯一提交点。提交前意图存在时，事件在则前滚为 cancelled，
+        事件不在则回滚到意图中的完整 pending 快照；无意图的 cancelled
+        现场或缺事件现场均为不可对账矛盾。恢复本身不新增事件、不改 seq。
+        """
+        cancel_events = self._request_cancel_events_strict(wallet_id)
+        intents = self._store.get_request_cancel_intents(wallet_id)
+        for rid, intent in intents.items():
+            if not _SAFE_ID.match(rid) or not isinstance(intent, dict):
+                raise RecoveryError("request cancellation intent is malformed")
+            if set(intent) != {"request_id", "cancel_id", "reason", "previous"}:
+                raise RecoveryError("request cancellation intent is malformed")
+            cancel_id = intent.get("cancel_id")
+            reason = intent.get("reason")
+            previous = intent.get("previous")
+            if intent.get("request_id") != rid or not (
+                isinstance(cancel_id, str) and _SAFE_ID.match(cancel_id)
+            ) or not self._valid_request_cancel_reason(reason):
+                raise RecoveryError("request cancellation intent is malformed")
+            if not isinstance(previous, dict) or previous.get("id") != rid:
+                raise RecoveryError("request cancellation intent is malformed")
+            current = self._store.get_request(wallet_id, rid)
+            event = cancel_events.get(rid)
+            if current is None:
+                raise RecoveryError(
+                    f"request cancellation intent for {rid!r} has no request"
+                )
+            if event is not None:
+                committed = dict(previous)
+                committed["state"] = "cancelled"
+                committed["reason"] = reason
+                if (
+                    event["actor_id"] != cancel_id
+                    or event["reason"] != reason
+                ):
+                    raise RecoveryError(
+                        f"request cancellation intent for {rid!r} disagrees "
+                        "with its event"
+                    )
+                if current != committed:
+                    self._store.update_request(wallet_id, rid, committed)
+            else:
+                if current != previous:
+                    self._store.update_request(wallet_id, rid, previous)
+            self._store.delete_request_cancel_intent(wallet_id, rid)
+
+        requests = self._store.list_requests(wallet_id)
+        for rid, record in requests.items():
+            event = cancel_events.get(rid)
+            if event is None:
+                if isinstance(record, dict) and record.get("state") == "cancelled":
+                    raise RecoveryError(
+                        f"cancelled request {rid!r} has no cancellation event"
+                    )
+                continue
+            if not isinstance(record, dict):
+                raise RecoveryError(f"request {rid!r} is malformed")
+            if record.get("state") != "cancelled":
+                raise RecoveryError(
+                    f"request {rid!r} has a cancellation event but is "
+                    f"{record.get('state')!r}"
+                )
+            if record.get("reason") != event["reason"]:
+                raise RecoveryError(
+                    f"cancelled request {rid!r} disagrees with its event reason"
+                )
+        for rid in cancel_events:
+            if rid not in requests:
+                raise RecoveryError(
+                    f"request_cancelled event for {rid!r} has no request"
+                )
+
     def _expire_if_needed(self, wallet_id: str, record: dict) -> dict:
         """懒过期：任何操作前把已超时的 pending 单持久化为 expired，
         并原子记录一次 request_expired 事件。调用方须持有该钱包事务锁。
@@ -3019,6 +3169,107 @@ class WalletService:
             raise
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+
+    def cancel_sign_request(
+        self, wallet_id: str, request_id: str, body: object
+    ) -> tuple[int, dict]:
+        """撤销 pending 且未过期的审批单。
+
+        request_cancelled 是唯一提交点；同 rid + cancel_id + reason 重放
+        返回 200。cancel_id 复用或参数变化、审批单非 pending、冻结钱包
+        均为 409。
+        """
+        record = None
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
+                if not isinstance(body, dict) or set(body) != {
+                    "cancel_id",
+                    "reason",
+                }:
+                    raise ServiceError(
+                        400,
+                        "body must contain exactly cancel_id and reason",
+                    )
+                cancel_id = body["cancel_id"]
+                reason = body["reason"]
+                if not isinstance(cancel_id, str) or not _SAFE_ID.match(
+                    cancel_id
+                ):
+                    raise ServiceError(400, "invalid cancel_id")
+                if not self._valid_request_cancel_reason(reason):
+                    raise ServiceError(
+                        400,
+                        "reason must be a non-blank string of 1 to "
+                        f"{MAX_REASON_LENGTH} characters",
+                    )
+                record = self._fetch_request_or_404(wallet_id, request_id)
+                record = self._expire_if_needed(wallet_id, record)
+                cancel_events = self._request_cancel_events_strict(wallet_id)
+                existing = cancel_events.get(request_id)
+                if existing is not None:
+                    if (
+                        existing["actor_id"] == cancel_id
+                        and existing["reason"] == reason
+                    ):
+                        return 200, self._request_view(record)
+                    raise ServiceError(
+                        409,
+                        "signing request was cancelled with different parameters",
+                    )
+                for event in cancel_events.values():
+                    if event["actor_id"] == cancel_id:
+                        raise ServiceError(
+                            409, "cancel_id has already been used"
+                        )
+                if record["state"] != "pending":
+                    raise ServiceError(
+                        409,
+                        f"signing request {request_id!r} is {record['state']}, "
+                        "not pending",
+                    )
+                cancelled = dict(record)
+                cancelled["state"] = "cancelled"
+                cancelled["reason"] = reason
+                self._store.save_request_cancel_intent(
+                    wallet_id, request_id, cancel_id, reason, record
+                )
+                self._store.update_request(
+                    wallet_id, request_id, cancelled
+                )
+                try:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_REQUEST_CANCELLED,
+                            request_id=request_id,
+                            actor_id=cancel_id,
+                            reason=reason,
+                            details={
+                                "cancel_id": cancel_id,
+                                "reason": reason,
+                            },
+                        ),
+                    )
+                except BaseException:
+                    self._store.update_request(
+                        wallet_id, request_id, record
+                    )
+                    self._store.delete_request_cancel_intent(
+                        wallet_id, request_id
+                    )
+                    raise
+                self._store.delete_request_cancel_intent(
+                    wallet_id, request_id
+                )
+                record = cancelled
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return 201, self._request_view(record)
 
     # ---- 审计事件查询 ---------------------------------------------------
 
@@ -10174,6 +10425,12 @@ class WalletService:
                 record = self._fetch_request_or_404(wallet_id, request_id)
                 # 懒过期可能在此原子记一次 E；过期后操作落入终态分支（409、不记 A/R）
                 record = self._expire_if_needed(wallet_id, record)
+                if record["state"] == "cancelled":
+                    raise ServiceError(
+                        409,
+                        f"signing request {request_id!r} is cancelled, "
+                        "not pending",
+                    )
                 roster = self._approval_roster_events_strict(wallet_id)
                 # 同人同决定重放优先，返回 200、不计数、不复查当前名单：
                 # 批准人已在审批单 approvers 中即同批准重放；拒绝重放由
