@@ -26,6 +26,7 @@
 - GET  /v1/wallets/<wallet_id>/share-rotations/<id>        查询轮换
 - POST /v1/wallets/<wallet_id>/share-rotations/<id>/activate  激活轮换
 - POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
+- GET  /v1/wallets/<wallet_id>/asset-operations/<id>       查询资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
@@ -227,6 +228,14 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
                 if len(rest) == 2 and rest[0] == "assets":
                     self._send_json(200, service.get_asset(wallet_id, rest[1]))
+                    return
+                if len(rest) == 2 and rest[0] == "asset-operations":
+                    # 只读：不触发懒过期、不追加事件、不分配 seq；冻结
+                    # 钱包亦可查询。
+                    self._send_json(
+                        200,
+                        service.get_asset_operation(wallet_id, rest[1]),
+                    )
                     return
                 if len(rest) == 2 and rest[0] == "chain":
                     self._send_json(
