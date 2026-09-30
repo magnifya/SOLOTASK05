@@ -3417,6 +3417,131 @@ class WalletService:
             "head": head,
         }
 
+    # ---- 审计区间证据（逐条摘要 + 前后局部链头） -------------------------
+
+    #: 单次证据区间最多 1000 条
+    AUDIT_EVIDENCE_MAX_RANGE = 1000
+
+    @staticmethod
+    def _evidence_seq(value: object, invalid_message: str) -> int:
+        """证据区间端点：非布尔正整数（parse_qs 单值列表取首项；字符串先
+        strip，仅接受十进制数字，拒绝 0/负数/小数/布尔/其他类型）。非法抛
+        调用方指定的 400 文案。调用方须先完成重复参数判定。"""
+        text = value[0] if isinstance(value, list) else value
+        if isinstance(text, str):
+            text = text.strip()
+            if not text.isdigit():
+                raise ServiceError(400, invalid_message)
+            text = int(text)
+        if not isinstance(text, int) or isinstance(text, bool) or text < 1:
+            raise ServiceError(400, invalid_message)
+        return text
+
+    def get_audit_evidence(
+        self,
+        wallet_id: str,
+        from_seq: object = None,
+        to_seq: object = None,
+        expected_head: object = None,
+    ) -> dict:
+        """返回区间逐条审计证据::
+
+            {wallet_id, range:{from_seq,to_seq}, events, event_digests,
+             start_head, end_head, count, state:"valid"}
+
+        - events 按 seq 升序并沿用 audit-events 公开视图（副本重排，绝不
+          含密钥或中间值）；event_digests 与 events 一一对应，按既有七字段
+          摘要规则（七键键升序紧凑 JSON 的 SHA-256）计算；
+        - start_head 为 from_seq 前一事件后的链头（from_seq=1 时为 64 个
+          零），end_head 为 to_seq 后的链头，可由 start_head 与
+          event_digests 按既有递推规则复算；count 为区间事件数。
+
+        纯只读：在该钱包事务锁内先自愈，再与其他审计读取同一套 DKG 重放
+        对账并重放整条摘要链（integrity），链元数据缺失/不匹配、事件被
+        改动等不可对账现场一律上抛（HTTP 边界转 503），不分配 seq、不改
+        状态、不写文件；并发追加后再次查询结果一致，旧 end_head 可作为
+        新请求的 expected_head 继续验证。
+
+        三个参数接受 parse_qs 的字符串列表（None 表示缺参，长度 >1 即重复
+        参数）。参数校验次序（钱包存在性 404 之后）：缺参 → 重复 →
+        from_seq 非法 → to_seq 非法 → expected_head 格式 → 区间非法
+        （from>to 或超 1000 条）；空钱包（无任何事件）404 empty evidence
+        range；to_seq 越界 404 evidence range out of bounds；expected_head
+        与 end_head 不符 409。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于查询参数 400：与 audit-events / audit-integrity
+                # 同一次序。
+                self._get_wallet_or_404(wallet_id)
+                # 1) 缺参（expected_head 可省；parse_qs 默认丢弃空白值，
+                #    故空白值同样按缺省处理）
+                if from_seq is None or to_seq is None:
+                    raise ServiceError(
+                        400, "missing evidence parameters"
+                    )
+                # 2) 重复参数：按 from_seq、to_seq、expected_head 次序报
+                for value in (from_seq, to_seq, expected_head):
+                    if isinstance(value, list) and len(value) > 1:
+                        raise ServiceError(
+                            400, "duplicate evidence parameters"
+                        )
+                # 3) from_seq 非法
+                seq_from = self._evidence_seq(from_seq, "invalid from_seq")
+                # 4) to_seq 非法
+                seq_to = self._evidence_seq(to_seq, "invalid to_seq")
+                # 5) expected_head 格式（可省；给定时须为 64 位小写十六进制）
+                if isinstance(expected_head, list):
+                    expected_head = expected_head[0]
+                if expected_head is not None and (
+                    not isinstance(expected_head, str)
+                    or not self._EXPECTED_HEAD_RE.match(expected_head)
+                ):
+                    raise ServiceError(400, "invalid expected_head")
+                # 6) 区间非法：from > to 或区间超过 1000 条
+                if (
+                    seq_from > seq_to
+                    or seq_to - seq_from + 1 > self.AUDIT_EVIDENCE_MAX_RANGE
+                ):
+                    raise ServiceError(400, "invalid evidence range")
+                # 与 audit-events 同一套严格 DKG 对账：details 形状矛盾等
+                # 现场 fail-closed，绝不返回未经对账的"证据"。
+                self._reconcile_dkg_events_locked(wallet_id)
+                # 整条摘要链必须可对账：文件存在但缺 chain 元数据、链头与
+                # 事件重算不符一律 RecoveryError（503），绝不静默出证。
+                self._audit.integrity(wallet_id)
+                evidence = self._audit.range_evidence(
+                    wallet_id, seq_from, seq_to
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        if evidence is None or evidence["count"] == 0:
+            # 无审计文件或一条事件都没有：区间必然为空
+            raise ServiceError(404, "empty evidence range")
+        if seq_to > evidence["count"]:
+            raise ServiceError(404, "evidence range out of bounds")
+        if expected_head is not None and expected_head != evidence["end_head"]:
+            raise ServiceError(
+                409, "expected_head does not match chain head"
+            )
+        events = [
+            self._public_audit_event_view(event)
+            for event in evidence["events"]
+        ]
+        return {
+            "wallet_id": wallet_id,
+            "range": {"from_seq": seq_from, "to_seq": seq_to},
+            "events": events,
+            "event_digests": evidence["event_digests"],
+            "start_head": evidence["start_head"],
+            "end_head": evidence["end_head"],
+            "count": len(events),
+            "state": "valid",
+        }
+
     # ---- 份额轮换 ---------------------------------------------------------
 
     @staticmethod

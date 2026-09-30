@@ -1282,6 +1282,58 @@ class AuditStore:
             if event.get("type") == event_type
         ]
 
+    def range_evidence(
+        self, wallet_id: str, from_seq: int, to_seq: int
+    ) -> Optional[dict]:
+        """区间逐条审计证据（纯只读，不分配 seq、不改状态、不写文件）。
+
+        严格加载审计文件（损坏/摘要矛盾即 CorruptDataError/RecoveryError，
+        由调用方转 503）；文件不存在返回 None。调用方须先保证钱包存在且
+        ``1 <= from_seq <= to_seq`` 且 ``to_seq`` 不越界（本方法不再复核
+        区间合法性）。返回::
+
+            {"events": [...from_seq..to_seq 按 seq 升序的副本...],
+             "event_digests": [与 events 一一对应的七字段事件摘要],
+             "start_head": from_seq 前一事件后的链头
+                           （from_seq=1 时为 64 个零）,
+             "end_head": to_seq 后的链头,
+             "count": 全部事件数}
+
+        start_head/end_head/event_digests 均按既有递推规则（前序摘要文本 +
+        事件摘要文本）重算：end_head 可由 start_head 与 event_digests 复算
+        得到。事件摘要基于严格加载归一化后的七字段形态，故调用方随后对
+        查询副本做的外层键序重排（如 dkg_failover 的公开视图）不影响
+        摘要——摘要只取七键且按键升序编码。
+        """
+        data = self._read_strict(wallet_id)
+        if data is None:
+            return None
+        head = GENESIS_HEAD
+        start_head = GENESIS_HEAD
+        end_head = GENESIS_HEAD
+        events: list[dict] = []
+        digests: list[str] = []
+        for event in sorted(data["events"], key=lambda e: e["seq"]):
+            digest = _event_digest(event)
+            head = hashlib.sha256(
+                (head + digest).encode("ascii")
+            ).hexdigest()
+            seq = event["seq"]
+            if seq == from_seq - 1:
+                start_head = head
+            if from_seq <= seq <= to_seq:
+                events.append(dict(event))
+                digests.append(digest)
+            if seq == to_seq:
+                end_head = head
+        return {
+            "events": events,
+            "event_digests": digests,
+            "start_head": start_head,
+            "end_head": end_head,
+            "count": len(data["events"]),
+        }
+
     def all_events(self, wallet_id: str) -> list[dict]:
         """返回该钱包全部事件（按 seq 升序，返回副本）。纯只读。
 

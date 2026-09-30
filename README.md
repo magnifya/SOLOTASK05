@@ -58,6 +58,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/reject` | 拒绝 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/cancel` | 撤销审批单 `{"cancel_id","reason"}` |
 | GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`） |
+| GET  | `/v1/wallets/{id}/audit-evidence` | 区间逐条证据（`from_seq`/`to_seq`/`expected_head`） |
 | GET  | `/v1/wallets/{id}/audit-integrity` | 审计防篡改摘要链校验（可带 `expected_head`） |
 | POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
 | POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
@@ -1191,6 +1192,39 @@ details 形状矛盾一律 fail-closed（`503`、serve 拒绝就绪、保留现�
 可带 `expected_head`：格式或钱包标识非法 `400`，钱包不存在 `404`，
 期望摘要与链头不符 `409`；不带该参数时只校验链。审计记录及链元数据
 随灾备快照校验，摘要不完整或被篡改时恢复失败且不写目标数据。
+
+#### 区间逐条证据（audit-evidence）
+
+`GET /v1/wallets/{id}/audit-evidence?from_seq=F&to_seq=T[&expected_head=H]`
+只接受 GET（其他方法 `405`，`error` 为 `method not allowed`），供审计方
+取得区间逐条摘要及前后局部链头。`from_seq`/`to_seq` 为正整数且
+`from_seq <= to_seq`，区间至多 1000 条；`expected_head` 可省，提供时
+为 64 位小写十六进制且须等于范围结束后的摘要头。成功 `200` 返回
+`{"wallet_id","range","events","event_digests","start_head","end_head",
+"count","state"}`：
+
+- `range` 为 `{"from_seq":F,"to_seq":T}`；`events` 按 seq 升序并沿用
+  audit-events 的公开七字段视图，不含密钥或中间值；
+- `event_digests` 与 `events` 一一对应，按既有七字段摘要规则（七键键
+  升序紧凑 JSON 的 SHA-256）计算；
+- `start_head` 为 from_seq 前一事件后的链头，from_seq 为 1 时是 64 个
+  零；`end_head` 为 to_seq 后的链头，可由 start_head 与 event_digests
+  按既有递推规则（前序摘要文本 + 事件摘要文本）复算；
+- `count` 为区间事件数，`state` 恒为 `valid`。
+
+错误次序（钱包存在性先于参数判定，钱包不存在 `404`）：缺参 `400`
+`missing evidence parameters`、重复参数 `400`
+`duplicate evidence parameters`、`from_seq` 非法 `400`
+`invalid from_seq`、`to_seq` 非法 `400` `invalid to_seq`、
+`expected_head` 格式非法 `400` `invalid expected_head`、范围非法
+（from>to 或超 1000 条）`400` `invalid evidence range`；空钱包（无
+任何事件）`404` `empty evidence range`；`to_seq` 越界 `404`
+`evidence range out of bounds`；expected_head 与 end_head 不符 `409`
+`expected_head does not match chain head`；审计不可对账（链元数据
+缺失/矛盾、事件被改动等）`503` `service temporarily unavailable`。
+证据为纯只读：不分配 seq、不改状态、不写文件；同一区间重复查询结果
+一致，追加事件后旧 end_head 仍可作为新请求的 expected_head 验证新的
+链头。成功体与错误体均为 UTF-8 紧凑 JSON（非 ASCII 不转义、无末换行）。
 
 ## 多进程与故障恢复（保证）
 
