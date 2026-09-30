@@ -63,6 +63,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/share-rotations/{rid}/activate` | 激活轮换 |
 | POST | `/v1/wallets/{id}/share-bind` | 绑定 DKG 复职节点到轮换份额槽位 `{"id","rotation","dkg","round","node","slot","approval"}` |
 | POST | `/v1/wallets/{id}/asset-operations` | 建资产操作 `{"operation_id","asset_id","delta"}` |
+| GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version` |
@@ -577,8 +578,15 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   过期或 message 异文 `409`。同 cancel_id、同操作、同审批参数重放优先
   `200`；同 cancel_id 异参、撤销 committed/cancelled 操作、同一操作已有
   其他 cancel_id、或与 commit 在同钱包事务锁内并发落败均 `409` 且账本、
-  version、审计不变（失败不写意图，也不懒落过期事件）。冻结钱包撤销
-  沿用 `409` 闸门。
+  version、审计不变（失败不写意图，也不懒落过期事件）。唯一取消事件
+  已存在后，三键完全相同的重放优先返回 `200`，即使审批单随后推进为
+  `signed` 也不再复查当前审批状态。冻结钱包撤销沿用 `409` 闸门。
+- `GET asset-operations/{oid}`：在每钱包事务锁和恢复/对账后只读返回
+  固定键序的既有操作视图，末键 `cancellation` 在未撤销时为 `null`；
+  已撤销时为 `{cancel_id,approval_request_id,seq}`，`seq` 为
+  `asset_operation_cancelled` 事件序号。非法 `operation_id` 返回 `400`，
+  钱包或操作不存在返回 `404`；冻结钱包可查询。查询不触发懒过期、不写
+  状态/意图/事件、不分配 seq，不改变余额、version、操作状态或摘要链。
 - 撤销事务可恢复（意图与提交意图共用 `asset-intents/`，以
   `kind:"cancel"` 区分）：唯一提交点是审计事件
   `asset_operation_cancelled`（`request_id` 为 cancel_id、`actor_id` 为

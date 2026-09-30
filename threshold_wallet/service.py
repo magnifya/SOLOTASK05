@@ -588,6 +588,7 @@ class WalletService:
             # 审计日志"的既有可用性边界。
             if self._store.asset_ledger_file_exists(wallet_id):
                 self._reconcile_asset_committed_events(wallet_id)
+                self._reconcile_asset_cancelled_events(wallet_id)
                 # 链确认报告/策略事件与账本提交门控同属账本一致性：
                 # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_events(wallet_id)
@@ -4374,8 +4375,42 @@ class WalletService:
                     f"approval request {approval_request_id!r} not found",
                 )
 
-            # 失败不写意图、账本或事件：过期判定只读，不在这里懒落
-            # request_expired（与"撤销失败零副作用"契约一致）。
+            cancel_events = {
+                event.get("request_id"): event
+                for event in self._audit.events_by_type(
+                    wallet_id, audit.TYPE_ASSET_OPERATION_CANCELLED
+                )
+            }
+            prior_for_cancel = cancel_events.get(cancel_id)
+            op_event = next(
+                (
+                    event
+                    for event in cancel_events.values()
+                    if event.get("details", {}).get("operation_id")
+                    == operation_id
+                ),
+                None,
+            )
+            # 唯一取消提交点已存在时，三键完全相同的重放优先成功，并且
+            # 不再复查审批单当前状态（其后可因签名推进为 signed）。
+            if (
+                prior_for_cancel is not None
+                and prior_for_cancel is op_event
+                and prior_for_cancel.get("actor_id") == approval_request_id
+            ):
+                return 200, record
+            # cancel_id 已指向他操作/他审批，或本操作已有其他取消提交点：
+            # 均为异参重放，409 且零副作用。
+            if prior_for_cancel is not None or op_event is not None:
+                raise ServiceError(
+                    409,
+                    f"cancel_id {cancel_id!r} was already used with "
+                    "different parameters",
+                )
+
+            # 以下仅适用于首次撤销：失败不写意图、账本或事件。过期判定
+            # 只读，不在这里懒落 request_expired（与"撤销失败零副作用"
+            # 契约一致）。
             approval_state = approval.get("state")
             if (
                 approval_state == "pending"
@@ -4398,32 +4433,7 @@ class WalletService:
                     f"{approval_state}, not approved",
                 )
 
-            cancel_events = {
-                event.get("request_id"): event
-                for event in self._audit.events_by_type(
-                    wallet_id, audit.TYPE_ASSET_OPERATION_CANCELLED
-                )
-            }
-            prior_for_cancel = cancel_events.get(cancel_id)
             if record["state"] == "cancelled":
-                # 幂等重放要求同 cancel_id、同操作、同审批参数；该操作
-                # 已由其他 cancel_id 撤销，或本 cancel_id 属于他操作/他
-                # 审批单，均为 409。
-                op_event = next(
-                    (
-                        event
-                        for event in cancel_events.values()
-                        if event["details"]["operation_id"] == operation_id
-                    ),
-                    None,
-                )
-                if (
-                    op_event is not None
-                    and op_event.get("request_id") == cancel_id
-                    and op_event.get("actor_id") == approval_request_id
-                    and prior_for_cancel is op_event
-                ):
-                    return 200, record
                 raise ServiceError(
                     409,
                     f"asset operation {operation_id!r} is already cancelled",
@@ -4434,13 +4444,6 @@ class WalletService:
                     409,
                     f"asset operation {operation_id!r} is committed and "
                     "cannot be cancelled",
-                )
-            if prior_for_cancel is not None:
-                # cancel_id 已用于他操作（或他参数）：异参重放 409
-                raise ServiceError(
-                    409,
-                    f"cancel_id {cancel_id!r} was already used with "
-                    "different parameters",
                 )
             cancelled_record = self._cancel_asset_operation_locked(
                 wallet_id,
@@ -4881,6 +4884,58 @@ class WalletService:
                     "balance": asset["balance"],
                     "version": asset["version"],
                 }
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    def get_asset_operation(
+        self, wallet_id: str, operation_id: object
+    ) -> dict:
+        """只读查询单条资产操作及其取消信息。
+
+        返回固定键序的既有操作视图，并在末键附带 cancellation：
+        cancelled 操作为
+        ``{cancel_id,approval_request_id,seq}``，其余状态为 None。
+
+        查询在每钱包事务锁和崩溃恢复之后读取；冻结钱包允许查询。查询不
+        触发审批懒过期、不追加事件、不分配 seq，也不改变余额、version、
+        操作状态或摘要链。钱包存在性先于 operation_id 校验；账本、意图、
+        取消事件或摘要链矛盾时保留现场并由 HTTP 层返回 503。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                self._validate_operation_id(operation_id)
+                record = self._store.get_asset_operation(
+                    wallet_id, operation_id
+                )
+                if record is None:
+                    raise ServiceError(
+                        404, f"asset operation {operation_id!r} not found"
+                    )
+
+                self._reconcile_asset_cancelled_events(wallet_id)
+                view = self._asset_operation_view(record)
+                cancellation = None
+                if record["state"] == "cancelled":
+                    event = next(
+                        event
+                        for event in self._audit.events_by_type(
+                            wallet_id,
+                            audit.TYPE_ASSET_OPERATION_CANCELLED,
+                        )
+                        if event.get("details", {}).get("operation_id")
+                        == operation_id
+                    )
+                    cancellation = {
+                        "cancel_id": event["request_id"],
+                        "approval_request_id": event["actor_id"],
+                        "seq": event["seq"],
+                    }
+                view["cancellation"] = cancellation
+                return view
         except CorruptDataError:
             raise
         except ValueError:

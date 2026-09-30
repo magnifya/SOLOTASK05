@@ -20,7 +20,7 @@ import tempfile
 import threading
 import unittest
 
-from threshold_wallet.service import WalletService
+from threshold_wallet.service import ServiceError, WalletService
 from threshold_wallet.store import WalletStore
 from tests.helpers import http_server, make_harness
 
@@ -199,6 +199,41 @@ class AssetOperationCommitTest(unittest.TestCase):
 
     def test_commit_unknown_operation_returns_404(self):
         status, _ = self._commit("nope")
+        self.assertEqual(status, 404)
+
+    def test_get_operation_returns_view_with_null_cancellation(self):
+        self._create("op1", "btc", 100)
+        status, body = self.srv.request(
+            "GET", "/v1/wallets/w1/asset-operations/op1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            list(body),
+            [
+                "operation_id",
+                "asset_id",
+                "delta",
+                "state",
+                "balance",
+                "version",
+                "cancellation",
+            ],
+        )
+        self.assertEqual(body["state"], "pending")
+        self.assertIsNone(body["cancellation"])
+
+    def test_get_operation_rejects_invalid_id_and_missing_targets(self):
+        status, _ = self.srv.request(
+            "GET", "/v1/wallets/w1/asset-operations/bad%2Fid"
+        )
+        self.assertEqual(status, 400)
+        status, _ = self.srv.request(
+            "GET", "/v1/wallets/w1/asset-operations/missing"
+        )
+        self.assertEqual(status, 404)
+        status, _ = self.srv.request(
+            "GET", "/v1/wallets/missing/asset-operations/op1"
+        )
         self.assertEqual(status, 404)
 
     def test_commit_missing_wallet_returns_404(self):
@@ -415,6 +450,148 @@ class AssetOperationAuditTest(unittest.TestCase):
                 "asset_operation_committed",
             ],
         )
+
+
+class AssetOperationQueryAndCancelTest(unittest.TestCase):
+    """GET 单条资产操作与取消重放边界。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.harness = make_harness(self.tmpdir)
+        self.service = self.harness.service
+        self.service.create_wallet("w1", 2)
+        self.service.put_policy("w1", 1, 3600)
+
+    def _cancel_message(self, operation_id="op1", cancel_id="c1"):
+        return json.dumps(
+            {"operation_id": operation_id, "cancel_id": cancel_id},
+            separators=(",", ":"),
+        )
+
+    def _approved_request(self, request_id, operation_id="op1", cancel_id="c1"):
+        message = self._cancel_message(operation_id, cancel_id)
+        status, _ = self.service.create_sign_request(
+            "w1", request_id, message
+        )
+        self.assertEqual(status, 201)
+        self.service.approve("w1", request_id, "alice")
+        return message
+
+    def test_query_pending_and_committed_with_null_cancellation(self):
+        self.service.create_asset_operation("w1", "op1", "btc", 100)
+        self.assertEqual(
+            self.service.get_asset_operation("w1", "op1"),
+            {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "delta": 100,
+                "state": "pending",
+                "balance": 0,
+                "version": 0,
+                "cancellation": None,
+            },
+        )
+        self.service.commit_asset_operation("w1", "op1")
+        self.assertIsNone(
+            self.service.get_asset_operation("w1", "op1")["cancellation"]
+        )
+
+    def test_query_cancelled_includes_cancel_ids_and_event_seq(self):
+        message = self._approved_request("ap1")
+        self.service.create_asset_operation("w1", "op1", "btc", 100)
+        status, cancelled = self.service.cancel_asset_operation(
+            "w1", "op1", "c1", "ap1"
+        )
+        self.assertEqual(status, 201)
+        self.assertNotIn("cancellation", cancelled)
+
+        events = self.service.get_audit_events("w1")["events"]
+        cancel_event = next(
+            event
+            for event in events
+            if event["type"] == "asset_operation_cancelled"
+        )
+        self.assertEqual(
+            self.service.get_asset_operation("w1", "op1"),
+            {
+                "operation_id": "op1",
+                "asset_id": "btc",
+                "delta": 100,
+                "state": "cancelled",
+                "balance": 0,
+                "version": 0,
+                "cancellation": {
+                    "cancel_id": "c1",
+                    "approval_request_id": "ap1",
+                    "seq": cancel_event["seq"],
+                },
+            },
+        )
+
+        status, replay = self.service.cancel_asset_operation(
+            "w1", "op1", "c1", "ap1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, cancelled)
+
+        self.service.sign(
+            "w1",
+            "ap1",
+            message,
+            self.harness.two_signatures("w1", "ap1", message),
+        )
+        status, replay_after_signed = self.service.cancel_asset_operation(
+            "w1", "op1", "c1", "ap1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(replay_after_signed, cancelled)
+        cancel_events = [
+            event
+            for event in self.service.get_audit_events("w1")["events"]
+            if event["type"] == "asset_operation_cancelled"
+        ]
+        self.assertEqual(len(cancel_events), 1)
+
+    def test_cancel_replay_conflicts_and_query_validation(self):
+        self._approved_request("ap1")
+        self.service.create_asset_operation("w1", "op1", "btc", 100)
+        self.service.cancel_asset_operation("w1", "op1", "c1", "ap1")
+
+        self._approved_request("ap2", operation_id="op2", cancel_id="c1")
+        self.service.create_asset_operation("w1", "op2", "btc", 100)
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.cancel_asset_operation("w1", "op2", "c1", "ap2")
+        self.assertEqual(ctx.exception.status, 409)
+
+        message = self._cancel_message("op1", "c1")
+        self.service.create_sign_request("w1", "ap3", message)
+        self.service.approve("w1", "ap3", "alice")
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.cancel_asset_operation("w1", "op1", "c1", "ap3")
+        self.assertEqual(ctx.exception.status, 409)
+
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.get_asset_operation("w1", "bad/id")
+        self.assertEqual(ctx.exception.status, 400)
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.get_asset_operation("w1", "missing")
+        self.assertEqual(ctx.exception.status, 404)
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.get_asset_operation("missing", "op1")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_frozen_wallet_remains_queryable_but_not_cancellable(self):
+        self._approved_request("ap1")
+        self.service.create_asset_operation("w1", "op1", "btc", 100)
+        self.service.freeze_wallet("w1", "incident")
+        self.assertEqual(
+            self.service.get_asset_operation("w1", "op1")["state"],
+            "pending",
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            self.service.cancel_asset_operation("w1", "op1", "c1", "ap1")
+        self.assertEqual(ctx.exception.status, 409)
 
 
 class AssetOperationPersistenceTest(unittest.TestCase):
