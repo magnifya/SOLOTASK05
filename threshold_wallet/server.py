@@ -6,6 +6,9 @@
 - POST /v1/wallets/<wallet_id>/freeze               应急冻结钱包
 - POST /v1/wallets/<wallet_id>/unfreeze             解除应急冻结
 - GET  /v1/wallets/<wallet_id>/security-state       查询钱包安全状态
+- GET  /v1/wallets/<wallet_id>/change-control      查询高风险配置双人变更控制开关
+- POST /v1/wallets/<wallet_id>/policy-changes      双人审批统一变更受控配置
+- GET  /v1/wallets/<wallet_id>/policy-changes/<id> 查询已应用的配置变更视图
 - PUT  /v1/wallets/<wallet_id>/approval-policy      设置审批策略
 - PUT  /v1/wallets/<wallet_id>/approval-roster      设置钱包级审批人名单
 - GET  /v1/wallets/<wallet_id>/approval-roster      查询钱包级审批人名单
@@ -218,6 +221,18 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if rest == ["security-state"]:
                     self._send_json(
                         200, service.get_security_state(wallet_id)
+                    )
+                    return
+                if rest == ["change-control"]:
+                    # 双人变更控制开关查询：初始 {"enabled": false}
+                    self._send_json(
+                        200, service.get_change_control(wallet_id)
+                    )
+                    return
+                if len(rest) == 2 and rest[0] == "policy-changes":
+                    # 已应用配置变更视图
+                    self._send_json(
+                        200, service.get_policy_change(wallet_id, rest[1])
                     )
                     return
                 if rest == ["approval-roster"]:
@@ -510,6 +525,33 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         request_id = body.get("signing_request_id")
                     status, result = service.create_sign_request(
                         wallet_id, request_id, body.get("message")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["policy-changes"]:
+                    # 高风险配置双人变更统一入口：请求体恰为五键
+                    # （值类型/取值/target/before/after 由 service 严格校验）
+                    body = self._read_json_body()
+                    if set(body) != {
+                        "change_id",
+                        "target",
+                        "before",
+                        "after",
+                        "approval_request_id",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly change_id, target, "
+                            "before, after and approval_request_id",
+                        )
+                    status, result = service.post_policy_change(
+                        wallet_id,
+                        body.get("change_id"),
+                        body.get("target"),
+                        body.get("before"),
+                        body.get("after"),
+                        body.get("approval_request_id"),
                     )
                     self._send_json(status, result)
                     return

@@ -312,6 +312,9 @@ class WalletStore:
         self._request_cancel_intents_dir = os.path.join(
             data_dir, "request-cancel-intents"
         )
+        self._policy_change_intents_dir = os.path.join(
+            data_dir, "policy-change-intents"
+        )
         os.makedirs(self._wallets_dir, exist_ok=True)
         os.makedirs(self._shares_dir, exist_ok=True)
         os.makedirs(self._signatures_dir, exist_ok=True)
@@ -596,6 +599,64 @@ class WalletStore:
     def list_request_cancel_intent_wallet_ids(self) -> list[str]:
         try:
             names = os.listdir(self._request_cancel_intents_dir)
+        except FileNotFoundError:
+            return []
+        return sorted(
+            name[: -len(".json")]
+            for name in names
+            if name.endswith(".json")
+            and bool(_SAFE_ID.match(name[: -len(".json")]))
+        )
+
+    # ---- 高风险配置变更意图（文件型配置崩溃前滚/回滚用）------------------
+
+    def _policy_change_intents_path(self, wallet_id: str) -> str:
+        _check_id("wallet_id", wallet_id)
+        return os.path.join(
+            self._policy_change_intents_dir, wallet_id + ".json"
+        )
+
+    def save_policy_change_intent(
+        self, wallet_id: str, change_id: str, intent: dict
+    ) -> None:
+        """持久化一次高风险配置变更的提交前意图（按 change_id 索引）。
+
+        仅 approval-policy/transaction-policy 两类文件型配置需要：意图记录
+        变更前的完整策略文件（previous_file，未配置为 null）与变更后的公开
+        视图（after_view）。审计事件 policy_change_applied 是唯一提交点：
+        事件在则前滚、事件不在则按 previous_file 回滚。"""
+        _check_id("change_id", change_id)
+        path = self._policy_change_intents_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path) or {}
+            all_records[change_id] = intent
+            self._atomic_write(path, all_records)
+
+    def get_policy_change_intents(self, wallet_id: str) -> dict:
+        return self._read_json(
+            self._policy_change_intents_path(wallet_id)
+        ) or {}
+
+    def delete_policy_change_intent(
+        self, wallet_id: str, change_id: str
+    ) -> None:
+        path = self._policy_change_intents_path(wallet_id)
+        with self._lock:
+            all_records = self._read_json(path)
+            if not all_records or change_id not in all_records:
+                return
+            del all_records[change_id]
+            if all_records:
+                self._atomic_write(path, all_records)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    def list_policy_change_intent_wallet_ids(self) -> list[str]:
+        try:
+            names = os.listdir(self._policy_change_intents_dir)
         except FileNotFoundError:
             return []
         return sorted(
