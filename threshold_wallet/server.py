@@ -37,6 +37,9 @@
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
+- POST /v1/wallets/<wallet_id>/assets/<asset_id>/freeze    应急冻结资产
+- POST /v1/wallets/<wallet_id>/assets/<asset_id>/unfreeze  解除资产应急冻结
+- GET  /v1/wallets/<wallet_id>/assets/<asset_id>/security-state  查询资产安全状态
 - PUT  /v1/wallets/<wallet_id>/chain/<asset_id>            设置跨链确认策略
 - GET  /v1/wallets/<wallet_id>/chain/<asset_id>            查询跨链确认策略
 - POST /v1/wallets/<wallet_id>/chain/<operation_id>/report 上报链上确认数
@@ -252,6 +255,17 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
                 if len(rest) == 2 and rest[0] == "assets":
                     self._send_json(200, service.get_asset(wallet_id, rest[1]))
+                    return
+                if (
+                    len(rest) == 3
+                    and rest[0] == "assets"
+                    and rest[2] == "security-state"
+                ):
+                    # 资产安全状态：{wallet_id,asset_id,state,reason}
+                    self._send_json(
+                        200,
+                        service.get_asset_security_state(wallet_id, rest[1]),
+                    )
                     return
                 if len(rest) == 2 and rest[0] == "asset-operations":
                     self._send_json(
@@ -471,6 +485,33 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     else:
                         status, result = service.unfreeze_wallet(
                             wallet_id, body.get("reason")
+                        )
+                    self._send_json(status, result)
+                    return
+
+                if (
+                    len(rest) == 3
+                    and rest[0] == "assets"
+                    and rest[2] in ("freeze", "unfreeze")
+                ):
+                    # 资产应急冻结/解冻：请求体恰为 {"reason": "..."}，
+                    # reason 须为 1..1024 字符非空白字符串（取值由 service
+                    # 校验）；缺键/夹带/非对象/非法 JSON 一律 400。资产
+                    # frozen 期间该资产的冻结/解冻与只读接口仍可用（资产
+                    # 闸门在 service 各写方法内）。
+                    body = self._read_json_body()
+                    if set(body) != {"reason"}:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly reason",
+                        )
+                    if rest[2] == "freeze":
+                        status, result = service.freeze_asset(
+                            wallet_id, rest[1], body.get("reason")
+                        )
+                    else:
+                        status, result = service.unfreeze_asset(
+                            wallet_id, rest[1], body.get("reason")
                         )
                     self._send_json(status, result)
                     return

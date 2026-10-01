@@ -73,6 +73,9 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version` |
+| POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 应急冻结资产 `{"reason"}` |
+| POST | `/v1/wallets/{id}/assets/{asset_id}/unfreeze` | 解除资产应急冻结 `{"reason"}` |
+| GET  | `/v1/wallets/{id}/assets/{asset_id}/security-state` | 查询资产安全状态 `{wallet_id,asset_id,state,reason}` |
 | PUT  | `/v1/wallets/{id}/chain/{asset_id}` | 跨链确认策略 `{"chain_id","enabled","required_confirmations","reorg_window"}` |
 | GET  | `/v1/wallets/{id}/chain/{asset_id}` | 查询跨链确认策略（未配置 404） |
 | POST | `/v1/wallets/{id}/chain/{oid}/report` | 上报链上确认数 `{"chain_id","tx_id","block_height","block_hash","confirmations"}` |
@@ -1197,6 +1200,51 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
   `serve` 拒绝就绪，保留现场不猜写。reason 原文只出现在事件 details 与
   security-state/freeze 响应中，不进入访问日志。
 
+### 资产应急冻结（assets/{asset_id}/freeze / unfreeze）
+
+`POST /v1/wallets/{id}/assets/{asset_id}/freeze` 与
+`POST /v1/wallets/{id}/assets/{asset_id}/unfreeze`（仅 POST）是钱包级
+冻结之外的**按资产粒度**应急开关，请求体**恰为** `{"reason":"..."}`
+（缺键、夹带其他键、非 JSON 对象、`reason` 非字符串、空串/纯空白或
+超过 1024 字符一律 `400`，规则与钱包级一致）。钱包不存在、或该资产
+**尚无已提交操作**（账本中无资产条目）一律 `404`；`asset_id` 非法
+`400`。
+
+- `GET /v1/wallets/{id}/assets/{asset_id}/security-state` 始终 `200`
+  返回 `{"wallet_id","asset_id","state","reason"}`，键序固定，`state`
+  为 `active|frozen`；active 时 `reason` 为 `null`，frozen 时 `reason`
+  为该资产最近一次冻结的原文。钱包/资产 404 规则同上。
+- 首次转换 `201`：active 资产 freeze 转 frozen、frozen 资产 unfreeze
+  转 active；响应同 security-state 视图。当前状态对应的最近一次**同类
+  转换记录**与请求**同 reason** 时幂等重放 `200`（不记事件）；reason
+  不同、重复冻结或对未冻结资产解冻一律 `409`。各资产的冻结状态相互
+  独立。
+- **资产冻结闸门**：资产 frozen 时，改变该资产余额、version、操作
+  状态或链上派发进程的写入口统一 `409`——资产操作创建/提交/撤销、
+  跨链确认策略与多源仲裁策略更新、确认上报与观察上报、派发/自动派发
+  及其 result/confirm/takeover/isolate/settle 推进——即便请求本来命中
+  幂等 `200` 重放也一律 `409` 且**零副作用**（不触发懒过期、不追加
+  事件、不改现场）。其他资产的操作、与资产无关的既有写接口及全部
+  只读接口（返回磁盘现状）不受影响；**钱包级冻结闸门优先**于资产
+  闸门判定（钱包 frozen 时资产 freeze/unfreeze 写入口同样 409，资产
+  security-state 查询仍可用）。
+- 状态**只由审计事件承载**，不写任何状态文件：`asset_frozen` 与
+  `asset_unfrozen` 是唯一提交点，`request_id`/`actor_id`/`reason`
+  均为 `null`，details 恰为 `{"asset_id":"...","reason":"..."}`（键序
+  固定），与既有事件共用同一连续 seq。判定与事件追加在每钱包跨进程
+  事务锁内原子完成：同一操作并发只有一个 `201`，其余同参请求得到
+  `200`，重放不产生新事件。
+- **崩溃与灾备恢复**：启动、持锁访问与 backup/restore 都按 seq 把
+  两类事件**按资产分组**折叠重建状态（无事件为 active；同一资产的
+  事件必须严格交替，首条必为 `asset_frozen`），恢复不新增事件、不改
+  seq；frozen 状态与资产闸门在服务重启及快照恢复后继续生效，摘要链
+  与历史签名保持连续。事件 details 畸形（asset_id 非安全标识、
+  reason 非 1..1024 非空白字符串、夹带/缺字段）、三 id 字段非 null
+  或同态连续等现场自相矛盾一律抛 `RecoveryError`；审计 JSON 损坏抛
+  `CorruptDataError`；文件 I/O 失败抛 `OSError`——三者 HTTP 统一
+  `503`、`serve` 拒绝就绪，保留现场不猜写。reason 原文只出现在事件
+  details 与 security-state/freeze 响应中，不进入访问日志。
+
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
 `from_seq`/`limit` 为正整数，默认 1/1000，limit 上限 1000；非法 `400`，
 钱包不存在 `404`。纯只读，不触发懒过期、不分配 seq。
@@ -1220,6 +1268,9 @@ approval_request_id、details 即 cancelled 操作视图）、
 `chain_dispatch_isolated`、`chain_adapter_health`。
 钱包应急冻结/解冻另有 `wallet_frozen`、`wallet_unfrozen`（details 恰为
 `{"reason":"..."}`，两类事件严格交替，按 seq 折叠出 active/frozen 状态）。
+资产应急冻结/解冻另有 `asset_frozen`、`asset_unfrozen`（details 恰为
+`{"asset_id":"...","reason":"..."}` 两键固定序，同一资产的两类事件严格
+交替，按资产分组按 seq 折叠出该资产的 active/frozen 状态）。
 高风险配置双人变更另有 `policy_change_applied`（`request_id` 为 change_id、
 `actor_id` 为 approval_request_id、reason 为 null，details 恰含
 `change_id,target,before,after,approval_request_id` 五键固定序；同时作为七类

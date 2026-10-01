@@ -675,6 +675,8 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "chain_adapter_health",
         "wallet_frozen",
         "wallet_unfrozen",
+        "asset_frozen",
+        "asset_unfrozen",
         "policy_change_applied",
     )
 )
