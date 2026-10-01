@@ -205,6 +205,14 @@ TYPE_WALLET_FROZEN = "wallet_frozen"
 #: 钱包应急解冻（details 恰为 {"reason": ...}；request_id/actor_id/
 #: reason 均为 null；回到 active 的唯一提交点，与 wallet_frozen 严格交替）
 TYPE_WALLET_UNFROZEN = "wallet_unfrozen"
+#: 资产粒度应急冻结（details 恰为 {"asset_id", "reason"}；request_id 为
+#: 资产标识、actor_id/reason 均为 null；同一资产的 frozen 状态唯一提交点，
+#: 与 asset_unfrozen 严格交替，按 seq 折叠恢复）
+TYPE_ASSET_FROZEN = "asset_frozen"
+#: 资产粒度应急解冻（details 恰为 {"asset_id", "reason"}；request_id 为
+#: 资产标识、actor_id/reason 均为 null；该资产回到 active 的唯一提交点，
+#: 与 asset_frozen 严格交替）
+TYPE_ASSET_UNFROZEN = "asset_unfrozen"
 #: 钱包级审批人名单整体快照（details 恰为 {"allowed_approvers": [...]}；
 #: 数组成员按 Unicode 码点升序，空数组表示取消限制，取最后一条恢复）
 TYPE_APPROVAL_ROSTER_UPDATED = "approval_roster_updated"
@@ -410,6 +418,17 @@ _DETAILS_KEY_ORDER = {
     TYPE_WALLET_UNFROZEN: (
         "reason",
     ),
+    # asset_frozen / asset_unfrozen 的 details 恰为 {"asset_id", "reason"}：
+    # 两键固定序 asset_id,reason，资产标识原样、reason 原文保序（非 ASCII
+    # 不转义由写盘统一处理）。
+    TYPE_ASSET_FROZEN: (
+        "asset_id",
+        "reason",
+    ),
+    TYPE_ASSET_UNFROZEN: (
+        "asset_id",
+        "reason",
+    ),
     TYPE_APPROVAL_ROSTER_UPDATED: (
         "allowed_approvers",
     ),
@@ -449,6 +468,10 @@ _STRICT_DETAILS_ORDER_TYPES = frozenset(
         TYPE_CHAIN_DISPATCH_TAKEN_OVER,
         TYPE_CHAIN_DISPATCH_ISOLATED,
         TYPE_POLICY_CHANGE_APPLIED,
+        # 资产冻结/解冻是资产安全状态的唯一提交点：details 必须恰为
+        # asset_id,reason 落盘序，错序即不可对账现场。
+        TYPE_ASSET_FROZEN,
+        TYPE_ASSET_UNFROZEN,
     )
 )
 

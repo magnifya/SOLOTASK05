@@ -113,6 +113,13 @@ DISPATCH_CONFIRMATION_STATES = ("confirming", "finalized", "reorged")
 WALLET_STATE_ACTIVE = "active"
 WALLET_STATE_FROZEN = "frozen"
 
+#: 资产安全状态：active 正常（reason 为 null）、frozen 资产粒度应急冻结。
+#: 状态不由任何状态文件承载，只由 asset_frozen/asset_unfrozen 审计事件
+#: 按 (wallet, asset) 分组的 seq 折叠恢复，每资产两类事件严格交替
+#: （首条必为 asset_frozen）。
+ASSET_STATE_ACTIVE = "active"
+ASSET_STATE_FROZEN = "frozen"
+
 #: 审计事件落盘的外层七字段规范键序（audit 写盘按 sort_keys，惟既定
 #: 类型 details 保序）。恢复据此核对事件**外层**未被重排：正常现场恒为
 #: 此序，任何重排都是外部篡改，按不可对账现场 fail-closed。
@@ -423,6 +430,11 @@ class WalletService:
             # 状态只由这两类事件折叠，逐事件严格校验 details 与交替状态
             # 机；畸形/同态连续 fail-closed，恢复不新增事件、不改 seq。
             self._freeze_events_strict(wallet_id)
+            # 资产粒度应急冻结/解冻事件（asset_frozen/asset_unfrozen）：
+            # 按 (wallet, asset) 分组折叠，逐事件严格校验 details 与每资产
+            # 交替状态机（绑定资产 id 与 reason）；畸形/同态连续
+            # fail-closed，恢复不新增事件、不改 seq。
+            self._asset_freeze_events_strict(wallet_id)
             # 钱包审批人名单仅由 approval_roster_updated 事件承载：逐事件
             # 校验成员形状/去重/码点升序，取最后一条重建，不新增事件。
             self._approval_roster_events_strict(wallet_id)
@@ -451,6 +463,10 @@ class WalletService:
             # 双向对账：撤销事件是撤销的唯一提交点，与 cancelled 操作
             # 一一对应、details 即 cancelled 视图。
             self._reconcile_asset_cancelled_events(wallet_id)
+            # 资产冻结事件绑定的每个资产都必须在账本中有已提交操作：
+            # 冻结入口只对有已提交余额的资产开放，引用无已提交操作资产
+            # 的冻结事件是不可对账现场。须排在账本语义校验之后。
+            self._reconcile_asset_freeze_ledger(wallet_id)
             # 链确认事件（chain_policy/chain_report）与提交门控对账：
             # 报告状态机逐事件重放，矛盾/损坏 fail-closed；纯只读。
             self._reconcile_chain_events(wallet_id)
@@ -640,6 +656,10 @@ class WalletService:
             if self._store.asset_ledger_file_exists(wallet_id):
                 self._reconcile_asset_committed_events(wallet_id)
                 self._reconcile_asset_cancelled_events(wallet_id)
+                # 资产冻结事件与账本交叉对账：每条冻结事件绑定的资产都
+                # 必须有已提交操作（仅在账本文件存在时需要，资产冻结事件
+                # 只可能随已提交操作出现）。
+                self._reconcile_asset_freeze_ledger(wallet_id)
                 # 链确认报告/策略事件与账本提交门控同属账本一致性：
                 # 账本存在时一并按 seq 重放对账，矛盾即 fail-closed。
                 self._reconcile_chain_events(wallet_id)
@@ -1126,6 +1146,365 @@ class WalletService:
                 # 404 优先：锁内先判定钱包存在，再折叠冻结事件
                 self._get_wallet_or_404(wallet_id)
                 return self._security_state_locked(wallet_id)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    # ---- 资产粒度应急冻结/解冻 -------------------------------------------
+
+    @staticmethod
+    def _asset_security_state_view(
+        wallet_id: str, asset_id: str, state: str, reason: object
+    ) -> dict:
+        """资产安全状态对外视图，固定键序 wallet_id,asset_id,state,reason；
+        active 时 reason 恒为 null。"""
+        return {
+            "wallet_id": wallet_id,
+            "asset_id": asset_id,
+            "state": state,
+            "reason": reason,
+        }
+
+    def _asset_freeze_events_strict(
+        self, wallet_id: str
+    ) -> dict[str, list[dict]]:
+        """按 seq 折叠该钱包全部 asset_frozen/asset_unfrozen 事件，按资产
+        标识分组（组内按 seq 升序），逐条严格校验并核对每资产的交替状态
+        机（调用方须持钱包事务锁）。
+
+        每条事件 request_id 必须等于 details.asset_id（安全标识），
+        actor_id/reason(外层) 必须为 null，details 恰为
+        ``{"asset_id", "reason"}``（落盘序 asset_id,reason），reason 为
+        1..1024 字符非空白字符串；每个资产的事件必须严格交替，首条必为
+        asset_frozen（active -> frozen），其后 frozen/unfrozen 轮流出现。
+        任何畸形或同态连续（重复 freeze / 重复 unfreeze）都是不可对账
+        现场（RecoveryError，fail-closed）。审计 JSON 损坏由下层抛
+        CorruptDataError，文件 I/O 失败抛 OSError。纯只读，不记事件、
+        不改 seq。"""
+        grouped: dict[str, list[dict]] = {}
+        for event in self._audit.all_events(wallet_id):
+            etype = event.get("type")
+            if etype not in (
+                audit.TYPE_ASSET_FROZEN,
+                audit.TYPE_ASSET_UNFROZEN,
+            ):
+                continue
+            if (
+                event.get("actor_id") is not None
+                or event.get("reason") is not None
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an asset freeze event with "
+                    "actor_id/reason set"
+                )
+            details = event.get("details")
+            asset_id = (
+                event.get("request_id")
+                if isinstance(details, dict)
+                else None
+            )
+            reason = (
+                details.get("reason")
+                if isinstance(details, dict)
+                else None
+            )
+            if (
+                not isinstance(details, dict)
+                or list(details) != ["asset_id", "reason"]
+                or not isinstance(asset_id, str)
+                or not ROTATION_ID_RE.match(asset_id)
+                or details.get("asset_id") != asset_id
+                or not isinstance(reason, str)
+                or isinstance(reason, bool)
+                or len(reason) < 1
+                or len(reason) > MAX_REASON_LENGTH
+                or not reason.strip()
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a malformed asset freeze event"
+                )
+            if not isinstance(event.get("request_id"), str) or not (
+                ROTATION_ID_RE.match(event["request_id"])
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an asset freeze event with a "
+                    "malformed request_id"
+                )
+            grouped.setdefault(asset_id, []).append(event)
+        for asset_id, events in grouped.items():
+            expected = audit.TYPE_ASSET_FROZEN
+            for event in events:
+                if event.get("type") != expected:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} asset {asset_id!r} has "
+                        "non-alternating asset freeze events"
+                    )
+                expected = (
+                    audit.TYPE_ASSET_UNFROZEN
+                    if expected == audit.TYPE_ASSET_FROZEN
+                    else audit.TYPE_ASSET_FROZEN
+                )
+        return grouped
+
+    def _asset_security_states_locked(
+        self, wallet_id: str
+    ) -> dict[str, dict]:
+        """按审计事件折叠该钱包全部资产的当前安全状态（调用方须持钱包
+        事务锁）。返回 ``{asset_id: {state, reason}}``：无事件或末条为
+        unfrozen 的资产不在表中（视为 active，reason=null）；末条为
+        frozen 时 state=frozen、reason 取最近一次 asset_frozen 原文。
+        矛盾/损坏现场 fail-closed。纯只读，不新增事件、不改 seq。"""
+        result: dict[str, dict] = {}
+        for asset_id, events in self._asset_freeze_events_strict(
+            wallet_id
+        ).items():
+            last = events[-1]
+            if last["type"] == audit.TYPE_ASSET_FROZEN:
+                result[asset_id] = {
+                    "state": ASSET_STATE_FROZEN,
+                    "reason": last["details"]["reason"],
+                }
+        return result
+
+    def _assert_asset_active_locked(
+        self, wallet_id: str, asset_id: str
+    ) -> None:
+        """指定资产 frozen 时，改变其现场的写入口统一 409（调用方须持
+        钱包事务锁，且已通过钱包存在性与钱包冻结闸门）。
+
+        在幂等重放、懒过期与一切业务判定之前调用：资产 frozen 期间即便
+        请求本来命中幂等 200 重放也一律 409 且零副作用（不触发懒过期、
+        不追加事件、不改现场）。同时保证冻结事件 ↔ 账本交叉对账：任何
+        资产的冻结事件引用了无已提交操作的资产即矛盾现场（503），绝不
+        在矛盾现场上放行其他资产的写入。"""
+        self._reconcile_asset_freeze_ledger(wallet_id)
+        state = self._asset_security_states_locked(wallet_id).get(asset_id)
+        if state is not None and state["state"] == ASSET_STATE_FROZEN:
+            raise ServiceError(
+                409, f"asset {asset_id!r} is frozen"
+            )
+
+    def _reconcile_asset_freeze_ledger(self, wallet_id: str) -> None:
+        """资产冻结事件与账本的交叉对账（调用方须持钱包事务锁）。
+
+        每一条 asset_frozen/asset_unfrozen 事件绑定的资产都必须在账本中
+        存在已提交操作——资产冻结入口只对有已提交余额的资产开放，事件
+        引用了无已提交操作的资产即外部篡改/不可对账现场。事件自身的形状
+        与每资产交替状态机由 :meth:`_asset_freeze_events_strict` 校验。
+        纯只读，不新增事件、不改 seq。"""
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        committed_assets = {
+            record["asset_id"]
+            for record in ledger["operations"].values()
+            if record.get("state") == "committed"
+        }
+        for asset_id in self._asset_freeze_events_strict(wallet_id):
+            if asset_id not in committed_assets:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has asset freeze events for "
+                    f"asset {asset_id!r} without any committed operation"
+                )
+
+    def _asset_has_committed_ops(
+        self, wallet_id: str, asset_id: str
+    ) -> bool:
+        """该资产是否已有已提交（committed）操作。资产冻结入口与
+        security-state 仅对有已提交余额的资产开放（pending/cancelled
+        不构成资产现场）。调用方须持钱包事务锁。"""
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        return any(
+            record.get("asset_id") == asset_id
+            and record.get("state") == "committed"
+            for record in ledger["operations"].values()
+        )
+
+    def _assert_dispatch_asset_active_locked(
+        self, wallet_id: str, dispatch_id: str
+    ) -> str:
+        """把 did 键的派发写入口（result/confirm/takeover/isolate/settle）
+        统一接到其所属资产的冻结闸门：解析该派发请求事件的 operation_id，
+        经账本得到 asset_id，frozen 时抛 409；派发不存在返回 None（由各
+        入口既有 404 逻辑处理）。调用方须持钱包事务锁。返回 asset_id。"""
+        grouped = self._dispatch_requests_grouped_locked(wallet_id).get(
+            dispatch_id
+        )
+        if not grouped:
+            return None
+        if len(grouped) != 1:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has multiple dispatch request events "
+                f"for {dispatch_id!r}"
+            )
+        operation_id = grouped[0]["details"]["operation_id"]
+        record = self._store.get_asset_operation(wallet_id, operation_id)
+        if record is None:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} dispatch {dispatch_id!r} refers to an "
+                "unknown asset operation"
+            )
+        self._assert_asset_active_locked(
+            wallet_id, record["asset_id"]
+        )
+        return record["asset_id"]
+
+    def freeze_asset(
+        self, wallet_id: str, asset_id: object, reason: object
+    ) -> tuple[int, dict]:
+        """POST /v1/wallets/<id>/assets/<asset_id>/freeze。
+
+        active -> frozen 首转 201，在钱包事务锁内原子追加唯一
+        asset_frozen 事件（request_id/details.asset_id 绑定资产、details
+        恰为 {asset_id,reason}）；frozen 期间同 reason 重放 200（不复查、
+        不记事件），异 reason 409。并发同一转换只有一个 201。钱包冻结
+        闸门优先。reason 非字符串/空白/超长 400；钱包或无已提交操作的
+        资产 404；asset_id 非法 400。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：钱包存在性在锁内先判定
+                self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
+                self._validate_asset_id(asset_id)
+                # 冻结事件 ↔ 账本交叉对账先于 404：该（或任一）资产有冻结
+                # 事件却无已提交操作是矛盾现场（503），不是普通 404。
+                self._reconcile_asset_freeze_ledger(wallet_id)
+                if not self._asset_has_committed_ops(wallet_id, asset_id):
+                    raise ServiceError(
+                        404, f"asset {asset_id!r} not found"
+                    )
+                self._validate_freeze_reason(reason)
+                states = self._asset_security_states_locked(wallet_id)
+                current = states.get(asset_id)
+                if current is not None:
+                    if current["reason"] != reason:
+                        raise ServiceError(
+                            409,
+                            f"asset {asset_id!r} is frozen with a different "
+                            "reason",
+                        )
+                    return 200, self._asset_security_state_view(
+                        wallet_id,
+                        asset_id,
+                        ASSET_STATE_FROZEN,
+                        current["reason"],
+                    )
+                self._emit(
+                    wallet_id,
+                    self._audit_event(
+                        audit.TYPE_ASSET_FROZEN,
+                        request_id=asset_id,
+                        details={"asset_id": asset_id, "reason": reason},
+                    ),
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+        return 201, self._asset_security_state_view(
+            wallet_id, asset_id, ASSET_STATE_FROZEN, reason
+        )
+
+    def unfreeze_asset(
+        self, wallet_id: str, asset_id: object, reason: object
+    ) -> tuple[int, dict]:
+        """POST /v1/wallets/<id>/assets/<asset_id>/unfreeze。
+
+        frozen -> active 首转 201，原子追加唯一 asset_unfrozen 事件；
+        active 期间仅当存在该资产最近一次 unfreeze 记录且 reason 相同才
+        幂等 200，无 unfreeze 记录（从未冻结）或异 reason 一律 409。
+        钱包冻结闸门优先。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                self._get_wallet_or_404(wallet_id)
+                self._assert_wallet_active_locked(wallet_id)
+                self._validate_asset_id(asset_id)
+                # 冻结事件 ↔ 账本交叉对账先于 404：该（或任一）资产有冻结
+                # 事件却无已提交操作是矛盾现场（503），不是普通 404。
+                self._reconcile_asset_freeze_ledger(wallet_id)
+                if not self._asset_has_committed_ops(wallet_id, asset_id):
+                    raise ServiceError(
+                        404, f"asset {asset_id!r} not found"
+                    )
+                self._validate_freeze_reason(reason)
+                events = self._asset_freeze_events_strict(wallet_id).get(
+                    asset_id, []
+                )
+                if (
+                    events
+                    and events[-1]["type"] == audit.TYPE_ASSET_FROZEN
+                ):
+                    # 当前 frozen：首提解冻。
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_ASSET_UNFROZEN,
+                            request_id=asset_id,
+                            details={"asset_id": asset_id, "reason": reason},
+                        ),
+                    )
+                    return 201, self._asset_security_state_view(
+                        wallet_id, asset_id, ASSET_STATE_ACTIVE, None
+                    )
+                # 当前 active（含从未冻结过）：须存在最近一次 unfreeze 记录
+                # 且 reason 相同才幂等重放；否则 409。
+                last_unfrozen = next(
+                    (
+                        event
+                        for event in reversed(events)
+                        if event["type"] == audit.TYPE_ASSET_UNFROZEN
+                    ),
+                    None,
+                )
+                if (
+                    last_unfrozen is not None
+                    and last_unfrozen["details"]["reason"] == reason
+                ):
+                    return 200, self._asset_security_state_view(
+                        wallet_id, asset_id, ASSET_STATE_ACTIVE, None
+                    )
+                raise ServiceError(
+                    409, f"asset {asset_id!r} is not frozen"
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    def get_asset_security_state(
+        self, wallet_id: str, asset_id: object
+    ) -> dict:
+        """GET /v1/wallets/<id>/assets/<asset_id>/security-state：返回
+        ``{wallet_id,asset_id,state,reason}``，active 时 reason 为 null。
+
+        纯只读（不触发懒过期、不记事件）；资产冻结事件损坏/矛盾
+        fail-closed（HTTP 503）。钱包不存在或资产尚无已提交操作 404；
+        asset_id 非法 400。"""
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先：钱包存在性先于 asset_id 校验
+                self._get_wallet_or_404(wallet_id)
+                self._validate_asset_id(asset_id)
+                self._reconcile_asset_freeze_ledger(wallet_id)
+                if not self._asset_has_committed_ops(wallet_id, asset_id):
+                    raise ServiceError(
+                        404, f"asset {asset_id!r} not found"
+                    )
+                current = self._asset_security_states_locked(
+                    wallet_id
+                ).get(asset_id)
+                if current is None:
+                    return self._asset_security_state_view(
+                        wallet_id, asset_id, ASSET_STATE_ACTIVE, None
+                    )
+                return self._asset_security_state_view(
+                    wallet_id,
+                    asset_id,
+                    ASSET_STATE_FROZEN,
+                    current["reason"],
+                )
         except CorruptDataError:
             raise
         except ValueError:
@@ -4971,6 +5350,9 @@ class WalletService:
                 self._validate_operation_id(operation_id)
                 self._validate_asset_id(asset_id)
                 self._validate_delta(delta)
+                # 资产粒度冻结闸门：先于幂等重放与一切业务判定，frozen
+                # 资产即便同参重放也一律 409 且零副作用。
+                self._assert_asset_active_locked(wallet_id, asset_id)
                 existing = self._store.get_asset_operation(
                     wallet_id, operation_id
                 )
@@ -5857,6 +6239,11 @@ class WalletService:
                 raise ServiceError(
                     404, f"asset operation {operation_id!r} not found"
                 )
+            # 资产粒度冻结闸门：先于 committed 幂等重放（frozen 时重放也
+            # 一律 409），不改账、不记事件。
+            self._assert_asset_active_locked(
+                wallet_id, record["asset_id"]
+            )
             if record["state"] == "committed":
                 # 幂等重放：不重复改账、不记事件
                 return 200, record
@@ -5936,6 +6323,11 @@ class WalletService:
                 raise ServiceError(
                     404, f"asset operation {operation_id!r} not found"
                 )
+            # 资产粒度冻结闸门：先于审批单查询、幂等重放与一切业务判定
+            # （frozen 时即便同参重放也一律 409，账本/version/审计不变）。
+            self._assert_asset_active_locked(
+                wallet_id, record["asset_id"]
+            )
             approval = self._store.get_request(
                 wallet_id, approval_request_id
             )
@@ -6732,6 +7124,9 @@ class WalletService:
                 self._assert_wallet_active_locked(wallet_id)
                 self._validate_asset_id(asset_id)
                 self._validate_chain_id(chain_id)
+                # 资产粒度冻结闸门：frozen 资产的确认策略写入（含同值
+                # 更新）一律 409 且零事件。
+                self._assert_asset_active_locked(wallet_id, asset_id)
                 if not isinstance(enabled, bool):
                     raise ServiceError(400, "enabled must be a boolean")
                 if (
@@ -7021,6 +7416,11 @@ class WalletService:
                     raise ServiceError(
                         404, f"asset operation {operation_id!r} not found"
                     )
+                # 资产粒度冻结闸门：先于终态同体重放与一切状态机判定，
+                # frozen 时重放也 409、不产生懒过期/事件/现场变化。
+                self._assert_asset_active_locked(
+                    wallet_id, record["asset_id"]
+                )
                 policy = self._chain_policies(wallet_id).get(
                     record["asset_id"]
                 )
@@ -7839,6 +8239,19 @@ class WalletService:
                             f"{name} must match [A-Za-z0-9_-]{{1,128}}",
                         )
 
+                # 404 与资产冻结闸门先于幂等重放：frozen 资产的派发请求
+                # 即便同参重放也一律 409 且零副作用。
+                record = self._store.get_asset_operation(
+                    wallet_id, operation_id
+                )
+                if record is None:
+                    raise ServiceError(
+                        404, f"asset operation {operation_id!r} not found"
+                    )
+                self._assert_asset_active_locked(
+                    wallet_id, record["asset_id"]
+                )
+
                 dispatches = self._dispatch_requests_grouped_locked(wallet_id)
                 # 幂等优先于 404/状态判定：已提交的同 dispatch_id 重放。
                 # 手工与自动派发事件合并查找：同一 dispatch_id 若由自动
@@ -8044,6 +8457,19 @@ class WalletService:
                     ):
                         # 同参（路径操作 + 审批单标识）重放：200 同 V，
                         # 不复查现状（事后健康翻转、审批单推进不影响）。
+                        # 但资产粒度冻结闸门先于幂等：frozen 资产的自动
+                        # 派发同参重放也一律 409 且零副作用。
+                        replay_record = self._store.get_asset_operation(
+                            wallet_id, operation_id
+                        )
+                        if replay_record is None:
+                            raise ServiceError(
+                                404,
+                                f"asset operation {operation_id!r} not found",
+                            )
+                        self._assert_asset_active_locked(
+                            wallet_id, replay_record["asset_id"]
+                        )
                         return 200, dict(saved)
                     raise ServiceError(
                         409,
@@ -8105,6 +8531,9 @@ class WalletService:
                 # 优先 200 返回）。健康表未配置或无 up 适配器一律 409，
                 # 且零副作用（在任何事件追加之前）。选择在钱包锁内按当前
                 # 快照完成：ASCII 最小的 up 适配器，确定性、无随机性。
+                self._assert_asset_active_locked(
+                    wallet_id, record["asset_id"]
+                )
                 adapters = self._chain_adapters_locked(wallet_id)
                 if adapters is None:
                     raise ServiceError(
@@ -8451,6 +8880,11 @@ class WalletService:
                     )
 
                 results = self._audit.chain_dispatch_result_events(wallet_id)
+                # 资产粒度冻结闸门先于幂等重放：派发存在但其资产 frozen 时
+                # 同参重放也一律 409；派发未知则留给下方既有 404。
+                self._assert_dispatch_asset_active_locked(
+                    wallet_id, dispatch_id
+                )
                 # 幂等优先于派发存在性/现状判定：任一已提交结果与全参
                 # （adapter_id/state/tx_id）相同即 200 返回同一 V。接管前后
                 # 可有两条结果（旧适配器 failed、新适配器一条），两者
@@ -9055,6 +9489,12 @@ class WalletService:
                 groups = self._audit.chain_dispatch_confirmation_events(
                     wallet_id
                 ).get(dispatch_id) or []
+                # 资产粒度冻结闸门先于历史同体重放（含已结算派发的重组
+                # 补偿写账）：派发存在但资产 frozen 时一律 409；派发未知
+                # 留给下方既有 404。
+                self._assert_dispatch_asset_active_locked(
+                    wallet_id, dispatch_id
+                )
                 # 历史同体重放优先于一切现状判定：200 返回原 V，不记事件。
                 for prior in groups:
                     saved = prior["details"]
@@ -10131,6 +10571,12 @@ class WalletService:
                             f"{name} must match [A-Za-z0-9_-]{{1,128}}",
                         )
 
+                # 资产粒度冻结闸门先于幂等/再次接管：派发存在但资产
+                # frozen 时，接管同参重放也一律 409；派发未知留给下方 404。
+                self._assert_dispatch_asset_active_locked(
+                    wallet_id, dispatch_id
+                )
+
                 # 幂等/再次接管优先于派发存在性等现状判定：已提交的接管只
                 # 按全参（adapter_id、approval_request_id）比较回放。
                 takeover_event = self._dispatch_takeover_event_locked(
@@ -10544,6 +10990,12 @@ class WalletService:
                         "dispatch_id must match [A-Za-z0-9_-]{1,128}",
                     )
 
+                # 资产粒度冻结闸门先于同 D 重放：派发存在但资产 frozen 时
+                # 隔离同参重放也一律 409；派发未知留给下方 404。
+                self._assert_dispatch_asset_active_locked(
+                    wallet_id, dispatch_id
+                )
+
                 # 同 D 重放优先于一切现状判定：已隔离即 200 返回同一 V，
                 # 不复查健康表（事后把适配器翻回 up 不影响幂等重放）。
                 isolate_event = self._dispatch_isolate_event_locked(
@@ -10678,6 +11130,12 @@ class WalletService:
                         400,
                         "dispatch_id must match [A-Za-z0-9_-]{1,128}",
                     )
+
+                # 资产粒度冻结闸门先于已结算重放：派发存在但资产 frozen 时
+                # 同 dispatch_id 重放也一律 409；派发未知留给下方 404。
+                self._assert_dispatch_asset_active_locked(
+                    wallet_id, dispatch_id
+                )
 
                 # 重放优先于一切现状判定：已结算的同 dispatch_id 一律
                 # 200 返回同一 R（紧邻提交事件的 details），不复查现状。
@@ -11075,6 +11533,9 @@ class WalletService:
                 # 优先于参数 400/409，绝不向不可对账现场追加事件。
                 ledger = self._reconcile_chain_state_locked(wallet_id)
                 self._validate_asset_id(asset_id)
+                # 资产粒度冻结闸门：frozen 资产的仲裁策略写入（含同值
+                # 更新）一律 409 且零事件、seq 不变。
+                self._assert_asset_active_locked(wallet_id, asset_id)
                 normalized_sources, normalized_quorum = (
                     self._validate_arbitration_body(sources, quorum)
                 )
@@ -11275,6 +11736,11 @@ class WalletService:
                         404,
                         f"asset operation {operation_id!r} not found",
                     )
+                # 资产粒度冻结闸门：先于仲裁/链策略判定、同源同体重放与
+                # quorum 提交，frozen 时一律 409、票不落盘、不记事件。
+                self._assert_asset_active_locked(
+                    wallet_id, record["asset_id"]
+                )
                 policy = self._chain_arbitration_policies(wallet_id).get(
                     record["asset_id"]
                 )
