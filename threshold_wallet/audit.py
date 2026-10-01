@@ -208,6 +208,13 @@ TYPE_WALLET_UNFROZEN = "wallet_unfrozen"
 #: 钱包级审批人名单整体快照（details 恰为 {"allowed_approvers": [...]}；
 #: 数组成员按 Unicode 码点升序，空数组表示取消限制，取最后一条恢复）
 TYPE_APPROVAL_ROSTER_UPDATED = "approval_roster_updated"
+#: 高风险配置统一变更入口（双人变更控制）的唯一提交点（request_id 为
+#: change_id、actor_id 为 approval_request_id、reason 为 null，details
+#: 恰为 {change_id,target,before,after}，before/after 为对应受控配置的
+#: 公开视图，未配置为 null；事件落盘即配置已应用，重放不记）。
+#: target=change-control 的此类事件折叠出开关本身（缺省 enabled=false），
+#: 启停仅经统一变更入口，不另写开关状态文件。
+TYPE_POLICY_CHANGE_APPLIED = "policy_change_applied"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
 EVENT_TYPES = {
@@ -404,6 +411,15 @@ _DETAILS_KEY_ORDER = {
     ),
     TYPE_APPROVAL_ROSTER_UPDATED: (
         "allowed_approvers",
+    ),
+    # policy_change_applied 的 details 即统一变更入口对外视图去 approval 后
+    # 的四字段：change_id,target,before,after 固定序（before/after 为受控
+    # 配置公开视图或 null，嵌套键随 sort_keys 规范序落盘）。
+    TYPE_POLICY_CHANGE_APPLIED: (
+        "change_id",
+        "target",
+        "before",
+        "after",
     ),
 }
 

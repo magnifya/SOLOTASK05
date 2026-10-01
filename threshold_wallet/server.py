@@ -17,6 +17,9 @@
 - GET  /v1/wallets/<wallet_id>/nodes                查询 DKG 节点健康表
 - PUT  /v1/wallets/<wallet_id>/chain-adapters       设置跨链适配器健康熔断表
 - GET  /v1/wallets/<wallet_id>/chain-adapters       查询跨链适配器健康熔断表
+- GET  /v1/wallets/<wallet_id>/change-control       查询高风险配置双人变更控制开关
+- POST /v1/wallets/<wallet_id>/policy-changes       双人审批的统一配置变更入口
+- GET  /v1/wallets/<wallet_id>/policy-changes/<id>  查询已应用的配置变更
 - POST /v1/wallets/<wallet_id>/nodes/<node_id>/rejoin 故障节点重新加入
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
@@ -169,6 +172,20 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 raise ServiceError(400, "request body must be a JSON object")
             return body
 
+        def _drain_body(self) -> None:
+            """读完并丢弃整个请求体（不解析、不校验）。
+
+            双人变更控制启用后受控 PUT 在读取/校验请求体之前即返回 409，
+            但仍须把 Content-Length 指定的字节全部读完，避免 keep-alive
+            连接上残留字节污染下一个请求。读取本身失败（非法长度/过大）
+            不掩盖已判定的 409。"""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return
+            if 0 < length <= _MAX_BODY_BYTES:
+                self.rfile.read(length)
+
         def _read_empty_body(self) -> None:
             """读取并校验空体 POST（如 settle）：请求体必须零字节；任何
             非空体（含空 JSON 对象 {}）一律 400。始终读完整个 body，避免
@@ -223,6 +240,23 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if rest == ["approval-roster"]:
                     self._send_json(
                         200, service.get_approval_roster(wallet_id)
+                    )
+                    return
+                if rest == ["change-control"]:
+                    # 高风险配置双人变更控制开关：始终 200 返回
+                    # {"enabled": bool}，缺省 false；仅查询，启停只经
+                    # POST policy-changes 统一入口。
+                    self._send_json(
+                        200, service.get_change_control(wallet_id)
+                    )
+                    return
+                if (
+                    len(rest) == 2
+                    and rest[0] == "policy-changes"
+                ):
+                    self._send_json(
+                        200,
+                        service.get_policy_change(wallet_id, rest[1]),
                     )
                     return
                 if len(rest) == 2 and rest[0] == "sign-requests":
@@ -510,6 +544,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         request_id = body.get("signing_request_id")
                     status, result = service.create_sign_request(
                         wallet_id, request_id, body.get("message")
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["policy-changes"]:
+                    # 高风险配置双人变更控制统一入口：请求体恰为
+                    # {change_id,target,before,after,approval_request_id}
+                    # 五键（值类型/取值由 service 严格校验）。
+                    body = self._read_json_body()
+                    if set(body) != {
+                        "change_id",
+                        "target",
+                        "before",
+                        "after",
+                        "approval_request_id",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly change_id, target, "
+                            "before, after and approval_request_id",
+                        )
+                    status, result = service.post_policy_change(
+                        wallet_id, body
                     )
                     self._send_json(status, result)
                     return
@@ -986,6 +1043,19 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 matched = self._split_wallet_path(path)
                 if matched is not None:
                     wallet_id, rest = matched
+
+                    def _controlled_gate(target: str) -> None:
+                        """受控 PUT 写前闸门：开关启用/冻结/钱包未知时在
+                        读取请求体之前抛出对应错误，并排空 body 以免污染
+                        keep-alive 连接。"""
+                        try:
+                            service.assert_controlled_put_allowed(
+                                wallet_id, target
+                            )
+                        except Exception:
+                            self._drain_body()
+                            raise
+
                     if rest == ["audit-integrity"]:
                         # audit-integrity 只接受 GET
                         raise ServiceError(405, "method not allowed")
@@ -993,6 +1063,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         # audit-evidence 只接受 GET
                         raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
+                        _controlled_gate("approval-policy")
                         body = self._read_json_body()
                         result = service.put_policy(
                             wallet_id,
@@ -1002,6 +1073,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                     if rest == ["approval-roster"]:
+                        _controlled_gate("approval-roster")
                         body = self._read_json_body()
                         if set(body) != {"allowed_approvers"}:
                             raise ServiceError(
@@ -1014,6 +1086,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                     if rest == ["transaction-policy"]:
+                        _controlled_gate("transaction-policy")
                         body = self._read_json_body()
                         result = service.put_transaction_policy(
                             wallet_id,
@@ -1024,6 +1097,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                     if rest == ["dkg-failover-policy"]:
+                        _controlled_gate("dkg-failover-policy")
                         body = self._read_json_body()
                         # PUT 仅收 {"enabled": bool}
                         if set(body) != {"enabled"}:
@@ -1037,6 +1111,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(200, result)
                         return
                     if rest == ["nodes"]:
+                        _controlled_gate("nodes")
                         body = self._read_json_body()
                         # PUT 仅收 Q={"nodes": ...}；nodes 表形状由 service
                         # 严格校验（非空、安全 ID、key/state 两键）
@@ -1054,6 +1129,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         # 跨链适配器健康熔断表：成功体与错误体均为 UTF-8
                         # 紧凑 JSON（非 ASCII 不转义、无末换行）。
                         self._compact_response = True
+                        _controlled_gate("chain-adapters")
                         body = self._read_json_body()
                         # PUT 仅收 Q={"adapters": ...}；adapters 表形状
                         # （非空、安全 ID、值 up|down）由 service 严格校验

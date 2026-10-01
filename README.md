@@ -51,6 +51,9 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/nodes` | 查询 DKG 节点健康表（未配置 404） |
 | PUT  | `/v1/wallets/{id}/chain-adapters` | 设置跨链适配器健康熔断表 `{"adapters":{...}}` |
 | GET  | `/v1/wallets/{id}/chain-adapters` | 查询跨链适配器健康熔断表（未配置 404） |
+| GET  | `/v1/wallets/{id}/change-control` | 查询高风险配置双人变更控制开关（缺省 `{"enabled":false}`） |
+| POST | `/v1/wallets/{id}/policy-changes` | 双人审批的统一配置变更入口 `{"change_id","target","before","after","approval_request_id"}` |
+| GET  | `/v1/wallets/{id}/policy-changes/{cid}` | 查询已应用的配置变更 |
 | POST | `/v1/wallets/{id}/nodes/{node}/rejoin` | 故障节点重新加入 `{"rejoin_id","dkg_id","round","key","approval_request_id"}` |
 | POST | `/v1/wallets/{id}/sign-requests` | 建审批单 `{"id","message"}` |
 | GET  | `/v1/wallets/{id}/sign-requests/{rid}` | 查审批单 |
@@ -1104,6 +1107,80 @@ quorum 后按既有 commit 契约自动提交。
   最小的 `up`；表未配置或无 `up` 一律 `409`。
 - 健康表的读取、更新与派发判定都在该钱包跨进程事务锁内线性化。
 
+### 高风险配置双人变更控制（可选）
+
+缺省关闭、**只增不改**：现有六个受控配置的原 PUT 行为在关闭时完全
+不变；一旦开关启用，这些 PUT 不再接受，统一改由双人审批的变更入口
+提交。开关本身也只经该入口启停。
+
+- `GET /v1/wallets/{id}/change-control`：始终 `200` 返回
+  `{"enabled": bool}`，从未启用缺省 `{"enabled": false}`；钱包不存在
+  `404`。开关状态只由 `policy_change_applied` 事件（target 为
+  change-control）折叠，不写状态文件。
+- `POST /v1/wallets/{id}/policy-changes`（仅 POST），请求体**恰为**
+
+  ```json
+  {"change_id":"C","target":"T","before":B0,"after":B1,
+   "approval_request_id":"R"}
+  ```
+
+  五键（含其他键或缺键一律 `400`）。`change_id`/`approval_request_id`
+  匹配安全标识；`target` 恰取
+  `approval-policy`、`approval-roster`、`transaction-policy`、
+  `dkg-failover-policy`、`nodes`、`chain-adapters`、`change-control`
+  之一，非法 `400`。`after` 为该目标**公开视图**配置（形状/取值与对应
+  GET/PUT 同形），`before` 为应用前配置（未配置为 `null`）；配置形状、
+  取值或嵌套键序非法一律 `400`（服务端不替客户端重排名单/ID 顺序）。
+  钱包未知 `404`。
+
+  各目标的 before/after 形态：approval-policy 为
+  `{required_approvals,timeout_seconds}`（文件型，首建 before 为
+  `null`）；transaction-policy 为
+  `{mode,max_delta,allowed_assets}`（文件型，首建 before 为 `null`）；
+  approval-roster 为 `{allowed_approvers:[...]}`（缺省空名单）；
+  dkg-failover-policy 与 change-control 为 `{"enabled": ...}`
+  （缺省即对应默认值，before 永不为 `null`）；nodes 为
+  `{"nodes":{...}}`、chain-adapters 为 `{"adapters":{...}}`（未配置
+  before 为 `null`）。
+- **审批**：`approval_request_id` 必须指向同一钱包既有审批单（审批
+  工作流沿用 sign-requests 契约）。审批单 `message` 必须与**仅含**
+  `change_id,target,before,after` 四字段（即请求体去掉
+  approval_request_id）的 ASCII 紧凑 JSON（`ensure_ascii`、无空格、
+  键序固定）**逐字一致**。审批单须为 `approved` 且由**两位不同审批人**
+  批准、未过期（操作前按既有契约懒过期）。审批单未知 `404`；pending、
+  rejected、expired、message 不符，或不足两位不同审批人，一律 `409`。
+- **before 比较**：应用在钱包事务锁内把 `before` 与应用前实际配置逐项
+  比较（未配置须为 `null`），不一致 `409`，随后写入配置并**原子**追加
+  唯一提交事件。
+- 首提 `201`，成功/重放/查询视图同为
+
+  ```json
+  {"change_id":"C","target":"T","before":B0,"after":B1,
+   "approval_request_id":"R","seq":N}
+  ```
+
+  同 `change_id` **同参**（五字段全同）重放 `200` 返回同一视图且不新增
+  事件；同 `change_id` **异参**（含更换 target/before/after/审批单）一律
+  `409`。`GET /v1/wallets/{id}/policy-changes/{cid}` 返回已应用视图，
+  `change_id` 非法 `400`、钱包/变更未知 `404`。
+- **受控 PUT 闸门**：开关启用后，六个受控目标的原 PUT 一律返回 `409`
+  `{"error":"change control required"}` 且**零副作用**（在读取/校验请求
+  体之前判定，并排空请求体，故即使 body 非法也返回 409、不污染
+  keep-alive 连接）；未知钱包仍 `404`、冻结钱包仍沿用冻结 `409` 闸门。
+  开关停用后原 PUT 恢复。chain 确认策略/仲裁等非受控 PUT 不受影响。
+- **提交点与恢复**：`policy_change_applied`（七字段，`request_id` 为
+  change_id、`actor_id` 为 approval_request_id、`reason=null`、details
+  即 `{change_id,target,before,after}`）是唯一提交点。事件型配置
+  （roster/dkg 开关/nodes/adapters）的配置快照事件与提交事件**同批一次
+  原子落盘**（seq 相邻，崩溃俱在/俱无）；文件型配置
+  （approval-policy/transaction-policy）先写文件再追加提交事件，崩溃后
+  以审计提交点为准前滚/回滚。恢复按 seq 单趟折叠统一入口与原 PUT 的共用
+  配置时间线，逐条复核 before 与事前配置一致、成对快照即 after、审批单
+  存在/message 逐字一致/两位不同审批人；矛盾现场 fail-closed（常驻
+  `503`、`serve` 拒绝就绪、保留现场），重启/灾备恢复后配置与 seq 连续
+  不变，恢复不新增事件。并发与重启交错只产生一次首次应用，重放不记事件。
+- 响应、日志、审计与新增文件都不含份额私钥或签名载荷。
+
 ### 审计事件
 
 ### 钱包应急冻结（freeze / unfreeze）
@@ -1171,6 +1248,10 @@ approval_request_id、details 即 cancelled 操作视图）、
 `chain_dispatch_confirmation`、`chain_dispatch_settled`、
 `chain_dispatch_reorged`、`chain_dispatch_taken_over`、
 `chain_dispatch_isolated`、`chain_adapter_health`。
+高风险配置双人变更控制另有 `policy_change_applied`（`request_id` 为
+change_id、`actor_id` 为 approval_request_id、`reason=null`，details
+恰为 `{change_id,target,before,after}`；target=change-control 的事件折叠
+出开关，事件型受控目标与紧邻的前一条既有类型快照同批落盘）。
 钱包应急冻结/解冻另有 `wallet_frozen`、`wallet_unfrozen`（details 恰为
 `{"reason":"..."}`，两类事件严格交替，按 seq 折叠出 active/frozen 状态）。
 
