@@ -93,6 +93,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-sessions` | 建可恢复会话 `{"id","message","timeout_seconds"}` |
 | GET  | `/v1/wallets/{id}/sign-sessions/{sid}` | 查会话视图 |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/shares` | 投递一份额签名 `{"share_id","signature"}` |
+| POST | `/v1/wallets/{id}/sign-sessions/{sid}/cancel` | 主动撤销会话 `{"cancel_id","reason"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/replace` | 替换会话单个参与方份额 `{"replacement_id","offline_share_id"}` |
 | POST | `/v1/wallets/{id}/sign-sessions/{sid}/participants/takeover` | 两阶段接管会话参与方份额 `{"takeover_id","stage","offline_share_id"}` |
 | POST | `/v1/dkg/{id}/{did}` | 推进两方 DKG 一个阶段 `{"op","node","key","hash","peer"}` |
@@ -209,10 +210,11 @@ JSON 对象。
 
 - 首建 `201`；同 id 同 `message`/`timeout_seconds` 重放 `200` 同体；
   同 id 异参 `409`；非法 `400`；钱包不存在 `404`。
-- 视图（创建/查询/投递同形）
+- 视图（创建/查询/投递/撤销同形）
   `{id,message,state,received_shares,missing_shares,expires_at}`，
-  `state` 为 `collecting|ready|signed|expired`，`aggregate_signature`
-  仅 signed 时存在（128 字节 hex），不回传单份额签名。
+  `state` 为 `collecting|ready|signed|expired|cancelled`，
+  `aggregate_signature` 仅 signed 时存在（128 字节 hex），`cancellation`
+  仅 cancelled 时存在（恰含 `cancel_id,reason`），不回传单份额签名。
 - 未知会话 `404`；查询与投递均懒过期，到点的 collecting/ready 原子转
   `expired`（创建重放不触发）。
 - 投递 `{"share_id","signature"}`：仅接受**当前在用份额**对 id+message
@@ -229,8 +231,38 @@ JSON 对象。
 - 会话文件 JSON 损坏或形状/事件/历史公钥/聚合签名自相矛盾时
   fail-closed：常驻请求 `503`、`serve` 拒绝就绪，保留现场不归一。
 - 审计事件统一为 `session_event`，动作 `created`/`share_received`/
-  `expired`/`signed`；重放不产生事件，details 只含标识/状态/整数/原文，
-  绝不含签名或私钥。
+  `expired`/`signed`/`cancelled`；重放不产生事件，details 只含标识/
+  状态/整数/原文，绝不含签名或私钥。
+
+### 会话主动撤销（cancel）
+
+`POST /v1/wallets/{id}/sign-sessions/{sid}/cancel`（仅 POST，其他方法
+`405`），请求体**恰为** `{"cancel_id","reason"}`（缺键/夹带/非 JSON
+对象一律 `400`）：主动撤销一个尚未终态的可恢复签名会话。
+
+- `cancel_id` 沿用安全标识 `[A-Za-z0-9_-]{1,128}`；`reason` 为 1..1024
+  字符非空白字符串并保留原文。标识或字段值非法 `400`；钱包或会话不
+  存在 `404`。
+- 仅尚未到期的 `collecting`/`ready` 会话可首次撤销：成功 `201` 并转
+  `cancelled`（终态）；已 `signed` 或已 `expired`（含到点懒过期，
+  沿用既有懒过期语义）`409`。撤销与最终签名提交在每钱包事务锁内
+  线性化，只允许一个终态生效，失败一方 `409`。
+- 撤销响应与后续查询沿用既有会话视图，仅在 `cancelled` 时增加恰含
+  `cancel_id,reason` 的 `cancellation` 对象，不出现聚合签名；撤销时
+  的已收/缺失份额标识保持不变，后续轮换不再迁移该快照。
+- `cancel_id` 只在**同钱包的会话撤销之间**判重：同会话、同标识、同
+  原因重放 `200` 同体且不再检查期限；换参数、复用到其他会话或再次
+  以新标识撤销均 `409`。
+- 撤销后投递份额及发起新的参与者替换/接管均 `409`；已完成参与者
+  操作的同参重放保留原语义（`200`）；创建同参重放返回撤销后的视图。
+- 冻结钱包拒绝撤销及其重放，`409` 且零副作用（不触发懒过期、不记
+  事件），查询不受影响；撤销不改变审批单及独立 `/sign` 入口的行为。
+- 首次撤销只追加一条 `session_event`（`request_id` 为会话 id，
+  details 恰含 `action=cancelled,cancel_id,reason`）且为唯一提交点：
+  事件未落盘则回滚、落盘则前滚；重放不追加事件。已提交撤销在重启
+  与合法 backup/restore 后继续生效，恢复不补记事件；未提交撤销不留
+  终态。撤销之后再出现收份额/签名/参与者变更事件属矛盾现场，
+  fail-closed（常驻 `503`、`serve` 拒绝就绪，保留现场）。
 
 ### 会话单节点参与者替换
 
@@ -1222,8 +1254,8 @@ JSON 对象、`reason` 非字符串、空串/纯空白或超过 1024 字符一�
 不复查现场、不记事件）；reason 与该记录不同 `409`。从未冻结过的天然
 active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 - **冻结闸门**：钱包 frozen 时，该钱包**全部既有写接口**统一返回 `409`，
-  包括审批（建单/批准/拒绝）、`/sign` 与签名会话（建会话/投递/参与者
-  替换与接管）、轮换准备/激活与 share-bind 参与者迁移、资产操作与全部
+  包括审批（建单/批准/拒绝）、`/sign` 与签名会话（建会话/投递/撤销/
+  参与者替换与接管）、轮换准备/激活与 share-bind 参与者迁移、资产操作与全部
   跨链接口（策略/报告/仲裁/派发/回执/确认/接管/隔离/结算）、两方 DKG 与
   故障轮次、节点健康表/rejoin 与适配器熔断表、三类策略写入——即便请求本
   来命中幂等 `200` 重放也一律 `409` 且**零副作用**（不触发懒过期、不追加
