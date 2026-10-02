@@ -72,7 +72,7 @@ python -m unittest discover -s tests -v
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
-| GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version` |
+| GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/unfreeze` | 解除单个资产冻结 `{"reason"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}/security-state` | 查询资产安全状态 `{wallet_id,asset_id,state,reason}` |
@@ -664,13 +664,60 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   一次）；崩溃按事件是否落盘前滚为 cancelled 或回滚为 pending，
   恢复不新增审计。
 - `GET assets/{asset_id}`：返回 `{asset_id,balance,version}`；资产无
-  已提交操作 `404`。
+  已提交操作 `404`。可选查询参数 `at_seq` 读历史资产状态（见下节）。
 - 重启后 pending/committed 与幂等保持，version 单调不回退、不重号。
   账本或提交意图损坏/矛盾时 fail-closed（常驻 `503`、阻止就绪），绝不
   归一为空或覆盖删除。
 - 审计事件 `asset_operation_committed`（details 即 committed 视图 R，
   仅首次提交记一次）、`asset_operation_cancelled` 与
   `transaction_policy_updated`。
+
+#### 历史资产状态（at_seq）
+
+`GET /v1/wallets/{id}/assets/{asset_id}?at_seq=N[&expected_head=H]`
+只接受 GET。`at_seq` 缺省时响应与错误语义与现状完全一致；提供时以钱包
+审计序列中 `seq <= N` 的事件为边界回答历史状态，成功 `200` 返回
+`{asset_id,balance,version,at_seq,head}`：
+
+- `balance`/`version` 仅由边界内该资产**最后一条**
+  `asset_operation_committed` 事件的 R（`balance`/`version`）给出；
+  人工提交、链上确认、多源仲裁、派发最终性结算与重组补偿五类提交点
+  统一适用，每笔已提交操作只计入一次，pending、cancelled 与幂等重放
+  不改变结果；不同资产分别计算余额与版本。
+- 资产变化从 `asset_operation_committed` 事件序号起生效：边界落在同批
+  报告/投票/结算/重组事件但未包含提交事件时，按落账前状态回答。边界
+  可落在任意事件上，不要求属于所查资产；`head` 绑定**整个钱包**审计
+  前缀，为边界事件后的摘要链头，与 `audit-evidence` 同一
+  `to_seq=N` 的 `end_head` 完全相同。
+- 边界内该资产无已提交操作（含空钱包与资产从未落账）返回 `404`
+  `asset '<id>' not found`，绝不以当前余额或零余额代替；`at_seq`
+  超过当前审计尾序号返回 `404` `at_seq beyond the audit tail`。
+  后续操作、策略修改或资产冻结都不改变同一边界的结果；重启或恢复
+  包含该边界的合法灾备快照后结果一致。
+
+参数规则（`parse_qs` 字符串列表；空值保留不丢弃）：
+
+- `at_seq` 只接受由 ASCII 数字组成的正整数（空值、纯空白、带符号、
+  小数、指数、Unicode 数字均非法），非法 `400` `invalid at_seq`；
+- 任一新增参数重复出现 `400`
+  （`duplicate at_seq parameters` /
+  `duplicate expected_head parameters`）；
+- `expected_head` 只能随 `at_seq` 使用（缺 `at_seq` 时连同非法
+  `at_seq` 一并 `400`），格式为 64 位小写十六进制，格式错误 `400`
+  `invalid expected_head`，格式合法但与 `head` 不符 `409`
+  `expected_head does not match chain head`（先于边界/资产 `404`
+  判定之后）。
+
+错误次序：钱包不存在 `404` 先于一切参数校验（标识沿用现有校验，
+非法 `400`）；其后为重复参数 → `at_seq` 非法 → `expected_head`
+缺 `at_seq`/格式非法 → 边界越尾 `404` → 边界前资产无落账 `404` →
+`expected_head` 不符 `409`。查询在既有恢复检查（`_heal_wallet`）
+之后、每钱包事务锁内读取一致现场，先做与 audit-evidence 同一套 DKG
+重放对账与整条摘要链完整性校验：完整审计链、账本或恢复现场损坏及
+读取失败时沿用 `503` `service temporarily unavailable`，保留现场、
+不返回部分结果。钱包或资产冻结时仍可使用；查询不触发审批懒过期、
+不新增事件或历史状态文件，不改变余额、version 或摘要链。响应与日志
+不含私钥、份额或单份额签名。
 
 ### 跨链资产确认（可选）
 

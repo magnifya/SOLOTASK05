@@ -6822,7 +6822,13 @@ class WalletService:
         self._store.delete_asset_commit_intent(wallet_id, dispatch_id)
         return committed_record
 
-    def get_asset(self, wallet_id: str, asset_id: str) -> dict:
+    def get_asset(
+        self,
+        wallet_id: str,
+        asset_id: str,
+        at_seq: object = None,
+        expected_head: object = None,
+    ) -> dict:
         """查询某资产的账本状态（balance/version）。
 
         在每钱包事务锁内读取：提交事务进行中（账本已改、事件尚未落盘）的
@@ -6830,7 +6836,138 @@ class WalletService:
 
         恢复检查、钱包存在性、asset_id 校验与余额读取全部在锁内：绝不
         先用锁外快照决定 404/400。
+
+        ``at_seq`` 缺省时为当前账本读取，响应与错误语义保持不变
+        （``{asset_id,balance,version}``）。``at_seq`` 提供时返回历史
+        资产状态：以审计序列中 seq 不超过 ``at_seq`` 的事件为边界，
+        余额/版本由边界内该资产最后一条 ``asset_operation_committed``
+        事件的 R 给出，响应仅含 ``asset_id,balance,version,at_seq,head``；
+        ``head`` 为边界事件后的摘要链头，与 audit-evidence 同一
+        ``to_seq=at_seq`` 的 ``end_head`` 相同。边界可落在任意事件上，
+        不要求属于所查资产；边界内该资产无已提交操作时 404，绝不以
+        当前余额或零余额代替。边界超过当前审计尾序号 404。
+
+        ``at_seq``/``expected_head`` 接受 parse_qs 的字符串列表
+        （None 表示缺参，长度 >1 即重复参数）。参数校验次序（钱包
+        存在性 404 之后）：重复 → at_seq 非法 → expected_head 缺
+        at_seq/格式 → 边界与资产读取；expected_head 格式合法但与
+        head 不符在边界/资产 404 之后判 409。历史读为纯只读：与
+        audit-evidence 同一套 DKG 对账与整条摘要链完整性校验，链不可
+        对账时上抛（HTTP 边界转 503），保留现场、不返回部分结果。
         """
+        if at_seq is None and expected_head is None:
+            return self._get_asset_current(wallet_id, asset_id)
+        try:
+            with self._wallet_lock(wallet_id):
+                # 查询前先自愈他进程崩溃遗留的提交意图，绝不基于半完成
+                # 余额/审计现场回答历史状态。
+                self._heal_wallet(wallet_id)
+                # 404 优先于查询参数 400：与 audit-evidence /
+                # audit-events 同一次序。
+                self._get_wallet_or_404(wallet_id)
+                # 1) 重复参数：按 at_seq、expected_head 次序报
+                if isinstance(at_seq, list) and len(at_seq) > 1:
+                    raise ServiceError(400, "duplicate at_seq parameters")
+                if (
+                    isinstance(expected_head, list)
+                    and len(expected_head) > 1
+                ):
+                    raise ServiceError(
+                        400, "duplicate expected_head parameters"
+                    )
+                if isinstance(at_seq, list):
+                    at_seq = at_seq[0]
+                # 2) at_seq：仅接受由 ASCII 数字组成的正整数（空值、
+                #    空白、带符号、小数、Unicode 数字一律拒绝；不做
+                #    strip，空串即非法）。此时只校验形状并保留归一化
+                #    文本（去前导零），int 转换推迟到尾序号比较之后，
+                #    避免超长数字串（Python int 转换上限）被误当
+                #    ValueError(400)——它仍是合法正整数，超尾应 404。
+                boundary_text = self._asset_at_seq_text(at_seq)
+                if isinstance(expected_head, list):
+                    expected_head = expected_head[0]
+                # 3) expected_head 只能随 at_seq 使用：缺 at_seq 或
+                #    expected_head 为空/非 64 位小写十六进制均 400
+                if expected_head is not None and (
+                    not isinstance(expected_head, str)
+                    or not self._EXPECTED_HEAD_RE.match(expected_head)
+                ):
+                    raise ServiceError(400, "invalid expected_head")
+                self._validate_asset_id(asset_id)
+                # 与 audit-evidence 同一套严格 DKG 对账与摘要链完整
+                # 性校验：链元数据缺失/矛盾、事件被改动等不可对账
+                # 现场 fail-closed，绝不静默出证。
+                self._reconcile_dkg_events_locked(wallet_id)
+                # integrity 返回 (尾序号, 当前链头)：链元数据缺失/
+                # 矛盾、事件被改动一律上抛（HTTP 边界转 503）。
+                tail_count = self._audit.integrity(wallet_id)[0]
+                # 4) 边界超过当前审计尾序号：404（边界内尚无事件的
+                #    空钱包同样落在此处）。按位数/文本比较，避免对
+                #    超长数字串做 int 转换；未越界的小值随后再转 int。
+                tail_text = str(tail_count)
+                beyond_tail = (
+                    len(boundary_text) > len(tail_text)
+                    or (
+                        len(boundary_text) == len(tail_text)
+                        and boundary_text > tail_text
+                    )
+                )
+                if beyond_tail:
+                    raise ServiceError(
+                        404, "at_seq beyond the audit tail"
+                    )
+                boundary = int(boundary_text)
+                evidence = self._audit.range_evidence(
+                    wallet_id, 1, boundary
+                )
+                head = evidence["end_head"]
+                committed = None
+                for event in evidence["events"]:
+                    if event.get("type") != (
+                        audit.TYPE_ASSET_OPERATION_COMMITTED
+                    ):
+                        continue
+                    details = event.get("details")
+                    # 资产生效点只能是形状合法的 R：形状矛盾与
+                    # audit-evidence 不可对账同等级，绝不猜读。
+                    if not self._committed_details_shape_ok(details):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} committed event at "
+                            f"seq {event.get('seq')!r} is malformed"
+                        )
+                    if details["asset_id"] == asset_id:
+                        committed = details
+                # 5) 边界前无该资产已提交操作：404，绝不以当前余额
+                #    或零余额代替
+                if committed is None:
+                    raise ServiceError(
+                        404, f"asset {asset_id!r} not found"
+                    )
+                # 6) expected_head 与边界 head 不符：409（先于 200，
+                #    后于边界/资产 404）
+                if (
+                    expected_head is not None
+                    and expected_head != head
+                ):
+                    raise ServiceError(
+                        409, "expected_head does not match chain head"
+                    )
+                return {
+                    "asset_id": asset_id,
+                    "balance": committed["balance"],
+                    "version": committed["version"],
+                    "at_seq": boundary,
+                    "head": head,
+                }
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    def _get_asset_current(
+        self, wallet_id: str, asset_id: str
+    ) -> dict:
+        """at_seq 缺省时的既有当前账本读取（语义与错误保持不变）。"""
         try:
             with self._wallet_lock(wallet_id):
                 # 查询前先自愈他进程崩溃遗留的提交意图，绝不返回半完成余额
@@ -6850,6 +6987,60 @@ class WalletService:
             raise
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+
+    #: at_seq 只接受由 ASCII 数字组成的字符串
+    _ASSET_AT_SEQ_RE = re.compile(r"^[0-9]+$")
+
+    @classmethod
+    def _asset_at_seq_text(cls, value: object) -> str:
+        """历史边界 at_seq 形状校验：仅接受 ASCII 数字组成的正整数，
+        返回去掉前导零的归一化文本（至少一位，且不全部为零）。
+
+        不做 strip：空串、纯空白、带符号/小数点/指数、Unicode 数字
+        （str.isdigit 会放行的非 ASCII 码点）一律拒绝；全零（0、
+        00…）非正整数。非法抛 ServiceError(400)。调用方须先完成重复
+        参数判定。int 转换由调用方在尾序号文本比较确认未越界后再做，
+        超长数字串因而不会触发 Python 的 int 转换上限。"""
+        if not isinstance(value, str) or not cls._ASSET_AT_SEQ_RE.fullmatch(
+            value
+        ):
+            raise ServiceError(400, "invalid at_seq")
+        normalized = value.lstrip("0")
+        if not normalized:
+            raise ServiceError(400, "invalid at_seq")
+        return normalized
+
+    @staticmethod
+    def _committed_details_shape_ok(details: object) -> bool:
+        """历史重放判定的提交事件 R 形状：恰含 R 六键，asset_id 为
+        字符串，delta 为非布尔非零整数，state 恒 committed，balance/
+        version 为非布尔整数。形状矛盾属不可对账现场（503），绝不
+        任取或跳过。"""
+        if not isinstance(details, dict) or set(details) != {
+            "operation_id",
+            "asset_id",
+            "delta",
+            "state",
+            "balance",
+            "version",
+        }:
+            return False
+        if not isinstance(details["asset_id"], str):
+            return False
+        if (
+            not isinstance(details["delta"], int)
+            or isinstance(details["delta"], bool)
+            or details["delta"] == 0
+        ):
+            return False
+        if details["state"] != "committed":
+            return False
+        for key in ("balance", "version"):
+            if not isinstance(details[key], int) or isinstance(
+                details[key], bool
+            ):
+                return False
+        return True
 
     def get_asset_operation(
         self, wallet_id: str, operation_id: object
