@@ -72,7 +72,7 @@ python -m unittest discover -s tests -v
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
-| GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version` |
+| GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可选 `at_seq`/`expected_head` 查历史状态） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/unfreeze` | 解除单个资产冻结 `{"reason"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}/security-state` | 查询资产安全状态 `{wallet_id,asset_id,state,reason}` |
@@ -664,7 +664,27 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   一次）；崩溃按事件是否落盘前滚为 cancelled 或回滚为 pending，
   恢复不新增审计。
 - `GET assets/{asset_id}`：返回 `{asset_id,balance,version}`；资产无
-  已提交操作 `404`。
+  已提交操作 `404`。可选 `at_seq=<正整数>` 按钱包审计前缀（seq ≤
+  at_seq 的全部事件为边界）读取历史资产状态，成功 `200` 仅返回
+  `{asset_id,balance,version,at_seq,head}`：余额与 version 完全由
+  边界内 `asset_operation_committed` 事件按 seq 重放（资产变化自提交
+  事件序号起生效，边界落在同批 chain_report/chain_vote/
+  chain_dispatch_settled/chain_dispatch_confirmation/
+  chain_dispatch_reorged 等触发事件但未含提交事件时按落账前状态
+  回答），不同资产分别计算；pending、cancelled、committed/观察/结算
+  幂等重放均不计入；边界前该资产无已提交操作 `404`（不以当前余额或
+  零余额代替），`at_seq` 超过当前审计尾序号 `404`。`head` 为边界事件
+  后的整个钱包摘要链头，与 audit-evidence 同一结束序号
+  （to_seq=at_seq）的 `end_head` 相同，不绑定单个资产。可选
+  `expected_head=<64 位小写 hex>` 仅能随 `at_seq` 使用，与 `head` 不
+  符 `409`；`at_seq` 仅接受 ASCII 数字组成的正整数（空值、`0`、空白、
+  小数、重复参数）与 `expected_head` 格式错误/重复/缺少 `at_seq` 一律
+  `400`；钱包不存在 `404` 且先于参数校验，非法 `asset_id` `400`。
+  历史查询在既有恢复检查与摘要链对账之后读取，纯只读：不触发审批懒
+  过期、不新增事件/seq/历史状态文件、不改余额/version/摘要链，钱包或
+  资产冻结仍可查，后续操作或策略修改不改变同一边界结果（重启或恢复
+  合法灾备快照后一致）；审计链、账本或恢复现场损坏/读取失败沿用
+  `503` 泛化文案、保留现场、不返回部分结果。
 - 重启后 pending/committed 与幂等保持，version 单调不回退、不重号。
   账本或提交意图损坏/矛盾时 fail-closed（常驻 `503`、阻止就绪），绝不
   归一为空或覆盖删除。

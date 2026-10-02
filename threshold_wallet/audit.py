@@ -1377,6 +1377,43 @@ class AuditStore:
             "count": len(data["events"]),
         }
 
+    def prefix_evidence(
+        self, wallet_id: str, at_seq: int
+    ) -> Optional[dict]:
+        """边界前缀证据（纯只读，不分配 seq、不改状态、不写文件）。
+
+        严格加载审计文件（损坏/摘要矛盾即 CorruptDataError/RecoveryError，
+        由调用方转 503）；文件不存在返回 None。调用方须先保证钱包存在且
+        ``1 <= at_seq`` 且 ``at_seq`` 不越界（本方法不再复核边界合法
+        性）。返回::
+
+            {"events": [...seq 1..at_seq 按 seq 升序的副本...],
+             "head": at_seq 事件后的链头（与 audit-evidence 同一
+                       结束序号 to_seq=at_seq 的 end_head 相同）,
+             "count": 全部事件数}
+
+        链头按既有递推规则（前序摘要文本 + 事件摘要文本）重算；严格
+        加载保证 seq 恰为 1..N，故到达 at_seq 后即可停止。
+        """
+        data = self._read_strict(wallet_id)
+        if data is None:
+            return None
+        head = GENESIS_HEAD
+        events: list[dict] = []
+        for event in sorted(data["events"], key=lambda e: e["seq"]):
+            digest = _event_digest(event)
+            head = hashlib.sha256(
+                (head + digest).encode("ascii")
+            ).hexdigest()
+            events.append(dict(event))
+            if event["seq"] == at_seq:
+                break
+        return {
+            "events": events,
+            "head": head,
+            "count": len(data["events"]),
+        }
+
     def all_events(self, wallet_id: str) -> list[dict]:
         """返回该钱包全部事件（按 seq 升序，返回副本）。纯只读。
 

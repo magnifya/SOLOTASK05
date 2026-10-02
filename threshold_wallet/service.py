@@ -6822,7 +6822,13 @@ class WalletService:
         self._store.delete_asset_commit_intent(wallet_id, dispatch_id)
         return committed_record
 
-    def get_asset(self, wallet_id: str, asset_id: str) -> dict:
+    def get_asset(
+        self,
+        wallet_id: str,
+        asset_id: str,
+        at_seq: object = None,
+        expected_head: object = None,
+    ) -> dict:
         """查询某资产的账本状态（balance/version）。
 
         在每钱包事务锁内读取：提交事务进行中（账本已改、事件尚未落盘）的
@@ -6830,26 +6836,188 @@ class WalletService:
 
         恢复检查、钱包存在性、asset_id 校验与余额读取全部在锁内：绝不
         先用锁外快照决定 404/400。
+
+        未提供 at_seq 时保持原契约：读当前账本，返回
+        ``{asset_id,balance,version}``；提供 at_seq 时按钱包审计前缀
+        （seq <= at_seq）重放历史，返回
+        ``{asset_id,balance,version,at_seq,head}``：
+
+        - at_seq 为仅由 ASCII 十进制数字组成的正整数（拒绝空值、0、
+          空白、符号、小数与布尔），expected_head 仅能随 at_seq 出现且
+          须为 64 位小写十六进制；重复参数、expected_head 缺 at_seq、
+          格式非法一律 400；
+        - at_seq 超过当前审计尾序号 404；边界前该资产无已提交操作（无
+          落账的 asset_operation_committed 事件）404，绝不用当前余额或
+          零余额代替；pending/cancelled/幂等重放均不计入；
+        - head 为整个钱包审计前缀（1..at_seq）的链头，与 audit-evidence
+          同一结束序号 to_seq=at_seq 的 end_head 相同，绑定整个钱包而非
+          单个资产；expected_head 与其不符 409；
+        - 历史完全由审计事件重放：资产变化从
+          asset_operation_committed 事件序号起生效，边界落在同批
+          chain_report/chain_vote/chain_dispatch_settled/
+          chain_dispatch_confirmation/chain_dispatch_reorged 等触发事件
+          但未包含提交事件时按落账前状态回答；不同资产分别计算；
+        - 纯只读：不触发审批懒过期、不写状态/事件/历史文件、不分配
+          seq、不改余额/version/摘要链；钱包与资产冻结不影响查询；审计
+          链/账本/恢复现场损坏或读取失败 fail-closed 503，保留现场、
+          不返回部分结果。
         """
         try:
             with self._wallet_lock(wallet_id):
                 # 查询前先自愈他进程崩溃遗留的提交意图，绝不返回半完成余额
                 self._heal_wallet(wallet_id)
-                # 404 优先于 400：存在性先于 asset_id 校验
+                # 404 优先于 400：存在性先于 asset_id/查询参数校验
                 self._get_wallet_or_404(wallet_id)
                 self._validate_asset_id(asset_id)
-                asset = self._store.get_asset(wallet_id, asset_id)
-                if asset is None:
-                    raise ServiceError(404, f"asset {asset_id!r} not found")
-                return {
-                    "asset_id": asset_id,
-                    "balance": asset["balance"],
-                    "version": asset["version"],
-                }
+                if at_seq is None and expected_head is None:
+                    asset = self._store.get_asset(wallet_id, asset_id)
+                    if asset is None:
+                        raise ServiceError(
+                            404, f"asset {asset_id!r} not found"
+                        )
+                    return {
+                        "asset_id": asset_id,
+                        "balance": asset["balance"],
+                        "version": asset["version"],
+                    }
+                # 历史查询参数：parse_qs(keep_blank_values=True) 的字符串
+                # 列表（None 缺参，长度 >1 重复，[""] 空值）
+                at_seq_text, expected_head_text = (
+                    self._parse_asset_history_params(at_seq, expected_head)
+                )
+                # 整条摘要链必须可对账：文件存在但缺 chain 元数据、链头
+                # 与事件重算不符一律 RecoveryError（503），绝不静默出证。
+                self._audit.integrity(wallet_id)
+                prefix = self._audit.prefix_evidence(
+                    wallet_id, at_seq_text
+                )
         except CorruptDataError:
             raise
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+        if prefix is None or at_seq_text > prefix["count"]:
+            # 无审计文件（尾序号 0）或边界超过当前审计尾序号
+            raise ServiceError(404, "at_seq beyond audit tail")
+        # 边界内所有 asset_operation_committed 事件都须满足 R 形状不变
+        # 量（与启动恢复/账本对账同一套校验）：即使畸形提交点属于其他
+        # 资产，也绝不在本查询中静默放过；随后按资产分别重放余额/version。
+        commits: list[dict] = []
+        for event in prefix["events"]:
+            if (
+                event.get("type")
+                == audit.TYPE_ASSET_OPERATION_COMMITTED
+            ):
+                self._validate_committed_event_details(
+                    event.get("details"), wallet_id
+                )
+                commits.append(event["details"])
+        balance = 0
+        version = 0
+        for details in commits:
+            if details["asset_id"] != asset_id:
+                continue
+            version += 1
+            balance += details["delta"]
+            if balance < 0:
+                # 正常服务只会写出非负余额前缀：负余额只可能是篡改/丢失
+                # 提交点，属不可对账现场
+                raise RecoveryError(
+                    f"asset {asset_id!r} history prefix goes negative"
+                )
+            if details["version"] != version or details["balance"] != balance:
+                raise RecoveryError(
+                    f"asset {asset_id!r} history prefix does not recompute"
+                )
+        if version == 0:
+            # 边界前无该资产已提交操作：不以当前余额或零余额代替
+            raise ServiceError(404, f"asset {asset_id!r} not found")
+        if (
+            expected_head_text is not None
+            and expected_head_text != prefix["head"]
+        ):
+            # 客户端链头前置条件不符：先于结果返回，绝不透露边界余额
+            raise ServiceError(409, "expected_head does not match chain head")
+        return {
+            "asset_id": asset_id,
+            "balance": balance,
+            "version": version,
+            "at_seq": at_seq_text,
+            "head": prefix["head"],
+        }
+
+    #: 历史边界 at_seq：仅 ASCII 数字组成的正整数（拒绝 0）
+    _AT_SEQ_RE = re.compile(r"^[0-9]+$")
+
+    def _parse_asset_history_params(
+        self, at_seq: object, expected_head: object
+    ) -> tuple[int, object]:
+        """解析资产历史查询参数（parse_qs keep_blank_values 列表形态）。
+
+        校验次序：重复参数（at_seq、expected_head）→ expected_head 缺
+        at_seq → at_seq 空值/格式/取值 → expected_head 空值/格式。返回
+        ``(at_seq_int, expected_head_str|None)``。调用方须先完成钱包
+        存在性 404 与 asset_id 400 校验。"""
+        if isinstance(at_seq, list) and len(at_seq) > 1:
+            raise ServiceError(400, "duplicate at_seq parameter")
+        if isinstance(expected_head, list) and len(expected_head) > 1:
+            raise ServiceError(400, "duplicate expected_head parameter")
+        if at_seq is None:
+            raise ServiceError(
+                400, "expected_head requires at_seq"
+            )
+        at_seq_value = at_seq[0] if isinstance(at_seq, list) else at_seq
+        if (
+            not isinstance(at_seq_value, str)
+            or not self._AT_SEQ_RE.match(at_seq_value)
+            or int(at_seq_value) < 1
+        ):
+            raise ServiceError(400, "at_seq must be a positive integer")
+        if expected_head is not None:
+            head_value = (
+                expected_head[0]
+                if isinstance(expected_head, list)
+                else expected_head
+            )
+            if (
+                not isinstance(head_value, str)
+                or not self._EXPECTED_HEAD_RE.match(head_value)
+            ):
+                raise ServiceError(
+                    400,
+                    "expected_head must be 64-char lowercase hex",
+                )
+        else:
+            head_value = None
+        return int(at_seq_value), head_value
+
+    @staticmethod
+    def _validate_committed_event_details(
+        details: object, wallet_id: str
+    ) -> None:
+        """严格校验边界内任一 asset_operation_committed 事件的 details
+        形状（与启动恢复/账本对账同一套 R 不变量）：恰含 operation_id
+        （字符串）、asset_id（字符串）、state="committed"、非布尔非零
+        整数 delta、非布尔整数 balance 与正整数 version。任何畸形提交
+        点（含属于其他资产者）都 fail-closed（RecoveryError），绝不静默
+        跳过或任取字段。"""
+        if (
+            not isinstance(details, dict)
+            or not isinstance(details.get("operation_id"), str)
+            or not isinstance(details.get("asset_id"), str)
+            or details.get("state") != "committed"
+            or not isinstance(details.get("delta"), int)
+            or isinstance(details.get("delta"), bool)
+            or details.get("delta") == 0
+            or not isinstance(details.get("balance"), int)
+            or isinstance(details.get("balance"), bool)
+            or not isinstance(details.get("version"), int)
+            or isinstance(details.get("version"), bool)
+            or details["version"] < 1
+        ):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} has a malformed "
+                "asset_operation_committed event in the audit prefix"
+            )
 
     def get_asset_operation(
         self, wallet_id: str, operation_id: object

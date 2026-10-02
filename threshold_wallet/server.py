@@ -36,7 +36,7 @@
 - GET  /v1/wallets/<wallet_id>/asset-operations/<id>       查询资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
-- GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本
+- GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本（可选 at_seq/expected_head 查历史）
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>/security-state 查询资产安全状态
 - POST /v1/wallets/<wallet_id>/assets/<asset_id>/freeze   应急冻结单个资产
 - POST /v1/wallets/<wallet_id>/assets/<asset_id>/unfreeze 解除单个资产冻结
@@ -261,7 +261,22 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 if len(rest) == 2 and rest[0] == "assets":
-                    self._send_json(200, service.get_asset(wallet_id, rest[1]))
+                    # 历史资产状态：at_seq 给定按审计前缀重放，
+                    # expected_head 仅能随 at_seq 使用；缺省保持原契约。
+                    # 单独保留空白查询值：at_seq= / expected_head= 属空值
+                    # 400（既有路由沿用 parse_qs 默认丢弃空白值的语义）。
+                    asset_query = parse_qs(
+                        parsed.query, keep_blank_values=True
+                    )
+                    self._send_json(
+                        200,
+                        service.get_asset(
+                            wallet_id,
+                            rest[1],
+                            asset_query.get("at_seq"),
+                            asset_query.get("expected_head"),
+                        ),
+                    )
                     return
                 if len(rest) == 2 and rest[0] == "asset-operations":
                     self._send_json(
