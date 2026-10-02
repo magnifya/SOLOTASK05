@@ -57,6 +57,7 @@
 - POST /v1/wallets/<wallet_id>/sign-sessions               创建可恢复签名会话
 - GET  /v1/wallets/<wallet_id>/sign-sessions/<id>          查询签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/shares   投递份额签名
+- POST /v1/wallets/<wallet_id>/sign-sessions/<id>/cancel   主动撤销签名会话
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/replace  替换会话单个参与方份额
 - POST /v1/wallets/<wallet_id>/sign-sessions/<id>/participants/takeover 两阶段接管会话参与方份额
 - POST /v1/wallets/<wallet_id>/share-bind                      绑定 DKG 复职节点到轮换份额槽位
@@ -318,6 +319,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         200, service.get_sign_session(wallet_id, rest[1])
                     )
                     return
+                if self._is_sign_session_cancel_path(rest):
+                    # 会话撤销只接受 POST：其他方法一律 405
+                    raise ServiceError(405, "method not allowed")
                 if rest == ["audit-events"]:
                     # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
                     # JSON（非 ASCII 不转义、无末换行）；其余路由不变。
@@ -686,6 +690,24 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get(
                             "node", WalletService._NO_NODE
                         ),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if self._is_sign_session_cancel_path(rest):
+                    body = self._read_json_body()
+                    # 请求体仅允许 cancel_id/reason 两键（值类型/取值由
+                    # service 校验）；缺键/夹带/非对象/非法 JSON 一律 400
+                    if set(body) != {"cancel_id", "reason"}:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly cancel_id and reason",
+                        )
+                    status, result = service.cancel_sign_session(
+                        wallet_id,
+                        rest[1],
+                        body.get("cancel_id"),
+                        body.get("reason"),
                     )
                     self._send_json(status, result)
                     return
@@ -1080,6 +1102,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 matched = self._split_wallet_path(path)
                 if matched is not None:
                     wallet_id, rest = matched
+                    if self._is_sign_session_cancel_path(rest):
+                        # 会话撤销只接受 POST
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["audit-integrity"]:
                         # audit-integrity 只接受 GET
                         raise ServiceError(405, "method not allowed")
@@ -1225,33 +1250,46 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             self._reject_unsupported_method()
 
         def do_HEAD(self) -> None:  # noqa: N802
-            # HEAD 语义不返回响应体：audit-integrity / audit-evidence 上仅给
-            # 405 状态头。
+            # HEAD 语义不返回响应体：audit-integrity / audit-evidence 与
+            # 会话 cancel 路径上仅给 405 状态头。
             self._compact_response = False
             path = urlparse(self.path).path
             matched = self._split_wallet_path(path)
-            if matched is not None and matched[1] in (
-                ["audit-integrity"],
-                ["audit-evidence"],
+            if matched is not None and (
+                matched[1]
+                in (
+                    ["audit-integrity"],
+                    ["audit-evidence"],
+                )
+                or self._is_sign_session_cancel_path(matched[1])
             ):
                 self.send_response(405)
-                self.send_header("Allow", "GET")
+                self.send_header(
+                    "Allow",
+                    "POST"
+                    if self._is_sign_session_cancel_path(matched[1])
+                    else "GET",
+                )
                 self.send_header("Content-Length", "0")
                 self.end_headers()
             else:
                 self._send_error(404, "not found")
 
         def _reject_unsupported_method(self) -> None:
-            """audit-integrity / audit-evidence 资源上的
-            DELETE/PATCH/OPTIONS/HEAD 一律抛 ServiceError(405)；其余路径保持
-            404。"""
+            """audit-integrity / audit-evidence 资源与签名会话 cancel 路径
+            上的 DELETE/PATCH/OPTIONS/HEAD 一律抛 ServiceError(405)；其余
+            路径保持 404。"""
             self._compact_response = False
             try:
                 path = urlparse(self.path).path
                 matched = self._split_wallet_path(path)
-                if matched is not None and matched[1] in (
-                    ["audit-integrity"],
-                    ["audit-evidence"],
+                if matched is not None and (
+                    matched[1]
+                    in (
+                        ["audit-integrity"],
+                        ["audit-evidence"],
+                    )
+                    or self._is_sign_session_cancel_path(matched[1])
                 ):
                     raise ServiceError(405, "method not allowed")
                 self._send_error(404, "not found")
@@ -1269,6 +1307,15 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             if not parts[0]:
                 return None
             return parts[0], parts[1:]
+
+        @staticmethod
+        def _is_sign_session_cancel_path(rest) -> bool:
+            """rest 是否为 sign-sessions/<sid>/cancel（仅接受 POST）。"""
+            return (
+                len(rest) == 3
+                and rest[0] == "sign-sessions"
+                and rest[2] == "cancel"
+            )
 
         @staticmethod
         def _split_dkg_path(path: str):

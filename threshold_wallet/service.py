@@ -12619,7 +12619,8 @@ class WalletService:
     @staticmethod
     def _session_view(record: dict) -> dict:
         """签名会话对外视图：原文、状态、已收/缺失份额、到期时间；
-        aggregate_signature 仅在 signed 时出现。绝不返回份额签名本身。
+        aggregate_signature 仅在 signed 时出现；cancellation（恰含
+        cancel_id/reason）仅在 cancelled 时出现。绝不返回份额签名本身。
 
         collecting/ready 会话在轮换后由持锁恢复迁移到当前在用快照（旧份额
         已从 shares 剔除），故视图只需按记录的 share_ids 计数。"""
@@ -12637,6 +12638,11 @@ class WalletService:
         }
         if record["state"] == "signed":
             view["aggregate_signature"] = record["aggregate_signature"]
+        if record["state"] == "cancelled":
+            view["cancellation"] = {
+                "cancel_id": record["cancellation"]["cancel_id"],
+                "reason": record["cancellation"]["reason"],
+            }
         return view
 
     @staticmethod
@@ -13125,6 +13131,12 @@ class WalletService:
                 raise ServiceError(
                     409, f"sign session {session_id!r} has expired"
                 )
+            if record["state"] == "cancelled":
+                # 已撤销是终态：任何投递（含已收份额重放）一律 409，
+                # 状态判定优先于载荷校验
+                raise ServiceError(
+                    409, f"sign session {session_id!r} has been cancelled"
+                )
             state = record["state"]
 
             # 会话存在且未过期后再校验载荷：share_id 非空、signature 为
@@ -13273,6 +13285,163 @@ class WalletService:
             return 409, self._session_view(record)
         signed_record = self._commit_session_signed(wallet_id, record)
         return 200, self._session_view(signed_record)
+
+    # -- 会话主动撤销 ------------------------------------------------------
+
+    @staticmethod
+    def _validate_session_cancel_reason(reason: object) -> str:
+        """会话撤销请求体 reason：1..1024 字符非空白字符串，原文保留。
+        非法抛 ServiceError(400)。"""
+        if not isinstance(reason, str) or isinstance(reason, bool):
+            raise ServiceError(400, "reason must be a string")
+        if len(reason) < 1 or len(reason) > MAX_REASON_LENGTH:
+            raise ServiceError(
+                400,
+                f"reason must be 1 to {MAX_REASON_LENGTH} characters long",
+            )
+        if not reason.strip():
+            raise ServiceError(400, "reason must be non-blank")
+        return reason
+
+    def cancel_sign_session(
+        self,
+        wallet_id: str,
+        session_id: object,
+        cancel_id: object,
+        reason: object,
+    ) -> tuple[int, dict]:
+        """主动撤销签名会话，返回 (状态码, 视图)。
+
+        - 钱包/会话未知 404；冻结钱包一律 409（含重放）且零副作用；
+        - cancel_id 须匹配安全标识、reason 须为 1..1024 字符非空白字符串
+          （原文保留），非法 400；
+        - 仅未到期的 collecting/ready 可首次撤销：成功 201 并原子转
+          cancelled，记录携带恰含 cancel_id/reason 的 cancellation 快照；
+          signed/expired（含撤销时懒过期）409；
+        - cancelled 为终态：已收/缺失份额快照冻结于撤销时刻，后续轮换
+          不再迁移；视图不出现聚合签名；
+        - cancel_id 只在同钱包的会话撤销之间判重：同会话同标识同原因
+          重放 200 同体（不再检查期限、不记事件）；异参、复用到其他会话
+          或对已撤销会话以新标识再撤销均 409；
+        - session_event（action=cancelled）是唯一提交点：事件未落盘则
+          回滚记录，落盘（含异常但已落盘）则前滚补齐；重放不追加事件。
+        """
+        record: dict | None = None
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：锁内先判定钱包存在性
+                if self._store.get_wallet(wallet_id) is None:
+                    raise ServiceError(404, f"wallet {wallet_id!r} not found")
+                self._assert_wallet_active_locked(wallet_id)
+                self._validate_session_id(session_id)
+                if not isinstance(
+                    cancel_id, str
+                ) or not ROTATION_ID_RE.match(cancel_id):
+                    raise ServiceError(
+                        400, "cancel_id must match [A-Za-z0-9_-]{1,128}"
+                    )
+                reason = self._validate_session_cancel_reason(reason)
+                record = self._store.get_sign_session(wallet_id, session_id)
+                if record is None:
+                    raise ServiceError(
+                        404, f"sign session {session_id!r} not found"
+                    )
+                # 已提交重放优先于一切状态/期限判定：cancelled 事件是唯一
+                # 提交点；cancel_id 只在同钱包的会话撤销之间判重。
+                own_event = None
+                for sid, events in self._audit.session_events(
+                    wallet_id
+                ).items():
+                    for event in events:
+                        details = event.get("details")
+                        if (
+                            not isinstance(details, dict)
+                            or details.get("action") != "cancelled"
+                            or details.get("cancel_id") != cancel_id
+                        ):
+                            continue
+                        if sid != session_id:
+                            raise ServiceError(
+                                409,
+                                f"cancel {cancel_id!r} is already in use",
+                            )
+                        own_event = event
+                if own_event is not None:
+                    if own_event["details"].get("reason") != reason:
+                        raise ServiceError(
+                            409,
+                            f"cancel {cancel_id!r} was committed with "
+                            "different parameters",
+                        )
+                    # 同会话同标识同原因重放：200 同体，不再检查期限、
+                    # 不追加事件
+                    return 200, self._session_view(record)
+                # 懒过期：collecting/ready 到点原子转 expired（仅一次事件）
+                record = self._session_expire_if_needed(wallet_id, record)
+                if record["state"] == "expired":
+                    raise ServiceError(
+                        409, f"sign session {session_id!r} has expired"
+                    )
+                if record["state"] == "cancelled":
+                    # 已以其他标识撤销：再次以新标识撤销一律 409
+                    raise ServiceError(
+                        409,
+                        f"sign session {session_id!r} has been cancelled",
+                    )
+                if record["state"] not in ("collecting", "ready"):
+                    raise ServiceError(
+                        409,
+                        f"sign session {session_id!r} is not collecting "
+                        "or ready",
+                    )
+                cancelled = dict(record)
+                cancelled["state"] = "cancelled"
+                cancelled["cancellation"] = {
+                    "cancel_id": cancel_id,
+                    "reason": reason,
+                }
+                # 提交点：状态落盘 + cancelled 事件原子。任一写入失败以
+                # 事件是否真正落盘为唯一判据：事件在则前滚补齐为唯一
+                # cancelled；事件不在则回滚为撤销前状态并向上抛出。
+                self._store.update_sign_session(
+                    wallet_id, session_id, cancelled
+                )
+                try:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_SESSION_EVENT,
+                            request_id=session_id,
+                            details={
+                                "action": "cancelled",
+                                "cancel_id": cancel_id,
+                                "reason": reason,
+                                "state": "cancelled",
+                            },
+                        ),
+                    )
+                except BaseException:
+                    landed = self._audit.find_session_event(
+                        wallet_id, session_id, "cancelled"
+                    )
+                    if landed is not None:
+                        # 事件已落盘：前滚补齐，绝不回滚、不重复记事件
+                        self._store.update_sign_session(
+                            wallet_id, session_id, cancelled
+                        )
+                        return 201, self._session_view(cancelled)
+                    self._store.update_sign_session(
+                        wallet_id, session_id, record
+                    )
+                    raise
+                record = cancelled
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return 201, self._session_view(record)
 
     # -- 会话单节点参与者替换 ----------------------------------------------
 
@@ -14008,8 +14177,10 @@ class WalletService:
           却无记录：矛盾现场，fail-closed；
         - 动作序列严格校验：created 首个且唯一；share_received 的份额必须
           属于该事件时刻的在用快照、不重复，details.state 与当时有效已收
-          份数一致（齐份 ready，否则 collecting）；expired/signed 至多一次
-          且互斥、其后不得再有事件；signed 时两份份额必已齐；created 的
+          份数一致（齐份 ready，否则 collecting）；expired/signed/cancelled
+          至多一次且互斥、其后不得再有事件；signed 时两份份额必已齐；
+          cancelled 事件的 cancel_id 在同钱包会话撤销间不得重复，记录
+          携带的 cancellation 必须与事件一致；created 的
           message/timeout_seconds 必须与记录一致；
         - 已存份额若无对应 share_received 事件：份额提交未完成，回滚丢弃；
           有事件却无已存份额：仅当该份额已被后续轮换激活淘汰（剔除旧份额
@@ -14017,8 +14188,10 @@ class WalletService:
         - 每份已存签名用其对应历史公钥重新校验；signed 按有序快照重算
           128 字节聚合签名，必须与记录一致，否则 fail-closed；
         - signed 事件：前滚为唯一 signed；expired 事件（collecting 与
-          ready 到点均可过期）：前滚 expired；否则按当前在用快照迁移并据
-          已提交份额恢复 collecting/ready——磁盘误写的终态随事件回滚；
+          ready 到点均可过期）：前滚 expired；cancelled 事件（collecting
+          与 ready 均可撤销）：前滚 cancelled 并按事件补齐 cancellation；
+          否则按当前在用快照迁移并据已提交份额恢复 collecting/ready——
+          磁盘误写的终态随事件回滚；
         - collecting/ready 记录若停留在旧快照，按钱包当前在用份额迁移：
           剔除已收旧份额（其 share_received 事件保留在仅追加审计中）。
         恢复本身不记事件、不分配 seq。
@@ -14065,6 +14238,29 @@ class WalletService:
                     f"wallet {wallet_id!r} sign session {session_id!r} has a "
                     "created event but no session record"
                 )
+
+        # cancel_id 只在同钱包的会话撤销之间判重：同一取消标识被两个会话的
+        # 已提交撤销事件引用属于矛盾现场，fail-closed。
+        cancel_owners: dict[str, str] = {}
+        for session_id, session_events in events_by_session.items():
+            for event in session_events:
+                details = event.get("details")
+                if (
+                    not isinstance(details, dict)
+                    or details.get("action") != "cancelled"
+                ):
+                    continue
+                cancel_id = details.get("cancel_id")
+                if not isinstance(cancel_id, str):
+                    # 形状交由 _recover_one_sign_session 严格校验
+                    continue
+                owner = cancel_owners.get(cancel_id)
+                if owner is not None and owner != session_id:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} cancel {cancel_id!r} is "
+                        "committed by more than one sign session"
+                    )
+                cancel_owners[cancel_id] = session_id
 
         # 已提交替换/接管事件引用的会话必须存在；其新份额文件必须密码学
         # 自洽（缺失/损坏/矛盾 fail-closed，保留现场）。两类事件共享新份额
@@ -14351,13 +14547,35 @@ class WalletService:
                         "expired event has malformed state"
                     )
                 terminal = "expired"
+            elif action == "cancelled":
+                cancel_id = details.get("cancel_id")
+                cancel_reason = details.get("reason")
+                if (
+                    details.get("state") != "cancelled"
+                    or not isinstance(cancel_id, str)
+                    or not ROTATION_ID_RE.match(cancel_id)
+                    or not isinstance(cancel_reason, str)
+                    or isinstance(cancel_reason, bool)
+                    or not 1 <= len(cancel_reason) <= MAX_REASON_LENGTH
+                    or not cancel_reason.strip()
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} sign session {session_id!r} "
+                        "cancelled event has malformed details"
+                    )
+                terminal = "cancelled"
             else:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} sign session {session_id!r} has "
                     f"unknown action {action!r}"
                 )
 
-        if actions.count("signed") + actions.count("expired") > 1:
+        if (
+            actions.count("signed")
+            + actions.count("expired")
+            + actions.count("cancelled")
+            > 1
+        ):
             raise RecoveryError(
                 f"wallet {wallet_id!r} sign session {session_id!r} has multiple "
                 "terminal actions"
@@ -14379,11 +14597,19 @@ class WalletService:
             ),
             None,
         )
+        cancelled_seq = next(
+            (
+                e["seq"]
+                for e in session_events
+                if e["details"].get("action") == "cancelled"
+            ),
+            None,
+        )
 
         # 终态冻结其提交时刻的在用快照；非终态以钱包当前在用份额为准
         # （有替换/接管事件的会话冻结于最后一次换槽后的快照，不再随轮换
         # 迁移）。
-        terminal_seq = signed_seq or expired_seq
+        terminal_seq = signed_seq or expired_seq or cancelled_seq
         for cut_seq, _old, _new in participant_cuts:
             if terminal_seq is not None and cut_seq > terminal_seq:
                 raise RecoveryError(
@@ -14395,6 +14621,8 @@ class WalletService:
             effective_ids = session_set_at(signed_seq)
         elif terminal == "expired":
             effective_ids = session_set_at(expired_seq)
+        elif terminal == "cancelled":
+            effective_ids = session_set_at(cancelled_seq)
         elif participant_cuts:
             effective_ids = session_set_at(participant_cuts[-1][0])
         else:
@@ -14518,6 +14746,7 @@ class WalletService:
             if sid in stored
         ]
         rebuilt.pop("aggregate_signature", None)
+        rebuilt.pop("cancellation", None)
 
         if terminal == "signed":
             if len(rebuilt["shares"]) != 2:
@@ -14544,6 +14773,31 @@ class WalletService:
         elif terminal == "expired":
             # collecting 与 ready 到点均可过期：终态不再聚合。
             rebuilt["state"] = "expired"
+        elif terminal == "cancelled":
+            # 主动撤销：collecting 与 ready 均可撤销，终态冻结撤销时刻
+            # 快照；撤销快照以事件为权威来源前滚补齐。
+            cancelled_event = next(
+                e
+                for e in session_events
+                if e["details"].get("action") == "cancelled"
+            )
+            rebuilt["state"] = "cancelled"
+            rebuilt["cancellation"] = {
+                "cancel_id": cancelled_event["details"]["cancel_id"],
+                "reason": cancelled_event["details"]["reason"],
+            }
+            # 记录已带撤销快照时必须与事件一致（被篡改即 fail-closed）；
+            # 恰缺快照（事件已落盘、状态写盘不完整的崩溃现场）按事件
+            # 前滚补齐即可。
+            recorded_cancellation = record.get("cancellation")
+            if (
+                recorded_cancellation is not None
+                and recorded_cancellation != rebuilt["cancellation"]
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} sign session {session_id!r} "
+                    "cancellation does not match the cancelled event"
+                )
         else:
             # 轮换迁移后的非终态：旧份额已剔除，按当前快照内已提交份数恢复
             rebuilt["state"] = (

@@ -779,12 +779,16 @@ class WalletStore:
 
         要求：id 为安全标识且与键一致；message 为非空字符串；
         timeout_seconds 为非布尔正整数；expires_at/created_at 为可解析的
-        UTC 时间字符串；state 仅 collecting/ready/signed/expired；
-        share_ids 恰为两个不重复的合法份额标识；shares 为条目数组，
-        share_id 不重复且属于 share_ids 快照，每份签名恰为 64 字节；
+        UTC 时间字符串；state 仅 collecting/ready/signed/expired/
+        cancelled；share_ids 恰为两个不重复的合法份额标识；shares 为条目
+        数组，share_id 不重复且属于 share_ids 快照，每份签名恰为 64 字节；
         signed 必须带恰两份份额与 128 字节聚合签名；ready 必须恰两份；
-        collecting/expired 可有 0~2 份——ready 到点同样会原子转 expired，
-        故 expired 允许保留齐备份额；这两个非终态/终态不得携带聚合签名。
+        collecting/expired/cancelled 可有 0~2 份——ready 到点同样会原子
+        转 expired、ready 也可被撤销，故 expired/cancelled 允许保留齐备
+        份额；这些状态不得携带聚合签名。cancelled 必须携带恰含
+        cancel_id/reason 的 cancellation 撤销快照（cancel_id 为安全标识、
+        reason 为 1..1024 字符非空白字符串），其余状态不得携带
+        cancellation。
 
         状态、事件序列与份额集合的语义一致性（含逐份公钥重验与 signed
         聚合重算）由 service 层恢复对账完成：崩溃窗口内磁盘可能短暂出现
@@ -805,7 +809,35 @@ class WalletStore:
         if not isinstance(record.get("created_at"), str):
             return False
         state = record.get("state")
-        if state not in ("collecting", "ready", "signed", "expired"):
+        if state not in (
+            "collecting",
+            "ready",
+            "signed",
+            "expired",
+            "cancelled",
+        ):
+            return False
+        cancellation = record.get("cancellation")
+        if state == "cancelled":
+            # cancelled 必须携带撤销快照：恰含 cancel_id/reason，cancel_id
+            # 为安全标识，reason 为 1..1024 字符非空白字符串（原文保留）
+            if not isinstance(cancellation, dict) or set(cancellation) != {
+                "cancel_id",
+                "reason",
+            }:
+                return False
+            if not _valid_safe_id(cancellation["cancel_id"]):
+                return False
+            cancel_reason = cancellation["reason"]
+            if (
+                not isinstance(cancel_reason, str)
+                or isinstance(cancel_reason, bool)
+                or not 1 <= len(cancel_reason) <= 1024
+                or not cancel_reason.strip()
+            ):
+                return False
+        elif cancellation is not None:
+            # 非 cancelled 状态携带撤销快照是矛盾现场
             return False
         expected = record.get("share_ids")
         if not isinstance(expected, list) or len(expected) != 2:
@@ -847,8 +879,8 @@ class WalletStore:
             if aggregate_hex is not None:
                 return False
         else:
-            # collecting / expired：0~2 份（ready 到点同样转 expired），
-            # 但不得携带聚合签名
+            # collecting / expired / cancelled：0~2 份（ready 到点同样转
+            # expired、ready 同样可被撤销），但不得携带聚合签名
             if aggregate_hex is not None:
                 return False
         return True
