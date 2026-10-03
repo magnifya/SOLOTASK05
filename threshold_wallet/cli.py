@@ -129,6 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_rcancel.add_argument("--cancel-id", required=True)
     p_rcancel.add_argument("--reason", required=True)
 
+    # rotation-cancel  <-> POST .../share-rotations/{rid}/cancel
+    p_rotcancel = sub.add_parser(
+        "rotation-cancel",
+        help="撤销未激活的份额轮换（POST .../share-rotations/{id}/cancel）",
+    )
+    p_rotcancel.add_argument("--url", default=DEFAULT_URL)
+    p_rotcancel.add_argument("--wallet-id", required=True)
+    p_rotcancel.add_argument("--rotation-id", required=True)
+    p_rotcancel.add_argument("--cancel-id", required=True)
+    p_rotcancel.add_argument("--reason", required=True)
+
     # share-sign（份额持有方本地辅助命令）
     p_ss = sub.add_parser(
         "share-sign",
@@ -305,6 +316,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "POST",
                 f"{args.url}/v1/wallets/{args.wallet_id}"
                 f"/sign-requests/{args.signing_request_id}/cancel",
+                {
+                    "cancel_id": args.cancel_id,
+                    "reason": args.reason,
+                },
+            )
+
+        elif args.command == "rotation-cancel":
+            status, body = _http_request(
+                "POST",
+                f"{args.url}/v1/wallets/{args.wallet_id}"
+                f"/share-rotations/{args.rotation_id}/cancel",
                 {
                     "cancel_id": args.cancel_id,
                     "reason": args.reason,

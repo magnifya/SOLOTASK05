@@ -145,6 +145,9 @@ TYPE_REQUEST_SIGNED = "request_signed"
 TYPE_REQUEST_CANCELLED = "request_cancelled"
 TYPE_SHARE_ROTATION_PREPARED = "share_rotation_prepared"
 TYPE_SHARE_ROTATION_ACTIVATED = "share_rotation_activated"
+#: 主动撤销未激活轮换（唯一提交点；request_id/actor_id/reason 外层为
+#: null，details 恰含 rotation_id/cancel_id/reason 三键，reason 为原文）
+TYPE_SHARE_ROTATION_CANCELLED = "share_rotation_cancelled"
 TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 #: 撤销未落账的 pending 资产操作（唯一提交点；request_id 为 cancel_id、
 #: actor_id 为 approval_request_id，details 即 cancelled 操作视图）
@@ -1243,6 +1246,20 @@ class AuditStore:
         return self._rotation_events(
             wallet_id, TYPE_SHARE_ROTATION_PREPARED, "prepared",
             strict_unique=False,
+        )
+
+    def cancelled_rotation_events(self, wallet_id: str) -> dict[str, dict]:
+        """返回该钱包已落盘的 share_rotation_cancelled 事件映射
+        ``{rotation_id: event}``。
+
+        恢复据此判定轮换撤销是否已提交（事件在则前滚为 cancelled 并继续
+        清理暂存，事件不在则回滚为 prepared 并保留暂存份额）。每个
+        rotation 至多一条撤销事件；同一 rotation_id 出现两条撤销事件属于
+        不可对账的重复提交点，抛 CorruptDataError（fail-closed），绝不任
+        取一条。纯只读。
+        """
+        return self._rotation_events(
+            wallet_id, TYPE_SHARE_ROTATION_CANCELLED, "cancelled"
         )
 
     def _rotation_events(

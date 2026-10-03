@@ -67,6 +67,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
 | GET  | `/v1/wallets/{id}/share-rotations/{rid}` | 查轮换状态 |
 | POST | `/v1/wallets/{id}/share-rotations/{rid}/activate` | 激活轮换 |
+| POST | `/v1/wallets/{id}/share-rotations/{rid}/cancel` | 撤销未激活轮换 `{"cancel_id","reason"}` |
 | POST | `/v1/wallets/{id}/share-bind` | 绑定 DKG 复职节点到轮换份额槽位 `{"id","rotation","dkg","round","node","slot","approval"}` |
 | POST | `/v1/wallets/{id}/asset-operations` | 建资产操作 `{"operation_id","asset_id","delta"}` |
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
@@ -585,6 +586,27 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 - `GET`：`200`，未知 `404`。
 - `activate`：仅 prepared 可激活（锁内原子替换份额/公钥/状态），成功
   `201`（`state:"active"`）；active 重放 `200`；其余状态 `409`。
+- `cancel`（仅 POST，其他方法 `405`）：请求体**恰为**
+  `{"cancel_id","reason"}`（缺键/夹带/非对象一律 `400`）；`cancel_id`
+  沿用安全标识 `[A-Za-z0-9_-]{1,128}`，`reason` 为 1..1024 字符非空白
+  字符串（原文保留）。仅 `prepared` 轮换可首次撤销：成功 `201` 并原子
+  转 `cancelled`，响应为既有轮换视图附加恰含 `cancel_id`/`reason` 的
+  `cancellation` 对象（其余状态视图形状不变）；成功响应前清理该轮
+  暂存份额，在用份额、钱包公钥、签名会话与历史签名不受影响。
+  - `cancel_id` 只在同钱包的轮换撤销之间判重：同轮换、同标识、同原因
+    重放 `200` 同体（不重复记事件）；异参、复用到另一轮换或对已撤销
+    轮换以新标识再撤销均 `409`。已激活轮换撤销 `409`；撤销与激活交错
+    时只有一个终态生效，另一方 `409`。
+  - 冻结钱包的撤销及其重放一律 `409` 且零副作用，查询仍可用。
+  - 撤销是终态：撤销后用原 `rotation_id` 再次准备返回 `200` 的撤销
+    视图（不生成新份额），查询同视图；激活与首次槽位绑定 `409`（已
+    完成绑定的同参重放保持原规则）。撤销释放 prepared 占用，允许用
+    新标识准备下一笔。
+  - 首次撤销只追加一条 `share_rotation_cancelled` 事件（外层
+    request_id/actor_id/reason 为 null，details 恰含
+    rotation_id/cancel_id/reason，reason 为原文）；该事件是唯一提交
+    点：中断时事件未落盘则保留原 prepared 状态与暂存份额，已落盘则
+    保持撤销结果并由恢复继续完成暂存清理，绝不复活轮换。
 - 激活后未首签的请求必须用新 share_ids（旧份额 `400`）；已首签请求
   重放仍 `200`。
 - 审计事件 `share_rotation_prepared` / `share_rotation_activated`，
@@ -1340,7 +1362,7 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 `at` 为 UTC（`...Z`），不适用字段为 `null`。seq 从 1 起、落盘后单调
 递增，**服务重启后续写、连续不重号；恢复不新增审计事件**。事件类型：
 `policy_updated`、`request_created/approved/rejected/expired/signed/cancelled`、
-`share_rotation_prepared/activated`、`asset_operation_committed`、
+`share_rotation_prepared/activated/cancelled`、`asset_operation_committed`、
 `asset_operation_cancelled`（`request_id` 为 cancel_id、`actor_id` 为
 approval_request_id、details 即 cancelled 操作视图）、
 `transaction_policy_updated`、`session_event`、
@@ -1430,7 +1452,7 @@ details 形状矛盾一律 fail-closed（`503`、serve 拒绝就绪、保留现�
 ## 命令行
 
 `create`/`sign`/`show` 及 `policy`/`request-create`/`request-show`/
-`approve`/`reject`/`request-cancel` 与 HTTP 接口一一对应，成功打印单行 JSON 到 stdout，
+`approve`/`reject`/`request-cancel`/`rotation-cancel` 与 HTTP 接口一一对应，成功打印单行 JSON 到 stdout，
 失败打印单行 `{"error":...}` 到 stderr 并非零退出；客户端命令用 `--url`
 （默认 `http://127.0.0.1:8080`）。
 

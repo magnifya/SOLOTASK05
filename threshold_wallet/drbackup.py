@@ -603,10 +603,11 @@ _WALLET_SHARE_ENTRY_KEYS = frozenset(("share_id", "public_key"))
 #: 单个份额文件允许的契约键（全系统唯一允许含 private_key 的文件形状）
 _SHARE_RECORD_KEYS = frozenset(("share_id", "public_key", "private_key"))
 
-#: 轮换记录允许的契约键（previous_public_key 仅 activating/active 携带）
+#: 轮换记录允许的契约键（previous_public_key 仅 activating/active 携带，
+#: cancellation 仅 cancelled 携带）
 _ROTATION_RECORD_KEYS = frozenset(
     ("rotation_id", "state", "share_ids", "public_key", "created_at",
-     "previous_public_key")
+     "previous_public_key", "cancellation")
 )
 
 #: 审批单记录允许的契约键
@@ -648,6 +649,7 @@ _KNOWN_AUDIT_TYPES = frozenset(
         "request_cancelled",
         "share_rotation_prepared",
         "share_rotation_activated",
+        "share_rotation_cancelled",
         "asset_operation_committed",
         "asset_operation_cancelled",
         "transaction_policy_updated",
@@ -1277,7 +1279,7 @@ def _verify_rotations_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
         if record.get("rotation_id") != key:
             raise BackupError(503, "rotation record id does not match its key")
         state = record.get("state")
-        if state not in ("prepared", "activating", "active"):
+        if state not in ("prepared", "activating", "active", "cancelled"):
             raise BackupError(503, "rotation record has a bad state")
         share_ids = record.get("share_ids")
         if (
@@ -1299,9 +1301,11 @@ def _verify_rotations_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
         if created_at is not None and not isinstance(created_at, str):
             raise BackupError(503, "rotation record has a bad created_at")
         previous = record.get("previous_public_key")
-        if state == "prepared":
+        if state in ("prepared", "cancelled"):
             if previous is not None:
-                raise BackupError(503, "prepared rotation carries a previous key")
+                raise BackupError(
+                    503, "inactive rotation carries a previous key"
+                )
         elif previous is None:
             # 已激活轮必须携带 previous_public_key，连续轮换时间线据此重建
             raise BackupError(503, "active rotation lacks its previous key")
@@ -1311,6 +1315,37 @@ def _verify_rotations_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
                     raise ValueError
             except (ValueError, TypeError):
                 raise BackupError(503, "rotation record has a bad previous key")
+        cancellation = record.get("cancellation")
+        if state == "cancelled":
+            # 撤销快照恰含 cancel_id/reason：cancel_id 为安全标识，reason
+            # 为 1..1024 字符非空白字符串（原文保留）
+            if not isinstance(cancellation, dict) or set(cancellation) != {
+                "cancel_id",
+                "reason",
+            }:
+                raise BackupError(
+                    503, "cancelled rotation has a malformed cancellation"
+                )
+            cancel_id = cancellation.get("cancel_id")
+            reason = cancellation.get("reason")
+            if not isinstance(cancel_id, str) or not _SAFE_ID.match(
+                cancel_id
+            ):
+                raise BackupError(
+                    503, "cancelled rotation has a bad cancel_id"
+                )
+            if (
+                not isinstance(reason, str)
+                or not 1 <= len(reason) <= 1024
+                or not reason.strip()
+            ):
+                raise BackupError(
+                    503, "cancelled rotation has a bad cancel reason"
+                )
+        elif cancellation is not None:
+            raise BackupError(
+                503, "non-cancelled rotation carries a cancellation"
+            )
 
 
 def _json_contains_key(value: object, forbidden: str) -> bool:
