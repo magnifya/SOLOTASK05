@@ -4722,6 +4722,9 @@ class WalletService:
     AUDIT_DEFAULT_LIMIT = 1000
     AUDIT_MAX_LIMIT = 1000
 
+    #: event_type/request_id 筛选值解码后的最大码点数
+    AUDIT_FILTER_MAX_LEN = 1024
+
     @staticmethod
     def _public_audit_event_view(event: dict) -> dict:
         """单条事件的公开查询视图（副本）。
@@ -4753,13 +4756,44 @@ class WalletService:
             raise ServiceError(400, f"{name} must be a positive integer")
         return value
 
+    @staticmethod
+    def _audit_filter_value(value: object, name: str) -> str | None:
+        """event_type/request_id 筛选值：None 表示缺省，否则返回原文。
+
+        parse_qs 单值列表取首项；长度 >1 即重复参数（即使同值）→ 400。
+        单值须为 1..1024 个 Unicode 码点且不全为空白——显式空值、纯
+        空白、超长一律 400，绝不按缺省处理。命中后原样返回：大小写与
+        首尾空白保留，不做任何归一化或前缀解释。"""
+        if value is None:
+            return None
+        if isinstance(value, list):
+            if len(value) > 1:
+                raise ServiceError(400, f"duplicate {name}")
+            value = value[0]
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= WalletService.AUDIT_FILTER_MAX_LEN
+            or not value.strip()
+        ):
+            raise ServiceError(400, f"invalid {name}")
+        return value
+
     def get_audit_events(
         self,
         wallet_id: str,
         from_seq: object = None,
         limit: object = None,
+        event_type: object = None,
+        request_id: object = None,
     ) -> dict:
         """返回 {wallet_id, events}（seq 升序）。
+
+        可选筛选：event_type/request_id 分别与事件外层 type/request_id
+        精确匹配（URL 解码后比较，大小写与首尾空白保留，不做前缀匹配；
+        两者同时给定取交集；不搜索 actor_id 或 details；事件中的 null
+        不匹配文本 null）。from_seq 仍是包含端点的原始审计序号下界，
+        limit 只限制符合全部条件的事件数。筛选值的重复/空值/纯空白/
+        超长校验与分页参数一样在锁内 404 之后进行。
 
         纯只读：不触发 pending 审批单懒过期、不写任何状态/事件、不分配
         seq。但与其他所有访问钱包状态的路由一致，必须在该钱包事务锁内
@@ -4797,10 +4831,20 @@ class WalletService:
                     raise ServiceError(
                         400, f"limit must be at most {self.AUDIT_MAX_LIMIT}"
                     )
+                # 筛选参数与分页参数同处校验（404 之后、读取之前）：
+                # 重复/显式空值/纯空白/超长一律 400，绝不按缺省处理。
+                event_type = self._audit_filter_value(event_type, "event_type")
+                request_id = self._audit_filter_value(request_id, "request_id")
                 # 只读自愈：把可恢复的崩溃现场对账到一致，但绝不记事件、
-                # 绝不触发审批单懒过期。
+                # 绝不触发审批单懒过期。筛选在整份日志严格加载之后施加，
+                # 被条件排除的异常记录同样触发 fail-closed，绝不返回部分
+                # 结果。
                 events = self._audit.list_events(
-                    wallet_id, from_seq=seq, limit=size
+                    wallet_id,
+                    from_seq=seq,
+                    limit=size,
+                    event_type=event_type,
+                    request_id=request_id,
                 )
         except CorruptDataError:
             raise

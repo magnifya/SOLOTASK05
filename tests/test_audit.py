@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -14,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from tests.helpers import http_server, make_harness
 from threshold_wallet.audit import AuditStore
+from threshold_wallet.service import ServiceError
 
 EVENT_KEYS = {"seq", "type", "at", "request_id", "actor_id", "reason", "details"}
 
@@ -502,6 +504,422 @@ class AuditAtomicityTest(unittest.TestCase):
         self.assertEqual(
             self.h.store.get_request("w1", "r1")["state"], "pending"
         )
+
+
+class AuditFilterHttpTest(unittest.TestCase):
+    """event_type/request_id 筛选：精确匹配、交集、分页语义与参数校验。"""
+
+    def setUp(self):
+        self._ctx = http_server(tempfile.mkdtemp())
+        self.srv = self._ctx.__enter__()
+        self.request("POST", "/v1/wallets", {"wallet_id": "w1", "shares": 2})
+
+    def tearDown(self):
+        self._ctx.__exit__(None, None, None)
+
+    def request(self, method, path, body=None):
+        return self.srv.request(method, path, body)
+
+    def get(self, query="", wallet="w1"):
+        path = f"/v1/wallets/{wallet}/audit-events"
+        if query:
+            path += "?" + query
+        return self.request("GET", path)
+
+    def seqs(self, query=""):
+        status, body = self.get(query)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(set(body), {"wallet_id", "events"})
+        return [e["seq"] for e in body["events"]]
+
+    def put_policy(self, req=1):
+        return self.request(
+            "PUT",
+            "/v1/wallets/w1/approval-policy",
+            {"required_approvals": req, "timeout_seconds": 3600},
+        )
+
+    def create_request(self, rid):
+        return self.request(
+            "POST", "/v1/wallets/w1/sign-requests",
+            {"id": rid, "message": "pay-100"},
+        )
+
+    def approve(self, rid, approver="alice"):
+        return self.request(
+            "POST", f"/v1/wallets/w1/sign-requests/{rid}/approve",
+            {"approver_id": approver},
+        )
+
+    def reject(self, rid, approver="alice"):
+        return self.request(
+            "POST", f"/v1/wallets/w1/sign-requests/{rid}/reject",
+            {"approver_id": approver},
+        )
+
+    def _standard_events(self):
+        # seq1 policy_updated(request_id=null) / seq2 request_created(r1) /
+        # seq3 request_created(r2) / seq4 request_approved(r1, actor alice)
+        self.put_policy()
+        self.create_request("r1")
+        self.create_request("r2")
+        self.approve("r1")
+
+    # ---- 精确匹配与交集 ---------------------------------------------------
+
+    def test_filter_by_event_type(self):
+        self._standard_events()
+        self.assertEqual(self.seqs("event_type=request_created"), [2, 3])
+        self.assertEqual(self.seqs("event_type=policy_updated"), [1])
+        self.assertEqual(self.seqs("event_type=request_approved"), [4])
+
+    def test_filter_by_request_id(self):
+        self._standard_events()
+        self.assertEqual(self.seqs("request_id=r1"), [2, 4])
+        self.assertEqual(self.seqs("request_id=r2"), [3])
+
+    def test_filter_intersection(self):
+        self._standard_events()
+        self.assertEqual(
+            self.seqs("event_type=request_created&request_id=r1"), [2]
+        )
+        # 两条件分别都有记录、但无同时满足的记录：交集为空
+        self.assertEqual(
+            self.seqs("event_type=request_approved&request_id=r2"), []
+        )
+
+    def test_filter_no_match_returns_200_empty(self):
+        self._standard_events()
+        status, body = self.get("event_type=no_such_type")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"wallet_id": "w1", "events": []})
+
+    def test_filter_does_not_search_actor_or_details(self):
+        self._standard_events()
+        # actor_id=alice、details.message=pay-100 均不参与匹配
+        self.assertEqual(self.seqs("request_id=alice"), [])
+        self.assertEqual(self.seqs("event_type=pay-100"), [])
+        self.assertEqual(self.seqs("request_id=pay-100"), [])
+
+    def test_null_request_id_not_matched_by_text_null(self):
+        self._standard_events()
+        # seq1 的 request_id 为 JSON null，不匹配文本 "null"
+        self.assertEqual(self.seqs("request_id=null"), [])
+
+    def test_filter_on_wallet_without_events_returns_empty(self):
+        # 一条事件都没有的钱包：合法筛选仍 200 空数组
+        self.assertEqual(self.seqs("event_type=policy_updated"), [])
+        self.assertEqual(self.seqs("request_id=r1"), [])
+        self.assertEqual(
+            self.seqs("event_type=policy_updated&request_id=r1"), []
+        )
+
+    def test_case_and_whitespace_are_significant(self):
+        self._standard_events()
+        self.assertEqual(self.seqs("event_type=Policy_Updated"), [])
+        self.assertEqual(self.seqs("event_type=POLICY_UPDATED"), [])
+        # 首尾空白保留：解码后为 " policy_updated" / "policy_updated "
+        self.assertEqual(self.seqs("event_type=%20policy_updated"), [])
+        self.assertEqual(self.seqs("event_type=policy_updated%20"), [])
+        self.assertEqual(self.seqs("request_id=%20r1"), [])
+
+    def test_no_prefix_match(self):
+        self._standard_events()
+        self.assertEqual(self.seqs("event_type=request"), [])
+        self.assertEqual(self.seqs("request_id=r"), [])
+
+    def test_values_are_url_decoded_before_matching(self):
+        self._standard_events()
+        # %5F == "_"：解码后精确匹配
+        self.assertEqual(self.seqs("event_type=request%5Fcreated"), [2, 3])
+        self.assertEqual(self.seqs("event_type=policy%5Fupdated"), [1])
+        # 斜杠是合法筛选字符（DKG 派生轮 request_id 形如 dkg1/2）：
+        # 格式合法但无对应记录时返回空数组
+        self.assertEqual(self.seqs("request_id=dkg1%2F2"), [])
+        self.assertEqual(self.seqs("request_id=dkg1/2"), [])
+
+    # ---- 分页语义：limit 只数符合全部条件的事件 ---------------------------
+
+    def _interleaved_events(self):
+        # policy_updated 落在 seq 2、7、11，中间夹不匹配记录（seq1 用一条
+        # dkg_stage 填充：无策略时 create_request 只能 409、不记事件）。
+        self.srv.harness.service.post_dkg_stage(
+            "w1", "d1", "register", "n1", "aa" * 32, None, None, None
+        )                                        # 1 dkg_stage
+        self.put_policy()                        # 2 policy_updated ✓
+        self.create_request("a")                 # 3 request_created
+        self.create_request("b")                 # 4 request_created
+        self.approve("a")                        # 5 request_approved
+        self.reject("b")                         # 6 request_rejected
+        self.put_policy()                        # 7 policy_updated ✓
+        self.create_request("c")                 # 8 request_created
+        self.approve("c")                        # 9 request_approved
+        self.create_request("d")                 # 10 request_created
+        self.put_policy()                        # 11 policy_updated ✓
+
+    def test_limit_counts_matching_events_only(self):
+        self._interleaved_events()
+        self.assertEqual(self.seqs("event_type=policy_updated"), [2, 7, 11])
+        # from_seq=3、limit=2 返回 7 和 11：不能因中间记录不匹配而提前结束
+        self.assertEqual(
+            self.seqs("event_type=policy_updated&from_seq=3&limit=2"),
+            [7, 11],
+        )
+        self.assertEqual(
+            self.seqs("event_type=policy_updated&limit=2"), [2, 7]
+        )
+        self.assertEqual(
+            self.seqs("event_type=policy_updated&from_seq=7"), [7, 11]
+        )
+        # from_seq 是包含端点的原始序号下界：命中记录本身
+        self.assertEqual(
+            self.seqs("event_type=policy_updated&from_seq=11&limit=1"), [11]
+        )
+        # 下界超过末尾 / 范围内无匹配：200 空数组
+        self.assertEqual(self.seqs("event_type=policy_updated&from_seq=12"), [])
+        self.assertEqual(self.seqs("request_id=zz&from_seq=3"), [])
+
+    def test_filter_combines_with_request_id_and_pagination(self):
+        self._interleaved_events()
+        self.assertEqual(self.seqs("request_id=a"), [3, 5])
+        self.assertEqual(
+            self.seqs("request_id=a&from_seq=4"), [5]
+        )
+        self.assertEqual(
+            self.seqs("event_type=request_approved&request_id=c"), [9]
+        )
+
+    # ---- 参数校验 ----------------------------------------------------------
+
+    def test_duplicate_filter_params_400(self):
+        self._standard_events()
+        for query in (
+            "event_type=request_created&event_type=request_created",
+            "event_type=request_created&event_type=policy_updated",
+            "request_id=r1&request_id=r1",
+            "request_id=r1&request_id=r2",
+            "event_type=request_created&event_type=",
+        ):
+            status, body = self.get(query)
+            self.assertEqual(status, 400, query)
+            self.assertIn("error", body)
+
+    def test_empty_and_blank_filter_values_400(self):
+        self._standard_events()
+        for query in (
+            "event_type=",
+            "event_type",
+            "event_type=%20",
+            "event_type=+%20",
+            "event_type=%09",
+            "request_id=",
+            "request_id",
+            "request_id=%20%20%20",
+        ):
+            status, body = self.get(query)
+            self.assertEqual(status, 400, query)
+            self.assertIn("error", body)
+
+    def test_filter_length_boundary(self):
+        self._standard_events()
+        # 1024 个码点：格式合法（无匹配 → 200 空数组）
+        status, body = self.get("event_type=" + "a" * 1024)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["events"], [])
+        status, _ = self.get("request_id=" + "b" * 1024)
+        self.assertEqual(status, 200)
+        # 1025 个码点：超长 400
+        for query in (
+            "event_type=" + "a" * 1025,
+            "request_id=" + "b" * 1025,
+        ):
+            status, body = self.get(query)
+            self.assertEqual(status, 400, query[:40])
+            self.assertIn("error", body)
+
+    def test_non_ascii_filter_value_counts_code_points(self):
+        self._standard_events()
+        # 1024 个非 ASCII 码点合法；1025 个超长
+        status, _ = self.get("event_type=" + "%C3%A9" * 1024)
+        self.assertEqual(status, 200)
+        status, _ = self.get("event_type=" + "%C3%A9" * 1025)
+        self.assertEqual(status, 400)
+
+    def test_missing_wallet_404_precedes_filter_validation(self):
+        for query in ("event_type=", "event_type=a&event_type=b",
+                      "request_id=%20", "event_type=request_created"):
+            status, body = self.get(query, wallet="ghost")
+            self.assertEqual(status, 404, query)
+            self.assertIn("error", body)
+
+    def test_invalid_wallet_id_400(self):
+        status, body = self.get("event_type=x", wallet="bad%20id")
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    def test_bad_pagination_params_keep_current_behavior(self):
+        self._standard_events()
+        for query in (
+            "event_type=request_created&from_seq=0",
+            "event_type=request_created&limit=1001",
+            "request_id=r1&limit=abc",
+        ):
+            status, _ = self.get(query)
+            self.assertEqual(status, 400, query)
+        # from_seq 空值沿用既有行为（视为缺省），不受新参数影响
+        self.assertEqual(
+            self.seqs("from_seq=&event_type=request_created"), [2, 3]
+        )
+
+    # ---- 只读语义与既有行为保持 -------------------------------------------
+
+    def test_no_filter_params_unchanged(self):
+        self._standard_events()
+        self.assertEqual(self.seqs(), [1, 2, 3, 4])
+        self.assertEqual(self.seqs("from_seq=2&limit=2"), [2, 3])
+
+    def test_filtered_events_keep_public_shape(self):
+        self._standard_events()
+        status, body = self.get("event_type=request_created")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(body), ["wallet_id", "events"])
+        for event in body["events"]:
+            self.assertEqual(set(event), EVENT_KEYS)
+        self.assertEqual(body["events"][0]["request_id"], "r1")
+
+    def test_filter_does_not_trigger_lazy_expiry_or_writes(self):
+        self.put_policy()
+        self.create_request("r1")
+        store = self.srv.harness.store
+        rec = dict(store.get_request("w1", "r1"))
+        rec["t1"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat().replace("+00:00", "Z")
+        store.update_request("w1", "r1", rec)
+        n = len(self.seqs())
+        self.seqs("event_type=request_expired")
+        self.seqs("request_id=r1")
+        # 不触发懒过期、不新增事件、不分配序号
+        self.assertEqual(
+            store.get_request("w1", "r1")["state"], "pending"
+        )
+        self.assertEqual(len(self.seqs()), n)
+
+    def test_frozen_wallet_still_queryable_with_filters(self):
+        self._standard_events()
+        status, _ = self.request(
+            "POST", "/v1/wallets/w1/freeze", {"reason": "incident"}
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self.seqs("event_type=request_created"), [2, 3])
+        self.assertEqual(self.seqs("request_id=r1"), [2, 4])
+
+    def test_corruption_excluded_by_filter_still_503(self):
+        self._standard_events()
+        # 篡改一条会被筛选条件排除的记录（seq1 policy_updated）：
+        # 整份日志严格加载在筛选之前，绝不返回部分结果
+        path = os.path.join(
+            self.srv.harness.tmpdir, "audit", "w1.json"
+        )
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["events"][0]["details"] = "not-an-object"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        for query in ("event_type=request_created", "request_id=r1", ""):
+            status, body = self.get(query)
+            self.assertEqual(status, 503, query)
+            self.assertIn("error", body)
+
+
+class AuditFilterServiceTest(unittest.TestCase):
+    """筛选的 service 级回归：DKG 派生轮斜杠 request_id、重启后结果。"""
+
+    KEY_A = "aa" * 32
+    KEY_B = "bb" * 32
+    KEY_C = "cc" * 32
+    HASH_A = "11" * 32
+    HASH_B = "22" * 32
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.h = make_harness(self.tmp)
+        self.svc = self.h.service
+        self.svc.create_wallet("w1", 2)
+
+    def _dkg_failover_event(self):
+        """走真实 DKG 故障流程，产生 request_id 为 d1/2 的 dkg_failover。"""
+        post = self.svc.post_dkg_stage
+        self.assertEqual(post("w1", "d1", "register", "n1",
+                              self.KEY_A, None, None)[0], 201)
+        self.assertEqual(post("w1", "d1", "register", "n2",
+                              self.KEY_B, None, None)[0], 201)
+        self.assertEqual(post("w1", "d1", "commit", "n1",
+                              None, self.HASH_A, None)[0], 201)
+        self.assertEqual(post("w1", "d1", "commit", "n2",
+                              None, self.HASH_B, None)[0], 201)
+        code, _ = self.svc.post_dkg_failover(
+            "w1", "d1", 2, "replace", "n2", "n3", self.KEY_C
+        )
+        self.assertEqual(code, 201)
+
+    def test_request_id_with_slash_matches_dkg_derived_round(self):
+        self._dkg_failover_event()
+        matched = self.svc.get_audit_events("w1", request_id="d1/2")["events"]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["type"], "dkg_failover")
+        self.assertEqual(matched[0]["request_id"], "d1/2")
+        # 与 event_type 取交集
+        self.assertEqual(
+            self.svc.get_audit_events(
+                "w1", event_type="dkg_failover", request_id="d1/2"
+            )["events"],
+            matched,
+        )
+        self.assertEqual(
+            self.svc.get_audit_events(
+                "w1", event_type="dkg_stage", request_id="d1/2"
+            )["events"],
+            [],
+        )
+        # 会话级 request_id（无斜杠）不受派生轮筛选影响
+        stages = self.svc.get_audit_events(
+            "w1", event_type="dkg_stage", request_id="d1"
+        )["events"]
+        self.assertEqual(len(stages), 4)
+
+    def test_filter_results_survive_restart(self):
+        self.svc.put_policy("w1", 1, 3600)
+        self.svc.create_sign_request("w1", "r1", "m")
+        self.svc.create_sign_request("w1", "r2", "m")
+        # 重启：同一目录上的新 service，筛选结果由已有记录决定
+        svc2 = make_harness(self.tmp).service
+        events = svc2.get_audit_events(
+            "w1", event_type="request_created"
+        )["events"]
+        self.assertEqual([e["seq"] for e in events], [2, 3])
+        self.assertEqual(
+            [e["request_id"] for e in events], ["r1", "r2"]
+        )
+
+    def test_service_level_filter_validation(self):
+        self.svc.put_policy("w1", 1, 3600)
+        for kwargs in (
+            {"event_type": ""},
+            {"event_type": "   "},
+            {"event_type": "a" * 1025},
+            {"event_type": ["a", "a"]},
+            {"event_type": 7},
+            {"request_id": ""},
+            {"request_id": "\t"},
+            {"request_id": ["r1", "r1"]},
+        ):
+            with self.assertRaises(ServiceError) as ctx:
+                self.svc.get_audit_events("w1", **kwargs)
+            self.assertEqual(ctx.exception.status, 400, kwargs)
+        # 缺省与边界值不抛
+        self.svc.get_audit_events("w1", event_type=None, request_id=None)
+        self.svc.get_audit_events("w1", event_type="a" * 1024)
 
 
 if __name__ == "__main__":

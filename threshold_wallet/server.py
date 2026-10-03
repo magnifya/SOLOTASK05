@@ -326,12 +326,18 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
                     # JSON（非 ASCII 不转义、无末换行）；其余路由不变。
                     self._compact_response = True
+                    # event_type/request_id 须区分"缺省"与"显式空值"
+                    # （后者 400），故单独按保留空白值重解析取这两个键；
+                    # from_seq/limit 仍用既有解析结果，行为完全不变。
+                    filters = parse_qs(parsed.query, keep_blank_values=True)
                     self._send_json_compact(
                         200,
                         service.get_audit_events(
                             wallet_id,
                             from_seq=query.get("from_seq", [None])[0],
                             limit=query.get("limit", [None])[0],
+                            event_type=filters.get("event_type"),
+                            request_id=filters.get("request_id"),
                         ),
                     )
                     return

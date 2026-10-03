@@ -60,7 +60,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/approve` | 批准 `{"approver_id","reason"?}` |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/reject` | 拒绝 |
 | POST | `/v1/wallets/{id}/sign-requests/{rid}/cancel` | 撤销审批单 `{"cancel_id","reason"}` |
-| GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`） |
+| GET  | `/v1/wallets/{id}/audit-events` | 审计事件（seq 升序，分页 `from_seq`/`limit`，筛选 `event_type`/`request_id`） |
 | GET  | `/v1/wallets/{id}/audit-evidence` | 区间逐条证据（`from_seq`/`to_seq`/`expected_head`） |
 | GET  | `/v1/wallets/{id}/audit-integrity` | 审计防篡改摘要链校验（可带 `expected_head`） |
 | POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
@@ -1324,6 +1324,17 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 `GET audit-events` 返回 `{"wallet_id","events":[...]}`，按 `seq` 升序。
 `from_seq`/`limit` 为正整数，默认 1/1000，limit 上限 1000；非法 `400`，
 钱包不存在 `404`。纯只读，不触发懒过期、不分配 seq。
+
+可选筛选 `event_type`/`request_id` 分别与事件外层 `type`/`request_id`
+精确匹配：按 URL 查询值解码后比较，大小写与首尾空白保留，不做前缀
+匹配；两者同时给定取交集；不搜索 `actor_id` 或 `details`；事件中的
+`null` 不匹配文本 `null`。解码后的值须为 1..1024 个 Unicode 码点且
+不全为空白——重复出现（即使同值）、显式空值、纯空白、超长一律
+`400`，绝不按缺省处理；格式有效但无匹配记录时返回 `200` 空数组。
+`from_seq` 仍是包含端点的原始审计序号下界，`limit` 只限制符合全部
+条件的事件数（如匹配序号为 2、7、11 时 `from_seq=3&limit=2` 返回
+7、11）。筛选不绕过整份审计记录与既有业务对账校验：即使异常记录
+被条件排除，不可对账现场仍 `503`，绝不返回部分结果。
 
 每条事件七字段 `seq,type,at,request_id,actor_id,reason,details`，
 `at` 为 UTC（`...Z`），不适用字段为 `null`。seq 从 1 起、落盘后单调

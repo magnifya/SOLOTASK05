@@ -1290,13 +1290,24 @@ class AuditStore:
         return result
 
     def list_events(
-        self, wallet_id: str, from_seq: int = 1, limit: int = 1000
+        self,
+        wallet_id: str,
+        from_seq: int = 1,
+        limit: int = 1000,
+        event_type: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> list[dict]:
-        """按 seq 升序返回 seq >= from_seq 的至多 limit 条事件。
+        """按 seq 升序返回 seq >= from_seq 且满足筛选的至多 limit 条事件。
 
-        无日志文件或范围内无事件时返回 []。返回的是记录副本，
-        调用方修改不会影响存储内容。日志损坏抛 CorruptDataError
-        （由调用方 fail-closed），绝不静默返回残缺历史。
+        event_type/request_id 给定时分别与事件外层 type/request_id 精确
+        匹配（大小写与首尾空白敏感，不做前缀匹配；两者同时给定取交集；
+        不搜索 actor_id 或 details；事件中的 null 不匹配任何文本）。
+        limit 只限制符合全部条件的事件数，而非待检查记录数。
+
+        无日志文件或范围内无匹配事件时返回 []。返回的是记录副本，
+        调用方修改不会影响存储内容。无论筛选条件如何都先严格加载整份
+        日志：日志损坏抛 CorruptDataError（由调用方 fail-closed），
+        绝不静默返回残缺历史。
         """
         data = self._read(wallet_id)
         if not data:
@@ -1307,6 +1318,11 @@ class AuditStore:
             dict(event)
             for event in data["events"]
             if event["seq"] >= from_seq
+            and (event_type is None or event.get("type") == event_type)
+            and (
+                request_id is None
+                or event.get("request_id") == request_id
+            )
         ]
         events.sort(key=lambda e: e["seq"])
         return events[:limit]
