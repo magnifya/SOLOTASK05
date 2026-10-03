@@ -454,6 +454,7 @@ class WalletService:
                 wallet_id,
                 self._activated_rotations(wallet_id),
                 self._prepared_rotations(wallet_id),
+                self._audit.cancelled_rotation_events(wallet_id),
             )
             self._recover_wallet_asset_commits(wallet_id)
             # 意图清零后再做账本 ↔ asset_operation_committed 事件的双向
@@ -639,6 +640,7 @@ class WalletService:
                     wallet_id,
                     activated,
                     self._prepared_rotations(wallet_id),
+                    self._audit.cancelled_rotation_events(wallet_id),
                 ):
                     needs_recovery = True
             if not needs_recovery and staging_ids:
@@ -5035,13 +5037,23 @@ class WalletService:
 
     @staticmethod
     def _rotation_view(record: dict) -> dict:
-        """轮换记录对外视图（只含公钥与标识，绝不含私钥）。"""
-        return {
+        """轮换记录对外视图（只含公钥与标识，绝不含私钥）。
+
+        cancelled 轮换附加恰含 cancel_id/reason 的 cancellation 快照；
+        其余状态的视图形状保持不变。"""
+        view = {
             "rotation_id": record["rotation_id"],
             "state": record["state"],
             "share_ids": list(record["share_ids"]),
             "public_key": record["public_key"],
         }
+        if record["state"] == "cancelled":
+            cancellation = record["cancellation"]
+            view["cancellation"] = {
+                "cancel_id": cancellation["cancel_id"],
+                "reason": cancellation["reason"],
+            }
+        return view
 
     @staticmethod
     def _validate_rotation_id(rotation_id: object) -> None:
@@ -5300,6 +5312,135 @@ class WalletService:
             # wallet_id 含非法字符（构造锁路径时抛出）
             raise ServiceError(400, "invalid wallet_id")
         return 201, self._rotation_view(active_record)
+
+    def cancel_share_rotation(
+        self,
+        wallet_id: str,
+        rotation_id: object,
+        cancel_id: object,
+        reason: object,
+    ) -> tuple[int, dict]:
+        """主动撤销一笔未激活的份额轮换，返回 (HTTP 状态码, 轮换视图)。
+
+        - 钱包/轮换未知 404；冻结钱包一律 409（含重放）且零副作用；
+        - rotation_id/cancel_id 须匹配安全标识、reason 须为 1..1024 字符
+          且含非空白内容的字符串（原文保留），非法 400；
+        - 仅 prepared 可首次撤销：成功 201 并原子转 cancelled，视图附加
+          恰含 cancel_id/reason 的 cancellation 快照；active/activating
+          及已撤销一律 409（撤销与激活交错时只有先提交的一方生效）；
+        - cancel_id 只在同钱包的轮换撤销之间判重：同轮换同标识同原因
+          重放 200 同体（不记事件）；异参、复用到其他轮换或对已撤销轮换
+          以新标识再撤销均 409；
+        - share_rotation_cancelled 事件是唯一提交点：事件未落盘则回滚
+          记录为 prepared（保留暂存份额），落盘（含异常但已落盘）则保持
+          撤销结果并继续完成暂存清理，绝不复活轮换；重放不追加事件；
+        - 成功响应前严格清理该轮换的暂存份额：读取/写入/清理失败按
+          OSError 上抛（HTTP 503）；不改变在用份额、钱包公钥、签名会话
+          与历史签名。恢复检查、存在性、校验与整个撤销事务全部在锁内。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性先于标识/原因校验
+                self._get_wallet_or_404(wallet_id)
+                # 冻结是应急闸门：撤销及其重放一律 409 且零副作用
+                self._assert_wallet_active_locked(wallet_id)
+                self._validate_rotation_id(rotation_id)
+                self._validate_cancel_id(cancel_id)
+                reason = self._validate_cancel_reason(reason)
+                record = self._store.get_rotation(wallet_id, rotation_id)
+                if record is None:
+                    raise ServiceError(
+                        404, f"share rotation {rotation_id!r} not found"
+                    )
+                # 已提交重放优先于一切状态判定：撤销事件是唯一提交点；
+                # cancel_id 只在同钱包的轮换撤销之间判重。
+                cancelled_events = self._audit.cancelled_rotation_events(
+                    wallet_id
+                )
+                own_event = cancelled_events.get(rotation_id)
+                for rid, event in cancelled_events.items():
+                    if rid == rotation_id:
+                        continue
+                    details = event.get("details")
+                    if (
+                        isinstance(details, dict)
+                        and details.get("cancel_id") == cancel_id
+                    ):
+                        raise ServiceError(
+                            409,
+                            f"cancel {cancel_id!r} is already in use",
+                        )
+                if own_event is not None:
+                    details = own_event["details"]
+                    if (
+                        details.get("cancel_id") != cancel_id
+                        or details.get("reason") != reason
+                    ):
+                        raise ServiceError(
+                            409,
+                            f"cancel {cancel_id!r} was committed with "
+                            "different parameters",
+                        )
+                    # 同轮换同标识同原因重放：200 同体，不追加事件
+                    return 200, self._rotation_view(record)
+                if record["state"] != "prepared":
+                    # active/activating 与已以其他标识撤销的 cancelled 一律
+                    # 409：撤销与激活交错时只有先提交的一方生效
+                    raise ServiceError(
+                        409,
+                        f"share rotation {rotation_id!r} is "
+                        f"{record['state']}, not prepared",
+                    )
+                cancelled_record = dict(record)
+                cancelled_record["state"] = "cancelled"
+                cancelled_record["cancellation"] = {
+                    "cancel_id": cancel_id,
+                    "reason": reason,
+                }
+                # 提交点：状态落盘 + 撤销事件原子。任一写入失败以事件是否
+                # 真正落盘为唯一判据：事件在则保持撤销结果并继续完成清理；
+                # 事件不在则回滚为撤销前的 prepared（保留暂存份额）。
+                self._store.update_rotation(
+                    wallet_id, rotation_id, cancelled_record
+                )
+                try:
+                    self._emit(
+                        wallet_id,
+                        self._audit_event(
+                            audit.TYPE_SHARE_ROTATION_CANCELLED,
+                            details={
+                                "rotation_id": rotation_id,
+                                "cancel_id": cancel_id,
+                                "reason": reason,
+                            },
+                        ),
+                    )
+                except BaseException:
+                    landed = self._audit.cancelled_rotation_events(
+                        wallet_id
+                    ).get(rotation_id)
+                    if landed is None:
+                        # 事件未落盘：回滚为 prepared，暂存份额保留可重试
+                        self._store.update_rotation(
+                            wallet_id, rotation_id, record
+                        )
+                        raise
+                    # 事件已落盘（提交不可撤回）：保持撤销结果，绝不回滚、
+                    # 不重复记事件；清理失败上抛，由恢复继续完成。
+                    self._store.delete_staging_strict(
+                        wallet_id, rotation_id
+                    )
+                    return 201, self._rotation_view(cancelled_record)
+                # 成功响应前严格清理该轮换的暂存份额：清理失败按 OSError
+                # 上抛（HTTP 503）；撤销已提交，残留由恢复继续清理。
+                self._store.delete_staging_strict(wallet_id, rotation_id)
+                return 201, self._rotation_view(cancelled_record)
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
 
     # ---- 资产账本 ---------------------------------------------------------
 
@@ -13333,8 +13474,8 @@ class WalletService:
     # -- 会话主动撤销 ------------------------------------------------------
 
     @staticmethod
-    def _validate_session_cancel_reason(reason: object) -> str:
-        """会话撤销请求体 reason：1..1024 字符非空白字符串，原文保留。
+    def _validate_cancel_reason(reason: object) -> str:
+        """撤销请求体 reason：1..1024 字符非空白字符串，原文保留。
         非法抛 ServiceError(400)。"""
         if not isinstance(reason, str) or isinstance(reason, bool):
             raise ServiceError(400, "reason must be a string")
@@ -13346,6 +13487,12 @@ class WalletService:
         if not reason.strip():
             raise ServiceError(400, "reason must be non-blank")
         return reason
+
+    @staticmethod
+    def _validate_session_cancel_reason(reason: object) -> str:
+        """会话撤销请求体 reason：与轮换撤销同一契约（1..1024 字符非空白
+        字符串，原文保留）。非法抛 ServiceError(400)。"""
+        return WalletService._validate_cancel_reason(reason)
 
     def cancel_sign_session(
         self,

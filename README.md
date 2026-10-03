@@ -67,6 +67,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
 | GET  | `/v1/wallets/{id}/share-rotations/{rid}` | 查轮换状态 |
 | POST | `/v1/wallets/{id}/share-rotations/{rid}/activate` | 激活轮换 |
+| POST | `/v1/wallets/{id}/share-rotations/{rid}/cancel` | 撤销未激活轮换 `{"cancel_id","reason"}` |
 | POST | `/v1/wallets/{id}/share-bind` | 绑定 DKG 复职节点到轮换份额槽位 `{"id","rotation","dkg","round","node","slot","approval"}` |
 | POST | `/v1/wallets/{id}/asset-operations` | 建资产操作 `{"operation_id","asset_id","delta"}` |
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
@@ -585,11 +586,29 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 - `GET`：`200`，未知 `404`。
 - `activate`：仅 prepared 可激活（锁内原子替换份额/公钥/状态），成功
   `201`（`state:"active"`）；active 重放 `200`；其余状态 `409`。
+- `cancel`（仅 POST，其他方法 `405`）：请求体恰含
+  `{"cancel_id","reason"}` 两键；`cancel_id` 沿用安全标识，`reason`
+  为 1..1024 字符且含非空白内容的字符串（原文保留），键集/标识/原因
+  非法 `400`，钱包或轮换不存在 `404`。仅 `prepared` 可首次撤销：成功
+  `201` 转 `cancelled`，响应为既有轮换视图附加恰含
+  `cancel_id`/`reason` 的 `cancellation` 对象（其余状态视图形状不
+  变），并在响应前清理该轮换的暂存份额（在用份额、钱包公钥、签名会话
+  与历史签名不变）。`cancel_id` 只在同钱包的轮换撤销之间判重：同轮换
+  同标识同原因重放 `200` 同体不记事件；异参、复用到另一轮换或以新标
+  识再撤销均 `409`；已激活轮换撤销 `409`；冻结钱包撤销及其重放均
+  `409` 且零副作用。撤销与激活交错时只有先提交的一方生效。撤销后以
+  原 `rotation_id` 再准备返回 `200` 撤销视图（不生成新份额），激活与
+  首次槽位绑定 `409`；撤销释放 prepared 占用，可用新标识准备下一笔。
+  审计事件 `share_rotation_cancelled`（details 恰含
+  `rotation_id/cancel_id/reason`）是唯一提交点：事件未落盘则保留
+  prepared 与暂存份额，已落盘则保持撤销并完成清理；读写/清理失败或
+  撤销记录与审计矛盾一律 `503`，启动恢复失败拒绝就绪。
+- 审计事件 `share_rotation_prepared` / `share_rotation_activated` /
+  `share_rotation_cancelled`，details 只含标识、公钥与原文原因，重放
+  不重复记；**历史签名按其签名时刻（由轮换链确定）的钱包公钥拆半独立
+  验通，轮换后连续有效**。
 - 激活后未首签的请求必须用新 share_ids（旧份额 `400`）；已首签请求
   重放仍 `200`。
-- 审计事件 `share_rotation_prepared` / `share_rotation_activated`，
-  details 只含标识与公钥，重放不重复记；**历史签名按其签名时刻（由轮换
-  链确定）的钱包公钥拆半独立验通，轮换后连续有效**。
 
 ### DKG 复职节点份额槽位绑定（share-bind）
 

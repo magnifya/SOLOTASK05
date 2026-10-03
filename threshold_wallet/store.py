@@ -8,7 +8,7 @@
     signatures/<wallet_id>.json     该钱包已完成的签名请求（幂等去重）
     policies/<wallet_id>.json       该钱包的审批策略（required_approvals 等）
     requests/<wallet_id>.json       该钱包的签名请求审批单（状态机）
-    rotations/<wallet_id>.json      该钱包的份额轮换记录（prepared/activating/active）
+    rotations/<wallet_id>.json      该钱包的份额轮换记录（prepared/activating/active/cancelled）
     rotation-staging/<wallet_id>/<rotation_id>/
                                     轮换暂存目录：新份额私钥文件（<share_id>.json），
                                     激活期间的旧份额/钱包元数据备份（*.bak.json），
@@ -59,6 +59,25 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 #: share_id 允许的字符：轮换份额 id 为 <rotation_id>-share-N，最长 128+8
 _SAFE_SHARE_ID = re.compile(r"^[A-Za-z0-9_-]{1,136}$")
+
+#: 轮换撤销原因允许的最大字符数（与 service 层契约一致）
+_MAX_CANCEL_REASON_LENGTH = 1024
+
+
+def _cancellation_shape_ok(value: object) -> bool:
+    """撤销快照形状：恰含 cancel_id（安全标识）与 reason（1..1024 字符、
+    含非空白内容的原文字符串）。"""
+    if not isinstance(value, dict) or set(value) != {"cancel_id", "reason"}:
+        return False
+    cancel_id = value.get("cancel_id")
+    reason = value.get("reason")
+    if not isinstance(cancel_id, str) or not _SAFE_ID.match(cancel_id):
+        return False
+    return (
+        isinstance(reason, str)
+        and 1 <= len(reason) <= _MAX_CANCEL_REASON_LENGTH
+        and bool(reason.strip())
+    )
 
 
 def _check_id(kind: str, value: str) -> None:
@@ -1748,6 +1767,16 @@ class WalletStore:
         with self._lock:
             shutil.rmtree(staging, ignore_errors=True)
 
+    def delete_staging_strict(self, wallet_id: str, rotation_id: str) -> None:
+        """删除整个轮换暂存目录，清理失败原样抛 OSError（撤销提交路径与
+        启动恢复用：清理失败必须让调用方 fail-closed，绝不静默残留来路
+        不明的暂存私钥）。目录本就不存在时为空操作。"""
+        staging = self._staging_dir(wallet_id, rotation_id)
+        with self._lock:
+            if not os.path.lexists(staging):
+                return
+            shutil.rmtree(staging)
+
     # ---- 启动恢复：未完成的激活先回滚，轮换残留按有效性判定 --------------
 
     def list_rotation_wallet_ids(self) -> list[str]:
@@ -1836,12 +1865,78 @@ class WalletStore:
                 self.delete_share(wallet_id, share_id)
 
     @staticmethod
+    def _validated_cancelled_events(
+        wallet_id: str, cancelled: dict[str, dict]
+    ) -> dict[str, dict]:
+        """严格校验 share_rotation_cancelled 事件映射并返回
+        ``{rotation_id: (cancel_id, reason)}``。
+
+        每条事件 details 必须恰含 {rotation_id, cancel_id, reason}：
+        rotation_id 与映射键一致，cancel_id 为安全标识，reason 为
+        1..1024 字符且含非空白内容的字符串；cancel_id 在全钱包撤销事件间
+        不得重复（重复属不可对账的冲突提交）。任一矛盾抛 RecoveryError
+        （fail-closed），绝不任取一条。纯只读。
+        """
+        result: dict[str, dict] = {}
+        seen_cancel_ids: dict[str, str] = {}
+        for rid, event in cancelled.items():
+            details = event.get("details") if isinstance(event, dict) else None
+            if not isinstance(details, dict) or set(details) != {
+                "rotation_id",
+                "cancel_id",
+                "reason",
+            }:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation cancel event for "
+                    f"{rid!r} is malformed"
+                )
+            if details.get("rotation_id") != rid:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation cancel event for "
+                    f"{rid!r} names a different rotation"
+                )
+            cancel_id = details.get("cancel_id")
+            reason = details.get("reason")
+            if (
+                not isinstance(cancel_id, str)
+                or not _SAFE_ID.match(cancel_id)
+                or not isinstance(reason, str)
+                or not 1 <= len(reason) <= _MAX_CANCEL_REASON_LENGTH
+                or not reason.strip()
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} rotation cancel event for "
+                    f"{rid!r} has a bad cancel_id or reason"
+                )
+            owner = seen_cancel_ids.get(cancel_id)
+            if owner is not None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} cancel_id {cancel_id!r} was "
+                    f"committed for both {owner!r} and {rid!r}"
+                )
+            seen_cancel_ids[cancel_id] = rid
+            result[rid] = {"cancel_id": cancel_id, "reason": reason}
+        return result
+
+    @staticmethod
     def _rotation_record_shape_ok(record: dict) -> bool:
         """轮换记录的基本形状校验（启动恢复判定"无效记录"用）。"""
         rotation_id = record.get("rotation_id")
         if not isinstance(rotation_id, str) or not _SAFE_ID.match(rotation_id):
             return False
-        if record.get("state") not in ("prepared", "activating", "active"):
+        state = record.get("state")
+        if state not in ("prepared", "activating", "active", "cancelled"):
+            return False
+        # cancellation 仅 cancelled 携带，且形状必须严格合法；其余状态
+        # 一旦出现即不可对账。cancelled 从未进入激活窗口，不得携带
+        # previous_public_key。
+        cancellation = record.get("cancellation")
+        if state == "cancelled":
+            if not _cancellation_shape_ok(cancellation):
+                return False
+            if record.get("previous_public_key") is not None:
+                return False
+        elif cancellation is not None:
             return False
         share_ids = record.get("share_ids")
         if (
@@ -2337,27 +2432,37 @@ class WalletStore:
         audit_store = AuditStore(self.data_dir)
         activated = audit_store.activated_rotation_events(wallet_id)
         prepared = audit_store.prepared_rotation_events(wallet_id)
+        cancelled = audit_store.cancelled_rotation_events(wallet_id)
         # 调用方持锁且传入的事件必定已落盘；防御性确保它在链映射中。
         details = event.get("details")
         rid = details.get("rotation_id") if isinstance(details, dict) else None
         if isinstance(rid, str):
             activated.setdefault(rid, event)
-        self.recover_wallet_rotation(wallet_id, activated, prepared)
+        self.recover_wallet_rotation(wallet_id, activated, prepared, cancelled)
 
     def verify_rotation_scene_consistent(
         self,
         wallet_id: str,
         activated: dict[str, dict],
         prepared: dict[str, dict],
+        cancelled: Optional[dict[str, dict]] = None,
     ) -> bool:
         """只读判定轮换现场是否静止且与激活链一致（不写盘、不清理）。
 
         常驻请求的自愈快路径用它在"看似静止"时仍做一次链对账：任一已
         提交激活缺记录、链乱序/跨轮次不相容、链顶公钥/份额与钱包元数据或
         磁盘份额不符、仍有暂存/备份残留，都返回 False，由调用方走完整
-        恢复（恢复会在真正矛盾时 fail-closed）。现场完全静止才返回 True。
+        恢复（恢复会在真正矛盾时 fail-closed）。撤销侧同样要求静止：
+        已提交撤销的记录必须为 cancelled 且 cancellation 与事件一致、
+        暂存已清空；记录已写 cancelled 但撤销事件缺失（崩溃窗口）也返回
+        False。现场完全静止才返回 True。
         """
         try:
+            cancelled_details = self._validated_cancelled_events(
+                wallet_id, cancelled or {}
+            )
+            if set(cancelled_details) & set(activated):
+                return False
             entries = self.list_rotation_entries(wallet_id)
             records_by_rid: dict[str, dict] = {}
             for _key, record in entries:
@@ -2368,6 +2473,14 @@ class WalletStore:
                 if rid in records_by_rid:
                     return False
                 records_by_rid[rid] = record
+            # 已提交撤销缺记录、或记录未停在 cancelled / cancellation 与
+            # 事件不符：非静止（恢复会前滚或在矛盾时 fail-closed）。
+            for rid, details in cancelled_details.items():
+                record = records_by_rid.get(rid)
+                if record is None or record["state"] != "cancelled":
+                    return False
+                if record["cancellation"] != details:
+                    return False
             chain = self._build_activation_chain(
                 wallet_id, activated, records_by_rid
             )
@@ -2386,11 +2499,16 @@ class WalletStore:
             for staging_rid in self.list_staging_rotation_ids(wallet_id):
                 if staging_rid not in kept_prepared:
                     return False
-            # 未提交的 activating/active 记录是崩溃现场
+            # 未提交的 activating/active 记录是崩溃现场；记录已写
+            # cancelled 但撤销事件未落盘同样是崩溃窗口（恢复置回 prepared）
             for rid, record in records_by_rid.items():
-                if rid not in activated and record["state"] in (
-                    "activating",
-                    "active",
+                if rid in activated:
+                    continue
+                if record["state"] in ("activating", "active"):
+                    return False
+                if (
+                    record["state"] == "cancelled"
+                    and rid not in cancelled_details
                 ):
                     return False
             if not chain:
@@ -2473,37 +2591,59 @@ class WalletStore:
         wallet_id: str,
         activated: Optional[dict[str, dict]] = None,
         prepared: Optional[dict[str, dict]] = None,
+        cancelled: Optional[dict[str, dict]] = None,
     ) -> None:
         """按钱包恢复轮换现场（调用方须持有该钱包的跨进程事务锁）。
 
-        先按审计 seq 建立连续的已提交激活公钥/份额时间线，再分三类对账：
+        先按审计 seq 建立连续的已提交激活公钥/份额时间线，再分类对账：
 
         - 已提交激活（share_rotation_activated 事件在）：链上各轮记录校准
           为 active，磁盘份额/钱包公钥只前滚到**链顶**一轮并清理全部暂存/
           备份；历史轮不再触碰在用份额。链缺失/重复/乱序/跨轮次不相容/
           事件与记录不一致一律 RecoveryError（fail-closed），绝不猜写；
+        - 已提交撤销（share_rotation_cancelled 事件在）：保持撤销结果，
+          记录校准为 cancelled（崩溃窗口里事件已落盘而记录未推进的，按
+          事件前滚补齐 cancellation），并严格清理该轮暂存份额；事件与
+          记录的 cancel_id/reason 矛盾、同一 cancel_id 跨轮换重复、撤销
+          与激活事件共存、撤销事件无对应记录，一律 RecoveryError；
         - 事件未落盘的 activating/active（含状态已写 active）：恢复上一轮
           完整份额与公钥、置回 prepared，保留经校验有效的暂存份额；缺
           回滚备份或与激活链不相容时 fail-closed；
+        - 事件未落盘的 cancelled（记录已写 cancelled 但无撤销事件）：
+          撤销未提交，置回 prepared 并保留暂存份额，绝不复活撤销结果；
         - prepared：暂存经密码学校验通过才保留，否则连记录带暂存删除；
           若该轮存在 share_rotation_prepared 事件，其 share_ids/public_key
           必须与记录一致，否则 fail-closed；
-        - 形状无效且**无**激活事件的记录、无记录的孤儿暂存：安全删除。
+        - 形状无效且**无**激活/撤销事件的记录、无记录的孤儿暂存：安全删除。
 
         全程不新增审计事件、不分配 seq；被删除暂存私钥不留副本。
         """
         _check_id("wallet_id", wallet_id)
         activated = activated or {}
         prepared = prepared or {}
+        cancelled = cancelled or {}
+        # 撤销事件先严格校验（形状/cancel_id 全钱包唯一），再与激活事件
+        # 互斥对账：同一轮换既有激活又有撤销提交点属不可对账现场。
+        cancelled_details = self._validated_cancelled_events(
+            wallet_id, cancelled
+        )
+        both = set(cancelled_details) & set(activated)
+        if both:
+            raise RecoveryError(
+                f"wallet {wallet_id!r} rotations {sorted(both)!r} have both "
+                "activated and cancelled commit events"
+            )
 
         entries = self.list_rotation_entries(wallet_id)
         records_by_rid: dict[str, dict] = {}
         for key, record in entries:
             rid = record.get("rotation_id")
             if not self._rotation_record_shape_ok(record):
-                # 形状无效：若该轮已有激活提交点则属"事件与记录不一致"，
+                # 形状无效：若该轮已有激活/撤销提交点则属"事件与记录不一致"，
                 # 绝不能删除提交记录掩盖矛盾，直接 fail-closed。
-                if isinstance(rid, str) and rid in activated:
+                if isinstance(rid, str) and (
+                    rid in activated or rid in cancelled_details
+                ):
                     raise RecoveryError(
                         f"wallet {wallet_id!r} rotation {rid!r} is committed "
                         "but its record is malformed"
@@ -2521,6 +2661,14 @@ class WalletStore:
                 )
             records_by_rid[rid] = record
 
+        # 撤销提交点事件在却没有任何记录（缺失）：拒绝猜写，fail-closed。
+        for rid in cancelled_details:
+            if rid not in records_by_rid:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a committed cancellation for "
+                    f"{rid!r} but no rotation record"
+                )
+
         # 提交点事件在却没有任何记录（缺失）：链构建内统一 fail-closed。
         chain = self._build_activation_chain(
             wallet_id, activated, records_by_rid
@@ -2534,6 +2682,62 @@ class WalletStore:
             if rid in activated:
                 # 已提交轮：磁盘对账统一在链顶前滚中处理，这里不动。
                 continue
+            cancel_details = cancelled_details.get(rid)
+            if cancel_details is not None:
+                # 撤销已提交（事件落盘）：保持撤销结果并继续完成清理，
+                # 绝不复活轮换。记录与事件的 cancel_id/reason 必须一致。
+                if record["state"] == "cancelled":
+                    cancellation = record["cancellation"]  # 形状已校验
+                    if (
+                        cancellation["cancel_id"]
+                        != cancel_details["cancel_id"]
+                        or cancellation["reason"] != cancel_details["reason"]
+                    ):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} rotation {rid!r} record "
+                            "is inconsistent with its cancelled event"
+                        )
+                elif record["state"] == "prepared":
+                    # 崩溃窗口：事件已落盘而记录未推进——按事件前滚为
+                    # cancelled，绝不回滚已提交的撤销。
+                    forwarded = dict(record)
+                    forwarded["state"] = "cancelled"
+                    forwarded["cancellation"] = dict(cancel_details)
+                    self.update_rotation(wallet_id, rid, forwarded)
+                    record = forwarded
+                else:
+                    # activating/active 记录与撤销提交点共存：不可对账
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} rotation {rid!r} is "
+                        f"{record['state']} but has a committed cancellation"
+                    )
+                # 有 prepared 事件时，事件与记录必须一致；不一致 fail-closed。
+                prepared_event = prepared.get(rid)
+                if prepared_event is not None:
+                    details = prepared_event.get("details")
+                    if (
+                        not isinstance(details, dict)
+                        or details.get("public_key") != record["public_key"]
+                        or list(details.get("share_ids") or [])
+                        != list(record["share_ids"])
+                    ):
+                        raise RecoveryError(
+                            f"wallet {wallet_id!r} rotation {rid!r} record "
+                            "is inconsistent with its prepared event"
+                        )
+                # 严格清理该轮暂存份额：清理失败即恢复失败（OSError 上抛），
+                # 绝不留下来路不明的暂存私钥。
+                self.delete_staging_strict(wallet_id, rid)
+                continue
+            if record["state"] == "cancelled":
+                # 撤销事件未落盘：撤销未提交，置回 prepared 并保留暂存份额
+                # （随后的 prepared 暂存校验决定保留还是安全删除）。
+                restored = {
+                    k: v for k, v in record.items() if k != "cancellation"
+                }
+                restored["state"] = "prepared"
+                self.update_rotation(wallet_id, rid, restored)
+                record = restored
             if record["state"] in ("activating", "active"):
                 # 激活状态已写但提交点事件未落盘：提交未生效，恢复上一轮
                 # 完整份额与公钥、置回 prepared，保留有效暂存。
@@ -2597,6 +2801,7 @@ class WalletStore:
                     wallet_id
                 )
             wallet_prepared = audit_store.prepared_rotation_events(wallet_id)
+            wallet_cancelled = audit_store.cancelled_rotation_events(wallet_id)
             self.recover_wallet_rotation(
-                wallet_id, wallet_activated, wallet_prepared
+                wallet_id, wallet_activated, wallet_prepared, wallet_cancelled
             )
