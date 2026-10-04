@@ -74,6 +74,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
+| GET  | `/v1/wallets/{id}/assets` | 钱包级资产清单分页查询（`at_seq`/`expected_head`/`limit`/`after`） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/unfreeze` | 解除单个资产冻结 `{"reason"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}/security-state` | 查询资产安全状态 `{wallet_id,asset_id,state,reason}` |
@@ -763,6 +764,42 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 不返回部分结果。钱包或资产冻结时仍可使用；查询不触发审批懒过期、
 不新增事件或历史状态文件，不改变余额、version 或摘要链。响应与日志
 不含私钥、份额或单份额签名。
+
+#### 钱包级资产清单（分页）
+
+`GET /v1/wallets/{id}/assets?at_seq=N[&expected_head=H][&limit=L][&after=A]`
+只接受 GET。成功 `200` 返回
+`{wallet_id,at_seq,head,assets,next_after}`：`assets` 每项仅含
+`asset_id,balance,version`，按 `asset_id` 的 ASCII 序升序；只列出边界
+内已有已提交操作的资产（余额归零仍保留，只有 pending/cancelled 操作的
+资产不出现），所有既有落账方式（人工提交、链上确认、多源仲裁、派发
+最终性结算与重组补偿）统一纳入，同一资产不重复，余额与版本取边界内该
+资产最后一条 `asset_operation_committed` 事件的 R，与同一边界的单资产
+历史查询一致。
+
+- `at_seq` 缺省取本次查询的一致审计尾序号；显式给定时接受 ASCII 数字
+  组成的非负整数，`0` 表示空前缀（assets 为空、`head` 为 64 个零）。
+  `head` 为整个钱包该边界后的审计摘要链头，正边界与 audit-evidence
+  同一 `to_seq=N` 的 `end_head` 完全一致。
+- `expected_head` 只允许随显式 `at_seq` 使用，接受 64 位小写十六进制
+  并校验该前缀摘要（不符 `409`）。后续页带回相同 `at_seq` 与 `head`
+  （作为 `expected_head`）时，新增事件不改变分页集合与数值。
+- `limit` 接受 ASCII 数字组成的 1 至 1000 整数，缺省 100。
+- `after` 沿用资产标识规则，表示排除该值及之前的资产，不要求该标识
+  实际存在。只有仍有后续资产时 `next_after` 才返回本页最后一个标识，
+  否则为 `null`。
+- 空钱包、零边界或游标之后无资产均返回 `200` 空数组，但仍校验摘要。
+
+错误次序：钱包标识非法 `400`；钱包不存在 `404` 并优先于查询参数校验；
+其后为重复参数 → `at_seq` 非法 → `expected_head` 缺 `at_seq`/格式非法
+→ `limit` 非法/越界 → `after` 非法（均 `400`）→ 边界越尾 `404` →
+`expected_head` 不符 `409`。查询在既有恢复检查（`_heal_wallet`）之后、
+每钱包事务锁内读取一致现场，先做与 audit-evidence 同一套 DKG 重放对账
+与整条摘要链完整性校验：审计链、账本或恢复现场损坏及读取失败统一沿用
+`503` `service temporarily unavailable`，保留现场、不返回部分结果。
+查询不写文件、不触发审批懒过期、不新增审计事件，不改变余额或 version；
+钱包与资产冻结期间仍可查询；重启及合法灾备恢复后同一边界结果一致。
+响应与日志不含私钥、份额或单份额签名。
 
 ### 跨链资产确认（可选）
 

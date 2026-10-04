@@ -7227,6 +7227,232 @@ class WalletService:
                 return False
         return True
 
+    #: 钱包级资产清单单页默认/最大条数
+    ASSET_LIST_DEFAULT_LIMIT = 100
+    ASSET_LIST_MAX_LIMIT = 1000
+
+    def list_assets(
+        self,
+        wallet_id: str,
+        at_seq: object = None,
+        expected_head: object = None,
+        limit: object = None,
+        after: object = None,
+    ) -> dict:
+        """钱包级资产清单分页查询（GET /v1/wallets/{id}/assets）。
+
+        返回 ``{wallet_id,at_seq,head,assets,next_after}``：assets 每项
+        仅含 ``asset_id,balance,version``，按 asset_id 的 ASCII 序升序；
+        只列出边界内已有已提交操作的资产（余额归零仍保留，只有
+        pending/cancelled 操作的资产不出现），同一资产不重复，余额与
+        版本取边界内该资产最后一条 ``asset_operation_committed`` 事件的
+        R——与同一边界的单资产历史查询一致。
+
+        ``at_seq`` 缺省取本次查询的一致审计尾序号；显式给定时接受
+        ASCII 数字组成的非负整数（0 表示空前缀：assets 为空、head 为
+        64 个零）。``head`` 为整个钱包该边界后的审计摘要链头，正边界与
+        audit-evidence 同一 ``to_seq`` 的 ``end_head`` 一致。
+        ``expected_head`` 只允许随显式 at_seq 使用，须为 64 位小写十六
+        进制且与该边界 head 一致（不符 409）。``limit`` 接受 ASCII 数字
+        组成的 1..1000 整数，缺省 100。``after`` 沿用资产标识规则，表示
+        排除该值及之前的资产，不要求该标识实际存在。只有仍有后续资产时
+        ``next_after`` 才返回本页最后一个标识，否则为 null。后续页带回
+        相同 at_seq 与 head（作为 expected_head）时，新增事件不改变
+        分页集合与数值。
+
+        四个参数接受 parse_qs 的字符串列表（None 表示缺参，长度 >1 即
+        重复参数）。参数校验次序（钱包存在性 404 之后）：重复 → at_seq
+        非法 → expected_head 缺 at_seq/格式非法 → limit 非法/越界 →
+        after 非法 → 边界越尾 404 → expected_head 不符 409。空钱包、
+        零边界或游标之后无资产均返回 200 空数组（仍校验摘要）。
+
+        纯只读：沿用既有恢复检查（_heal_wallet）与 audit-evidence 同一
+        套 DKG 重放对账和整条摘要链完整性校验；审计链、账本或恢复现场
+        损坏及读取失败一律上抛（HTTP 边界转 503），不返回部分结果。
+        查询不写文件、不触发审批懒过期、不新增审计事件，不改变余额或
+        version；钱包与资产冻结期间仍可查询。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                # 查询前先自愈他进程崩溃遗留的提交意图，绝不基于半完成
+                # 余额/审计现场回答清单。
+                self._heal_wallet(wallet_id)
+                # 404 优先于查询参数 400：与单资产历史查询同一次序。
+                self._get_wallet_or_404(wallet_id)
+                # 1) 重复参数：按 at_seq、expected_head、limit、after
+                #    次序报
+                if isinstance(at_seq, list) and len(at_seq) > 1:
+                    raise ServiceError(400, "duplicate at_seq parameters")
+                if (
+                    isinstance(expected_head, list)
+                    and len(expected_head) > 1
+                ):
+                    raise ServiceError(
+                        400, "duplicate expected_head parameters"
+                    )
+                if isinstance(limit, list) and len(limit) > 1:
+                    raise ServiceError(400, "duplicate limit parameters")
+                if isinstance(after, list) and len(after) > 1:
+                    raise ServiceError(400, "duplicate after parameters")
+                if isinstance(at_seq, list):
+                    at_seq = at_seq[0]
+                # 2) at_seq：仅接受 ASCII 数字组成的非负整数（0 表示空
+                #    前缀；空值、空白、带符号、小数、Unicode 数字一律
+                #    拒绝）。只做形状校验并保留归一化文本，int 转换推迟
+                #    到尾序号比较之后，避免超长数字串触发 int 转换上限
+                #    被误当 400——它仍是合法非负整数，超尾应 404。
+                boundary_text = (
+                    None
+                    if at_seq is None
+                    else self._asset_list_at_seq_text(at_seq)
+                )
+                if isinstance(expected_head, list):
+                    expected_head = expected_head[0]
+                # 3) expected_head 只能随显式 at_seq 使用：缺 at_seq
+                #    或 expected_head 非 64 位小写十六进制均 400
+                if expected_head is not None:
+                    if at_seq is None:
+                        raise ServiceError(
+                            400, "expected_head requires at_seq"
+                        )
+                    if (
+                        not isinstance(expected_head, str)
+                        or not self._EXPECTED_HEAD_RE.match(expected_head)
+                    ):
+                        raise ServiceError(400, "invalid expected_head")
+                # 4) limit：ASCII 数字组成的 1..1000 整数，缺省 100
+                page_limit = self._asset_list_limit(limit)
+                # 5) after：沿用资产标识规则，不要求该标识实际存在
+                if isinstance(after, list):
+                    after = after[0]
+                if after is not None and (
+                    not isinstance(after, str)
+                    or not ROTATION_ID_RE.match(after)
+                ):
+                    raise ServiceError(400, "invalid after")
+                # 与 audit-evidence 同一套严格 DKG 对账与摘要链完整
+                # 性校验：链元数据缺失/矛盾、事件被改动等不可对账
+                # 现场 fail-closed，绝不静默出证。
+                self._reconcile_dkg_events_locked(wallet_id)
+                tail_count = self._audit.integrity(wallet_id)[0]
+                # 6) 边界：缺省取本次查询的一致审计尾序号；显式边界
+                #    超过当前审计尾序号 404（按位数/文本比较，避免对
+                #    超长数字串做 int 转换）。
+                if boundary_text is None:
+                    boundary = tail_count
+                else:
+                    tail_text = str(tail_count)
+                    beyond_tail = (
+                        len(boundary_text) > len(tail_text)
+                        or (
+                            len(boundary_text) == len(tail_text)
+                            and boundary_text > tail_text
+                        )
+                    )
+                    if beyond_tail:
+                        raise ServiceError(
+                            404, "at_seq beyond the audit tail"
+                        )
+                    boundary = int(boundary_text)
+                # 7) 边界内逐资产取最后一条已提交事件的 R：人工提交、
+                #    链上确认、多源仲裁、派发最终性结算与重组补偿五类
+                #    提交点统一适用，同一资产不重复。零边界为空前缀：
+                #    head 为 64 个零、无资产。
+                committed_by_asset: dict[str, dict] = {}
+                if boundary == 0:
+                    head = audit.GENESIS_HEAD
+                else:
+                    evidence = self._audit.range_evidence(
+                        wallet_id, 1, boundary
+                    )
+                    head = evidence["end_head"]
+                    for event in evidence["events"]:
+                        if event.get("type") != (
+                            audit.TYPE_ASSET_OPERATION_COMMITTED
+                        ):
+                            continue
+                        details = event.get("details")
+                        # 资产生效点只能是形状合法的 R：形状矛盾与
+                        # audit-evidence 不可对账同等级，绝不猜读。
+                        if not self._committed_details_shape_ok(details):
+                            raise RecoveryError(
+                                f"wallet {wallet_id!r} committed event at "
+                                f"seq {event.get('seq')!r} is malformed"
+                            )
+                        committed_by_asset[details["asset_id"]] = details
+                # 8) expected_head 与边界 head 不符：409（后于边界
+                #    404；空钱包、零边界与空页同样校验摘要）
+                if expected_head is not None and expected_head != head:
+                    raise ServiceError(
+                        409, "expected_head does not match chain head"
+                    )
+                # 9) 按 asset_id 的 ASCII 序升序分页：after 排除该值及
+                #    之前的资产；仍有后续资产时 next_after 为本页最后
+                #    一个标识，否则为 None。
+                asset_ids = sorted(committed_by_asset)
+                if after is not None:
+                    asset_ids = [aid for aid in asset_ids if aid > after]
+                page = asset_ids[:page_limit]
+                next_after = (
+                    page[-1] if len(asset_ids) > page_limit else None
+                )
+                return {
+                    "wallet_id": wallet_id,
+                    "at_seq": boundary,
+                    "head": head,
+                    "assets": [
+                        {
+                            "asset_id": aid,
+                            "balance": committed_by_asset[aid]["balance"],
+                            "version": committed_by_asset[aid]["version"],
+                        }
+                        for aid in page
+                    ],
+                    "next_after": next_after,
+                }
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    @classmethod
+    def _asset_list_at_seq_text(cls, value: object) -> str:
+        """清单查询的 at_seq 形状校验：仅接受 ASCII 数字组成的非负整数，
+        返回去掉前导零的归一化文本（全零归一为 "0"，表示空前缀）。
+
+        与单资产历史查询的唯一差异是 0 合法；空串、纯空白、带符号/
+        小数点/指数、Unicode 数字一律拒绝。非法抛 ServiceError(400)。
+        调用方须先完成重复参数判定；int 转换由调用方在尾序号文本比较
+        确认未越界后再做。"""
+        if not isinstance(value, str) or not cls._ASSET_AT_SEQ_RE.fullmatch(
+            value
+        ):
+            raise ServiceError(400, "invalid at_seq")
+        normalized = value.lstrip("0")
+        return normalized if normalized else "0"
+
+    @classmethod
+    def _asset_list_limit(cls, value: object) -> int:
+        """清单查询的 limit 校验：缺省 100；显式给定时仅接受 ASCII 数字
+        组成的 1..1000 整数（空值、空白、带符号、小数、Unicode 数字、
+        0 与越界一律 400）。先按归一化文本位数挡掉超长数字串，避免
+        触发 Python int 转换上限。"""
+        if value is None:
+            return cls.ASSET_LIST_DEFAULT_LIMIT
+        if isinstance(value, list):
+            value = value[0]
+        if not isinstance(value, str) or not cls._ASSET_AT_SEQ_RE.fullmatch(
+            value
+        ):
+            raise ServiceError(400, "invalid limit")
+        normalized = value.lstrip("0")
+        if not normalized or len(normalized) > 4:
+            raise ServiceError(400, "invalid limit")
+        limit = int(normalized)
+        if limit < 1 or limit > cls.ASSET_LIST_MAX_LIMIT:
+            raise ServiceError(400, "invalid limit")
+        return limit
+
     def get_asset_operation(
         self, wallet_id: str, operation_id: object
     ) -> dict:
