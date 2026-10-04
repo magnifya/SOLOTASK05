@@ -618,20 +618,28 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
 
                 if rest == ["policy-changes"]:
-                    # 高风险配置双人变更统一入口：请求体恰为五键
-                    # （值类型/取值/target/before/after 由 service 严格校验）
+                    # 高风险配置双人变更统一入口：请求体恰为五键；
+                    # target=chain-policy 时恰增 asset_id 一键（六键）。
+                    # 值类型/取值/target/before/after 由 service 严格校验
                     body = self._read_json_body()
-                    if set(body) != {
+                    base_keys = {
                         "change_id",
                         "target",
                         "before",
                         "after",
                         "approval_request_id",
-                    }:
+                    }
+                    body_keys = set(body)
+                    if body_keys == base_keys:
+                        asset_id = None
+                    elif body_keys == base_keys | {"asset_id"}:
+                        asset_id = body.get("asset_id")
+                    else:
                         raise ServiceError(
                             400,
                             "body must contain exactly change_id, target, "
-                            "before, after and approval_request_id",
+                            "before, after and approval_request_id "
+                            "(chain-policy also requires asset_id)",
                         )
                     status, result = service.post_policy_change(
                         wallet_id,
@@ -640,6 +648,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("before"),
                         body.get("after"),
                         body.get("approval_request_id"),
+                        asset_id,
                     )
                     self._send_json(status, result)
                     return

@@ -223,10 +223,12 @@ TYPE_APPROVAL_ROSTER_UPDATED = "approval_roster_updated"
 #: 高风险配置双人变更控制的统一配置变更（仅由
 #: POST /v1/wallets/{id}/policy-changes 提交）。request_id 为 change_id、
 #: actor_id 为 approval_request_id、reason 为 null；details 恰含
-#: change_id,target,before,after,approval_request_id 五键。该事件既是变更
-#: 的唯一提交点，也作为七类受控配置（approval-policy/approval-roster/
+#: change_id,target,before,after,approval_request_id 五键（target=
+#: chain-policy 时在 target 后插入 asset_id 共六键）。该事件既是变更
+#: 的唯一提交点，也作为八类受控配置（approval-policy/approval-roster/
 #: transaction-policy/dkg-failover-policy/nodes/chain-adapters/
-#: change-control）的配置快照参与按 seq 折叠恢复，取每个 target 最后一条。
+#: change-control/chain-policy）的配置快照参与按 seq 折叠恢复，取每个
+#: target（chain-policy 按资产）最后一条。
 TYPE_POLICY_CHANGE_APPLIED = "policy_change_applied"
 
 #: 单字母缩写 -> 完整类型（P/C/A/R/E/S）
@@ -436,16 +438,30 @@ _DETAILS_KEY_ORDER = {
     TYPE_APPROVAL_ROSTER_UPDATED: (
         "allowed_approvers",
     ),
-    # policy_change_applied 的 details 恰为五键固定序
-    # change_id,target,before,after,approval_request_id；嵌套的 before/after
-    # 配置视图由 service 归一为确定序（节点 ID 升序且每值 key,state；适配
-    # 器 ASCII 升序；名单码点升序；策略/开关字典按规范键序），原样保序落盘。
+    # policy_change_applied 的 details 按 target 分两种精确键序：原七类
+    # 受控目标恰为五键固定序
+    # change_id,target,before,after,approval_request_id；target=chain-policy
+    # 在 target 后插入 asset_id，恰为六键固定序
+    # change_id,target,asset_id,before,after,approval_request_id。嵌套的
+    # before/after 配置视图由 service 归一为确定序（节点 ID 升序且每值
+    # key,state；适配器 ASCII 升序；名单码点升序；策略/开关字典按规范
+    # 键序），原样保序落盘。
     TYPE_POLICY_CHANGE_APPLIED: (
-        "change_id",
-        "target",
-        "before",
-        "after",
-        "approval_request_id",
+        (
+            "change_id",
+            "target",
+            "before",
+            "after",
+            "approval_request_id",
+        ),
+        (
+            "change_id",
+            "target",
+            "asset_id",
+            "before",
+            "after",
+            "approval_request_id",
+        ),
     ),
 }
 

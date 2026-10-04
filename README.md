@@ -156,41 +156,57 @@ JSON 对象。
 
 - `GET /v1/wallets/{id}/change-control` 始终 `200` 返回 `{"enabled":bool}`，
   初始 `{"enabled":false}`；钱包不存在 `404`，标识非法 `400`。
-- 受控 target 恰七类：`approval-policy`、`approval-roster`、
+- 受控 target 恰八类：`approval-policy`、`approval-roster`、
   `transaction-policy`、`dkg-failover-policy`、`nodes`、`chain-adapters`、
-  `change-control`。
+  `change-control`、`chain-policy`。
 - `POST /v1/wallets/{id}/policy-changes` 请求体**恰为**
   `{"change_id","target","before","after","approval_request_id"}`（缺键/
-  夹带一律 `400`）。`after` 为该 target 对应公开视图配置（各 target 沿用其
-  PUT 的形状与归一规则：名单码点升序、节点 ID 升序且每值 `key,state`、
-  适配器 ASCII 升序）；`before` 等于应用前配置，未配置策略为 `null`
-  （`approval-policy`/`transaction-policy`/`nodes`/`chain-adapters` 可空；
-  `approval-roster`/`dkg-failover-policy`/`change-control` 恒有缺省值，不
-  接受 null；`after` 恒非空）。标识、target、before/after 配置形状非法
-  `400`。
+  夹带一律 `400`）；**仅 `target=chain-policy` 时在原五键之外恰增
+  `asset_id` 一键**（六键，原七类目标夹带 `asset_id` 一律 `400`）。
+  `asset_id` 沿用资产标识规则（不要求已有余额记录）。`after` 为该
+  target 对应公开视图配置（各 target 沿用其 PUT 的形状与归一规则：名单
+  码点升序、节点 ID 升序且每值 `key,state`、适配器 ASCII 升序、链策略
+  恰为 `chain_id,enabled,required_confirmations,reorg_window` 四键）；
+  `before` 等于应用前配置，未配置策略为 `null`
+  （`approval-policy`/`transaction-policy`/`nodes`/`chain-adapters`/
+  `chain-policy` 可空；`approval-roster`/`dkg-failover-policy`/
+  `change-control` 恒有缺省值，不接受 null；`after` 恒非空）。
+  `chain-policy` 的 `before` 只与该资产当前公开策略比较，其他资产的
+  变动不影响。标识、target、before/after 配置形状非法 `400`。
 - 审批 `message` 是**仅含** `change_id,target,before,after` 四键（该固定
   序）的 ASCII 紧凑 JSON（无空白、非 ASCII 转义），且与请求逐字匹配；
-  审批单必须为同钱包 `approved`、有两位**不同**审批人且未过期（未知单
-  `404`；`pending`/`rejected`/`expired`、已过期、message 不符或仅一位审批
-  人均 `409`）。
+  **`target=chain-policy` 时在 `target` 后插入 `asset_id` 共五键**，嵌套
+  策略沿用原 PUT 公开视图的字段顺序。审批单必须为同钱包 `approved`、有
+  两位**不同**审批人且未过期（未知单 `404`；`pending`/`rejected`/
+  `expired`、已过期、message 不符或仅一位审批人均 `409`）。
 - 应用在钱包事务锁内比较 `before` 与当前配置、写配置并**原子**追加唯一
   `policy_change_applied` 事件（`request_id` 为 change_id、`actor_id` 为
-  approval_request_id、`reason` 为 null，details 即五字段）；`before` 漂移
-  `409`。首次 `201` 返回含 `change_id,target,before,after,
-  approval_request_id,seq` 的视图；同参重放 `200` 同体且不新增事件；同
-  change_id 异参 `409`。未知 change_id 的 GET `404`。
-- 启用后（含 `change-control` 本身）六类受控 PUT 一律 `409`
-  `change control required` 且**零副作用**（在任何校验/写入之前判定，但晚
-  于钱包存在性与冻结闸门）；`GET .../policy-changes/{change_id}` 返回已应用
-  视图。关闭仍走统一入口（after `{"enabled":false}`），关闭后原 PUT 恢复。
+  approval_request_id、`reason` 为 null，details 即五字段；
+  `chain-policy` 的 details 在 `target` 后增加 `asset_id` 共六字段）；
+  `before` 漂移 `409`。首次 `201` 返回含 `change_id,target,before,after,
+  approval_request_id,seq` 的视图（`chain-policy` 的视图在 `target` 后
+  含 `asset_id`）；同参重放 `200` 同体且不新增事件、不复查审批期限与
+  当前配置；同 change_id 异参（含换资产）`409`。未知 change_id 的 GET
+  `404`。并发同参只有一次首次应用；不同变更均修改同一旧配置时先成功者
+  生效，另一方 `409`。
+- 启用后（含 `change-control` 本身）六类受控 PUT 与跨链确认策略 PUT
+  一律 `409` `change control required` 且**零副作用**（在任何校验/写入
+  之前判定，但晚于钱包存在性与冻结闸门）；`GET .../policy-changes/
+  {change_id}` 返回已应用视图。关闭仍走统一入口（after
+  `{"enabled":false}`），关闭后原 PUT 恢复。
+- 钱包或 `chain-policy` 目标资产被冻结时，新变更与重放一律 `409` 且零
+  副作用，变更查询与链策略 GET 仍可用。
 - 配置状态由 legacy 写入事件与 `policy_change_applied` 按 seq 统一折叠：
-  audit-only 配置（roster/故障开关/nodes/adapters/开关）的全部读取与按 seq
-  的事前健康快照折叠（DKG 自动替补、rejoin、share-bind、自动派发、隔离）
-  都把两类事件当作同一快照流；文件型配置（approval/transaction policy）以
-  审计为提交点，崩溃窗口按提交前意图前滚/回滚并把文件对账到折叠结果。并发
-  与重启只产生一次首次应用；事件畸形或无法一致对账 fail-closed（`503`、
-  serve 拒绝就绪、保留现场）。响应、日志、审计与新增文件均不含份额私钥或
-  签名载荷；其余现有功能保持兼容。
+  audit-only 配置（roster/故障开关/nodes/adapters/开关）的全部读取与按
+  seq 的事前健康快照折叠（DKG 自动替补、rejoin、share-bind、自动派发、
+  隔离）都把两类事件当作同一快照流；链确认策略由 legacy `chain_policy`
+  事件与 `target=chain-policy` 的 `policy_change_applied` 按 seq 合并
+  折叠——GET 与后续跨链操作（报告/观察/派发门控）取该资产最近配置，
+  派发后的确认、结算与重组仍沿用派发前策略；文件型配置（approval/
+  transaction policy）以审计为提交点，崩溃窗口按提交前意图前滚/回滚并
+  把文件对账到折叠结果。并发与重启只产生一次首次应用；事件畸形或无法
+  一致对账 fail-closed（`503`、serve 拒绝就绪、保留现场）。响应、日志、
+  审计与新增文件均不含份额私钥或签名载荷；其余现有功能保持兼容。
 
 ### 冷热钱包交易策略（可选）
 
@@ -810,12 +826,16 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   `Q={"chain_id","enabled","required_confirmations","reorg_window"}`
   （含其他键或缺键一律 `400`）。`chain_id` 为安全标识；`enabled` 须为
   布尔；`required_confirmations` 为非布尔正整数；`reorg_window` 为非
-  布尔非负整数。成功 `200` 返回 Q；钱包不存在 `404`。策略仅由
+  布尔非负整数。成功 `200` 返回 Q；钱包不存在 `404`。双人变更控制启用
+  后本入口一律 `409` `change control required` 且零副作用，链策略只能
+  经 policy-changes 的 `chain-policy` 目标变更（见「高风险配置双人变更
+  控制」）。策略仅由
   `chain_policy` 审计事件持久化（`request_id` 为资产标识，
   `actor_id`/`reason` 为 `null`，details 即 Q，每个资产取最后一条
   恢复），**同值更新也记事件**，不写策略状态文件。
 - `GET /v1/wallets/{id}/chain/{asset_id}`：已配置 `200` 同体，未配置
-  `404`；钱包不存在 `404`。
+  `404`；钱包不存在 `404`。新旧策略写入混合时按 seq 取该资产最近配置
+  （legacy `chain_policy` 事件与 `chain-policy` 变更事件合并折叠）。
 - `POST /v1/wallets/{id}/chain/{oid}/report`：`oid` 为资产操作 id。
   请求体恰为
   `B={"chain_id","tx_id","block_height","block_hash","confirmations"}`，

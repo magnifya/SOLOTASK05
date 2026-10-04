@@ -74,7 +74,9 @@ DKG_NODE_STATES = ("up", "down", "ban")
 #: 一律 409；未配置或适配器缺席视为 up）
 CHAIN_ADAPTER_STATES = ("up", "down")
 
-#: 高风险配置双人变更控制的受控配置 target 取值（恰七类）。
+#: 高风险配置双人变更控制的受控配置 target 取值（恰八类）。chain-policy
+#: 是唯一的资产粒度目标：请求/审批 message/事件 details/视图都在 target
+#: 之后携带 asset_id。
 CHANGE_CONTROL_TARGETS = (
     "approval-policy",
     "approval-roster",
@@ -83,9 +85,10 @@ CHANGE_CONTROL_TARGETS = (
     "nodes",
     "chain-adapters",
     "change-control",
+    "chain-policy",
 )
 
-#: 存在"未配置（null）"状态的受控 target：这四类 GET 未配置时 404/无策略，
+#: 存在"未配置（null）"状态的受控 target：这五类 GET 未配置时 404/无策略，
 #: policy-changes 的 before/after 允许为 null；其余三类（approval-roster、
 #: dkg-failover-policy、change-control）始终有缺省值，不接受 null。
 _CHANGE_NULLABLE_TARGETS = frozenset(
@@ -94,6 +97,7 @@ _CHANGE_NULLABLE_TARGETS = frozenset(
         "transaction-policy",
         "nodes",
         "chain-adapters",
+        "chain-policy",
     )
 )
 
@@ -1944,6 +1948,15 @@ class WalletService:
         "after",
         "approval_request_id",
     )
+    #: target=chain-policy 的 details 固定六字段（target 后插入 asset_id）。
+    _POLICY_CHANGE_DETAILS_KEY_ORDER_CHAIN = (
+        "change_id",
+        "target",
+        "asset_id",
+        "before",
+        "after",
+        "approval_request_id",
+    )
     #: 审批单 message 固定四字段（不含 approval_request_id）。
     _POLICY_CHANGE_MESSAGE_KEY_ORDER = (
         "change_id",
@@ -1951,15 +1964,28 @@ class WalletService:
         "before",
         "after",
     )
+    #: target=chain-policy 的审批单 message 固定五字段（target 后插入
+    #: asset_id）。
+    _POLICY_CHANGE_MESSAGE_KEY_ORDER_CHAIN = (
+        "change_id",
+        "target",
+        "asset_id",
+        "before",
+        "after",
+    )
 
     @staticmethod
     def _policy_change_message(payload: dict) -> str:
         """审批单 message 必须逐字一致的 ASCII 紧凑 JSON：仅含
-        change_id,target,before,after 四键（该固定序），无空白，非 ASCII
-        一律转义（ensure_ascii=True）。嵌套 before/after 为归一后的公开
-        配置视图（节点/适配器/名单键序确定）。"""
-        ordered = {key: payload[key] for key in
-                  WalletService._POLICY_CHANGE_MESSAGE_KEY_ORDER}
+        change_id,target,before,after 四键（该固定序），target=chain-policy
+        时在 target 后插入 asset_id 共五键；无空白，非 ASCII 一律转义
+        （ensure_ascii=True）。嵌套 before/after 为归一后的公开配置视图
+        （节点/适配器/名单键序确定，链策略沿用 PUT 公开视图字段序）。"""
+        if payload.get("target") == "chain-policy":
+            order = WalletService._POLICY_CHANGE_MESSAGE_KEY_ORDER_CHAIN
+        else:
+            order = WalletService._POLICY_CHANGE_MESSAGE_KEY_ORDER
+        ordered = {key: payload[key] for key in order}
         return json.dumps(
             ordered, ensure_ascii=True, separators=(",", ":")
         )
@@ -2049,6 +2075,52 @@ class WalletService:
             raise ServiceError(400, "enabled must be a boolean")
         return {"enabled": enabled}
 
+    def _normalize_change_chain_policy(self, view: object) -> dict:
+        """归一并校验 chain-policy 目标的非空公开配置视图：恰为 PUT 公开
+        视图 Q 的四键与取值规则，返回固定键序
+        chain_id,enabled,required_confirmations,reorg_window。非法抛
+        ServiceError(400)。"""
+        if not isinstance(view, dict) or set(view) != {
+            "chain_id",
+            "enabled",
+            "required_confirmations",
+            "reorg_window",
+        }:
+            raise ServiceError(
+                400,
+                "chain-policy config must contain exactly chain_id, "
+                "enabled, required_confirmations and reorg_window",
+            )
+        chain_id = view["chain_id"]
+        enabled = view["enabled"]
+        required = view["required_confirmations"]
+        window = view["reorg_window"]
+        self._validate_chain_id(chain_id)
+        if not isinstance(enabled, bool):
+            raise ServiceError(400, "enabled must be a boolean")
+        if (
+            not isinstance(required, int)
+            or isinstance(required, bool)
+            or required <= 0
+        ):
+            raise ServiceError(
+                400, "required_confirmations must be a positive integer"
+            )
+        if (
+            not isinstance(window, int)
+            or isinstance(window, bool)
+            or window < 0
+        ):
+            raise ServiceError(
+                400, "reorg_window must be a non-negative integer"
+            )
+        return {
+            "chain_id": chain_id,
+            "enabled": enabled,
+            "required_confirmations": required,
+            "reorg_window": window,
+        }
+
     def _normalize_change_config(self, target: str, view: object) -> dict:
         """归一并校验某 target 的非空公开配置视图，非法抛 ServiceError(400)。
 
@@ -2078,6 +2150,8 @@ class WalletService:
                     400, "nodes config must contain exactly nodes"
                 )
             return {"nodes": self._normalize_nodes_body(view["nodes"])}
+        if target == "chain-policy":
+            return self._normalize_change_chain_policy(view)
         # chain-adapters
         if not isinstance(view, dict) or set(view) != {"adapters"}:
             raise ServiceError(
@@ -2104,6 +2178,8 @@ class WalletService:
                 normalized = self._normalize_change_transaction_policy(view)
             elif target in ("dkg-failover-policy", "change-control"):
                 normalized = self._normalize_change_enabled(view, target)
+            elif target == "chain-policy":
+                normalized = self._normalize_change_chain_policy(view)
             elif target == "approval-roster":
                 if not isinstance(view, dict) or set(view) != {
                     "allowed_approvers"
@@ -2170,12 +2246,14 @@ class WalletService:
         - 外层七字段为落盘规范序；reason 为 null；
         - request_id/actor_id 均为安全标识，request_id==details.change_id，
           actor_id==details.approval_request_id；同一 change_id 至多一条；
-        - details 恰为五键固定序；target 属七类受控配置；
-        - before 仅对四类可缺省目标允许 null，after 必须为合法非空视图；
+        - details 恰为五键固定序（target=chain-policy 时在 target 后插入
+          asset_id 共六键，asset_id 为安全标识，且 asset_id 键由
+          chain-policy 独占）；target 属八类受控配置；
+        - before 仅对五类可缺省目标允许 null，after 必须为合法非空视图；
           两者形状按各 target 公开视图严格校验（节点/适配器升序、名单
-          码点升序）；
-        - actor 审批单必须存在、message 逐字为四键 ASCII 紧凑 JSON、状态
-          approved/signed 且有两位**不同**审批人。
+          码点升序、链策略四键取值）；
+        - actor 审批单必须存在、message 逐字为四键（chain-policy 五键）
+          ASCII 紧凑 JSON、状态 approved/signed 且有两位**不同**审批人。
 
         任何畸形/矛盾都是不可对账现场（RecoveryError，fail-closed，保留
         现场）。纯只读，不新增事件、不改 seq。"""
@@ -2218,16 +2296,38 @@ class WalletService:
                     f"{change_id!r} has a non-null reason"
                 )
             details = event.get("details")
-            if (
-                not isinstance(details, dict)
-                or list(details)
-                != list(self._POLICY_CHANGE_DETAILS_KEY_ORDER)
+            if not isinstance(details, dict):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} policy_change_applied "
+                    f"{change_id!r} has malformed details"
+                )
+            if list(details) == list(self._POLICY_CHANGE_DETAILS_KEY_ORDER):
+                asset_id = None
+            elif list(details) == list(
+                self._POLICY_CHANGE_DETAILS_KEY_ORDER_CHAIN
             ):
+                asset_id = details["asset_id"]
+                if not (
+                    isinstance(asset_id, str)
+                    and ROTATION_ID_RE.match(asset_id)
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} policy_change_applied "
+                        f"{change_id!r} has a malformed asset_id"
+                    )
+            else:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} policy_change_applied "
                     f"{change_id!r} has malformed details"
                 )
             target = details["target"]
+            if (target == "chain-policy") != (asset_id is not None):
+                # asset_id 键由 chain-policy 独占：原七类目标夹带、或
+                # chain-policy 缺失，都是不可对账现场。
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} policy_change_applied "
+                    f"{change_id!r} details identifiers disagree"
+                )
             if (
                 details["change_id"] != change_id
                 or details["approval_request_id"] != approval_id
@@ -2273,6 +2373,7 @@ class WalletService:
                 {
                     "change_id": change_id,
                     "target": target,
+                    "asset_id": asset_id,
                     "before": before,
                     "after": after,
                 }
@@ -2325,9 +2426,9 @@ class WalletService:
     def _assert_change_control_not_required_locked(
         self, wallet_id: str
     ) -> None:
-        """双人变更控制启用后，六类受控配置的原 PUT 统一 409
-        （change control required）且零副作用。在钱包存在性/冻结判定之后、
-        任何参数校验与写入之前调用。"""
+        """双人变更控制启用后，受控配置的原 PUT（六类钱包级配置与跨链
+        确认策略 PUT）统一 409（change control required）且零副作用。
+        在钱包存在性/冻结判定之后、任何参数校验与写入之前调用。"""
         if self._change_control_enabled_locked(wallet_id):
             raise ServiceError(
                 409, "change control required"
@@ -2438,11 +2539,15 @@ class WalletService:
             enabled = changes[seq] if seq in changes else legacy[seq]
         return enabled
 
-    def _current_config_view_locked(self, wallet_id: str, target: str):
+    def _current_config_view_locked(
+        self, wallet_id: str, target: str, asset_id: str | None = None
+    ):
         """某受控 target 的当前公开配置视图（调用方须持钱包事务锁）。
 
         audit-sourced 配置统一折叠 legacy 快照与 policy_change_applied；
-        文件型配置（heal/recover 已把文件对账到审计提交点）直接读文件。"""
+        文件型配置（heal/recover 已把文件对账到审计提交点）直接读文件。
+        chain-policy 为资产粒度：返回该资产当前链确认策略（未配置 None），
+        其他资产的配置与变动不参与比较。"""
         if target == "approval-policy":
             return self._current_approval_policy_view_locked(wallet_id)
         if target == "transaction-policy":
@@ -2465,21 +2570,28 @@ class WalletService:
             if not snapshots:
                 return None
             return {"adapters": dict(snapshots[-1]["details"]["adapters"])}
+        if target == "chain-policy":
+            policy = self._chain_policies(wallet_id).get(asset_id)
+            return None if policy is None else dict(policy)
         # change-control
         return {"enabled": self._change_control_enabled_locked(wallet_id)}
 
     def _policy_change_view(self, event: dict) -> dict:
-        """已应用变更的公开视图（GET/首提/重放同形）：六键固定序，seq 为
-        事件落盘序号。"""
+        """已应用变更的公开视图（GET/首提/重放同形）：六键固定序
+        （target=chain-policy 时在 target 后插入 asset_id 共七键），seq
+        为事件落盘序号。"""
         details = event["details"]
-        return {
+        view = {
             "change_id": details["change_id"],
             "target": details["target"],
-            "before": self._clone_config(details["before"]),
-            "after": self._clone_config(details["after"]),
-            "approval_request_id": details["approval_request_id"],
-            "seq": event["seq"],
         }
+        if "asset_id" in details:
+            view["asset_id"] = details["asset_id"]
+        view["before"] = self._clone_config(details["before"])
+        view["after"] = self._clone_config(details["after"])
+        view["approval_request_id"] = details["approval_request_id"]
+        view["seq"] = event["seq"]
+        return view
 
     @staticmethod
     def _clone_config(value):
@@ -2527,20 +2639,26 @@ class WalletService:
         before: object,
         after: object,
         approval_request_id: object,
+        asset_id: object = None,
     ) -> tuple[int, dict]:
         """POST /v1/wallets/{id}/policy-changes —— 高风险配置双人变更的
         统一入口。返回 (201|200, 视图)。
 
         顺序（全部在每钱包跨进程事务锁内，heal/存在性/冻结之后）：
 
-        1. 字段 400：change_id/approval_request_id 安全标识、target 七类、
-           before（可空目标允许 null）/after（恒非空）配置形状；
-        2. 幂等优先：同 change_id 已提交，同参（target/before/after/
-           approval_request_id 全等）重放 200 同体不复查现场、不记事件；
-           异参 409；
-        3. 审批单未知 404；锁内懒过期后 message 须逐字为四键 ASCII 紧凑
-           JSON，状态 approved 且两位不同审批人，否则 409（零副作用）；
-        4. before 必须等于当前配置（锁内折叠），漂移 409；
+        1. 字段 400：change_id/approval_request_id 安全标识、target 八类、
+           asset_id 仅 chain-policy 必填（安全标识，其余目标夹带一律
+           400）、before（可空目标允许 null）/after（恒非空）配置形状；
+           chain-policy 目标资产 frozen 时新变更与重放一律 409（在幂等
+           判定之前）；
+        2. 幂等优先：同 change_id 已提交，同参（target/asset_id/before/
+           after/approval_request_id 全等）重放 200 同体不复查现场、不记
+           事件；异参（含换资产）409；
+        3. 审批单未知 404；锁内懒过期后 message 须逐字为四键（chain-policy
+           五键，target 后插入 asset_id）ASCII 紧凑 JSON，状态 approved
+           且两位不同审批人，否则 409（零副作用）；
+        4. before 必须等于当前配置（锁内折叠；chain-policy 只比较该资产
+           当前策略，其他资产的变动不影响），漂移 409；
         5. 比较通过后写配置并**原子**追加唯一 policy_change_applied 事件：
            audit-sourced 目标只追加事件；文件型目标先落提交前意图，事件在
            则前滚、不在则回滚。首提 201，并发/重启只有一个首提。
@@ -2576,6 +2694,20 @@ class WalletService:
                         "approval_request_id must match "
                         "[A-Za-z0-9_-]{1,128}",
                     )
+                if target == "chain-policy":
+                    # chain-policy 是资产粒度目标：asset_id 必填且沿用资产
+                    # 标识规则（不要求已有余额记录）。
+                    self._validate_asset_id(asset_id)
+                elif asset_id is not None:
+                    # 原七类目标格式保持兼容：夹带 asset_id 一律 400。
+                    raise ServiceError(
+                        400,
+                        "asset_id is only allowed for target chain-policy",
+                    )
+                if target == "chain-policy":
+                    # 目标资产冻结闸门：frozen 时新变更与重放一律 409 且零
+                    # 副作用（在幂等判定之前，与钱包冻结闸门同序）。
+                    self._assert_asset_active_locked(wallet_id, asset_id)
                 allow_null = target in _CHANGE_NULLABLE_TARGETS
                 if before is not None or not allow_null:
                     before_view = self._normalize_change_config(target, before)
@@ -2593,6 +2725,7 @@ class WalletService:
                     saved = committed["details"]
                     if (
                         saved["target"] == target
+                        and saved.get("asset_id") == asset_id
                         and saved["before"] == before_view
                         and saved["after"] == after_view
                         and saved["approval_request_id"]
@@ -2626,6 +2759,7 @@ class WalletService:
                 message_payload = {
                     "change_id": change_id,
                     "target": target,
+                    "asset_id": asset_id,
                     "before": before_view,
                     "after": after_view,
                 }
@@ -2649,7 +2783,9 @@ class WalletService:
                     )
 
                 # --- 4. before 漂移检查（锁内当前配置）---
-                current = self._current_config_view_locked(wallet_id, target)
+                current = self._current_config_view_locked(
+                    wallet_id, target, asset_id
+                )
                 if current != before_view:
                     raise ServiceError(
                         409,
@@ -2665,6 +2801,7 @@ class WalletService:
                     before_view,
                     after_view,
                     approval_request_id,
+                    asset_id=asset_id,
                 )
         except CorruptDataError:
             raise
@@ -2681,20 +2818,23 @@ class WalletService:
         before_view,
         after_view: dict,
         approval_request_id: str,
+        asset_id: str | None = None,
     ) -> dict:
         """在已持有钱包事务锁、全部校验通过后写配置并原子追加唯一
         policy_change_applied 事件，返回含 seq 的落盘事件（调用方持锁）。
 
         文件型目标（approval-policy/transaction-policy）先写提交前意图，
         事件是唯一提交点（崩溃由 _recover_policy_changes 前滚/回滚）；
-        audit-sourced 目标只追加事件。"""
+        audit-sourced 目标（含 chain-policy）只追加事件。"""
         details = {
             "change_id": change_id,
             "target": target,
-            "before": before_view,
-            "after": after_view,
-            "approval_request_id": approval_request_id,
         }
+        if target == "chain-policy":
+            details["asset_id"] = asset_id
+        details["before"] = before_view
+        details["after"] = after_view
+        details["approval_request_id"] = approval_request_id
         file_backed = target in ("approval-policy", "transaction-policy")
         if file_backed:
             if target == "approval-policy":
@@ -7636,17 +7776,46 @@ class WalletService:
             )
         return operation_id, dict(details)
 
-    def _chain_policies(self, wallet_id: str) -> dict[str, dict]:
-        """从 chain_policy 事件序列恢复各资产的链确认策略（每资产取最后一条）。
-
-        策略只由审计事件持久化（事件之外不写任何状态文件）；畸形事件
-        fail-closed（RecoveryError），绝不静默按缺省处理。纯只读，
-        不分配 seq。"""
-        policies: dict[str, dict] = {}
+    def _chain_policy_snapshot_events_locked(
+        self, wallet_id: str
+    ) -> list[tuple[int, str, dict]]:
+        """链确认策略的全部配置快照（按 seq 升序）：既有的 chain_policy
+        事件与 target=chain-policy 的 policy_change_applied 事件统一为
+        ``(seq, asset_id, 策略Q)`` 流。后者是变更控制启用后链策略的唯一
+        提交点，与 legacy 事件同样作为全量快照参与按 seq 的折叠（GET、
+        报告/观察/派发门控与各恢复对账）。两类事件均先经严格校验。
+        纯只读，不分配 seq。"""
+        snapshots: list[tuple[int, str, dict]] = []
         for event in self._audit.events_by_type(
             wallet_id, audit.TYPE_CHAIN_POLICY
         ):
             asset_id, policy = self._chain_policy_shape(wallet_id, event)
+            snapshots.append((event["seq"], asset_id, policy))
+        for event in self._policy_change_events_strict(wallet_id):
+            details = event["details"]
+            if details["target"] == "chain-policy":
+                snapshots.append(
+                    (
+                        event["seq"],
+                        details["asset_id"],
+                        dict(details["after"]),
+                    )
+                )
+        snapshots.sort(key=lambda item: item[0])
+        return snapshots
+
+    def _chain_policies(self, wallet_id: str) -> dict[str, dict]:
+        """从链策略快照流恢复各资产当前的链确认策略（每资产按 seq 取最后
+        一条）。
+
+        策略只由审计事件持久化（legacy chain_policy 与 target=chain-policy
+        的 policy_change_applied 合并流，事件之外不写任何状态文件）；畸形
+        事件 fail-closed（RecoveryError），绝不静默按缺省处理。纯只读，
+        不分配 seq。"""
+        policies: dict[str, dict] = {}
+        for _seq, asset_id, policy in (
+            self._chain_policy_snapshot_events_locked(wallet_id)
+        ):
             policies[asset_id] = policy
         return policies
 
@@ -7713,17 +7882,23 @@ class WalletService:
     ) -> dict:
         """设置（或覆盖）某资产的跨链确认策略。成功 200 返回 Q。
 
-        钱包不存在 404；标识/值非法 400（键集由 HTTP 边界校验）。策略
-        仅由 chain_policy 审计事件持久化（request_id 为资产标识，
-        actor_id/reason 为 null，details 即 Q），**同值更新也记事件**，
-        不写任何策略状态文件。恢复检查、存在性判定、校验与事件追加全部
-        在每钱包跨进程事务锁内完成。"""
+        钱包不存在 404；标识/值非法 400（键集由 HTTP 边界校验）。双人变更
+        控制启用后本入口一律 409 change control required 且零副作用（在
+        参数校验与任何写入之前判定），链确认策略只能经 policy-changes 的
+        chain-policy 目标变更。策略仅由 chain_policy 审计事件持久化
+        （request_id 为资产标识，actor_id/reason 为 null，details 即 Q），
+        **同值更新也记事件**，不写任何策略状态文件。恢复检查、存在性判定、
+        校验与事件追加全部在每钱包跨进程事务锁内完成。"""
         try:
             with self._wallet_lock(wallet_id):
                 self._heal_wallet(wallet_id)
                 # 404 优先于 400：存在性在锁内、heal 之后先判定
                 self._get_wallet_or_404(wallet_id)
                 self._assert_wallet_active_locked(wallet_id)
+                # 双人变更控制启用后受控 PUT 统一 409（零副作用，在参数校验
+                # 与任何写入之前）；链确认策略只能经 policy-changes 的
+                # chain-policy 目标变更。
+                self._assert_change_control_not_required_locked(wallet_id)
                 self._validate_asset_id(asset_id)
                 self._validate_chain_id(chain_id)
                 # 资产粒度冻结闸门：frozen 资产的确认策略写入（含同值
@@ -8110,6 +8285,8 @@ class WalletService:
         按 seq 重放全部事件，逐事件核对在线规则：
 
         - chain_policy/chain_report 事件形状必须合法（标识、hex、整数）；
+          链确认策略按 legacy chain_policy 与 target=chain-policy 的
+          policy_change_applied 合并流折叠；
         - 报告必须指向账本中存在的操作，且当时该资产策略已启用、链一致；
         - 报告状态机（tx/链绑定、同块确认数不降、换块回退不超窗、低于
           门槛的同体报告不产生事件、终态后不再有报告）逐事件成立；
@@ -8129,6 +8306,16 @@ class WalletService:
         reports: dict[str, dict] = {}
         committed: set[str] = set()
         prev: dict | None = None
+        # target=chain-policy 的 policy_change_applied 与 legacy
+        # chain_policy 事件按 seq 合并折叠（均先经严格校验）。
+        policy_changes = {
+            event["seq"]: (
+                event["details"]["asset_id"],
+                dict(event["details"]["after"]),
+            )
+            for event in self._policy_change_events_strict(wallet_id)
+            if event["details"]["target"] == "chain-policy"
+        }
         events = self._audit.all_events(wallet_id)
         for index, event in enumerate(events):
             event_type = event.get("type")
@@ -8137,6 +8324,10 @@ class WalletService:
                     wallet_id, event
                 )
                 policies[asset_id] = policy
+            elif event_type == audit.TYPE_POLICY_CHANGE_APPLIED:
+                change = policy_changes.get(event.get("seq"))
+                if change is not None:
+                    policies[change[0]] = change[1]
             elif event_type == audit.TYPE_CHAIN_REPORT:
                 operation_id, report = self._chain_report_shape(
                     wallet_id, event
@@ -8650,17 +8841,20 @@ class WalletService:
         self._dispatch_all_request_events_strict(wallet_id)
         ledger = self._store.check_asset_ledger_semantics(wallet_id)
         operations = ledger["operations"]
-        # 重放全部事件，取各操作的提交 seq 与各资产的策略历史（seq 升序）。
+        # 重放全部事件，取各操作的提交 seq；各资产的策略历史（seq 升序）
+        # 取 legacy chain_policy 与 target=chain-policy 的
+        # policy_change_applied 合并流（均经严格校验）。
         committed_seq: dict[str, int] = {}
         policy_history: dict[str, list[tuple[int, dict]]] = {}
+        for snap_seq, snap_asset, snap_policy in (
+            self._chain_policy_snapshot_events_locked(wallet_id)
+        ):
+            policy_history.setdefault(snap_asset, []).append(
+                (snap_seq, snap_policy)
+            )
         for event in self._audit.all_events(wallet_id):
             event_type = event.get("type")
-            if event_type == audit.TYPE_CHAIN_POLICY:
-                asset_id, policy = self._chain_policy_shape(wallet_id, event)
-                policy_history.setdefault(asset_id, []).append(
-                    (event["seq"], policy)
-                )
-            elif event_type == audit.TYPE_ASSET_OPERATION_COMMITTED:
+            if event_type == audit.TYPE_ASSET_OPERATION_COMMITTED:
                 request_id = event.get("request_id")
                 if isinstance(request_id, str):
                     committed_seq[request_id] = event["seq"]
@@ -8695,7 +8889,8 @@ class WalletService:
                     f"wallet {wallet_id!r} has a {event['type']} event for "
                     f"already committed asset operation {operation_id!r}"
                 )
-            # 事前策略：该事件 seq 之前最后一条该资产 chain_policy。
+            # 事前策略：该事件 seq 之前最后一条该资产链确认策略（legacy
+            # chain_policy 与 chain-policy 变更事件的合并流）。
             policy = None
             for policy_seq, candidate in policy_history.get(
                 record["asset_id"], []
@@ -9741,20 +9936,19 @@ class WalletService:
     def _chain_policy_before(
         self, wallet_id: str, asset_id: str, seq: int
     ) -> dict | None:
-        """该资产在指定 seq 之前最后一条 chain_policy 策略（无则 None）。
+        """该资产在指定 seq 之前最后一条链确认策略（无则 None）：legacy
+        chain_policy 事件与 target=chain-policy 的 policy_change_applied
+        合并流按 seq 折叠（派发后的确认/结算/重组据此沿用派发前策略）。
 
         纯只读；畸形策略事件 fail-closed（RecoveryError），绝不静默按
         缺省处理。"""
         policy = None
-        for event in self._audit.events_by_type(
-            wallet_id, audit.TYPE_CHAIN_POLICY
+        for snap_seq, snap_asset, candidate in (
+            self._chain_policy_snapshot_events_locked(wallet_id)
         ):
-            if event["seq"] >= seq:
+            if snap_seq >= seq:
                 continue
-            policy_asset, candidate = self._chain_policy_shape(
-                wallet_id, event
-            )
-            if policy_asset == asset_id:
+            if snap_asset == asset_id:
                 policy = candidate
         return policy
 
@@ -12490,12 +12684,26 @@ class WalletService:
         arb_policies: dict[str, dict] = {}
         chain_policies: dict[str, dict] = {}
         votes_by_op: dict[str, list[dict]] = {}
+        # target=chain-policy 的 policy_change_applied 与 legacy
+        # chain_policy 事件按 seq 合并折叠（均先经严格校验）。
+        policy_changes = {
+            event["seq"]: (
+                event["details"]["asset_id"],
+                dict(event["details"]["after"]),
+            )
+            for event in self._policy_change_events_strict(wallet_id)
+            if event["details"]["target"] == "chain-policy"
+        }
         events = self._audit.all_events(wallet_id)
         for index, event in enumerate(events):
             etype = event.get("type")
             if etype == audit.TYPE_CHAIN_POLICY:
                 asset_id, policy = self._chain_policy_shape(wallet_id, event)
                 chain_policies[asset_id] = policy
+            elif etype == audit.TYPE_POLICY_CHANGE_APPLIED:
+                change = policy_changes.get(event.get("seq"))
+                if change is not None:
+                    chain_policies[change[0]] = change[1]
             elif etype == audit.TYPE_CHAIN_ARBITRATION:
                 # 合法旧策略事件：仅只读兼容，与新形事件一同按 seq 重放
                 asset_id, policy = self._legacy_arbitration_policy_shape(
