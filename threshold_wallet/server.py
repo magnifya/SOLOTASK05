@@ -618,20 +618,28 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     return
 
                 if rest == ["policy-changes"]:
-                    # 高风险配置双人变更统一入口：请求体恰为五键
-                    # （值类型/取值/target/before/after 由 service 严格校验）
+                    # 高风险配置双人变更统一入口：原七类 target 请求体恰为
+                    # 五键；target=chain-policy 额外要求 asset_id（恰六键）。
+                    # 值类型/取值/target/before/after 由 service 严格校验；
+                    # 原七类 target 夹带 asset_id 一律 400。
                     body = self._read_json_body()
-                    if set(body) != {
+                    required = {
                         "change_id",
                         "target",
                         "before",
                         "after",
                         "approval_request_id",
-                    }:
+                    }
+                    if body.get("target") == "chain-policy":
+                        required.add("asset_id")
+                    if set(body) != required:
                         raise ServiceError(
                             400,
                             "body must contain exactly change_id, target, "
-                            "before, after and approval_request_id",
+                            "before, after and approval_request_id"
+                            + (", plus asset_id for target chain-policy"
+                               if body.get("target") == "chain-policy"
+                               else ""),
                         )
                     status, result = service.post_policy_change(
                         wallet_id,
@@ -640,6 +648,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("before"),
                         body.get("after"),
                         body.get("approval_request_id"),
+                        body.get("asset_id"),
                     )
                     self._send_json(status, result)
                     return

@@ -156,41 +156,59 @@ JSON 对象。
 
 - `GET /v1/wallets/{id}/change-control` 始终 `200` 返回 `{"enabled":bool}`，
   初始 `{"enabled":false}`；钱包不存在 `404`，标识非法 `400`。
-- 受控 target 恰七类：`approval-policy`、`approval-roster`、
+- 受控 target 原七类：`approval-policy`、`approval-roster`、
   `transaction-policy`、`dkg-failover-policy`、`nodes`、`chain-adapters`、
-  `change-control`。
-- `POST /v1/wallets/{id}/policy-changes` 请求体**恰为**
+  `change-control`；另有第八类 `chain-policy`（单个资产的跨链确认策略），
+  仅此 target 在原请求字段外额外要求 `asset_id`。
+- `POST /v1/wallets/{id}/policy-changes` 请求体：原七类 target **恰为**
   `{"change_id","target","before","after","approval_request_id"}`（缺键/
-  夹带一律 `400`）。`after` 为该 target 对应公开视图配置（各 target 沿用其
-  PUT 的形状与归一规则：名单码点升序、节点 ID 升序且每值 `key,state`、
-  适配器 ASCII 升序）；`before` 等于应用前配置，未配置策略为 `null`
-  （`approval-policy`/`transaction-policy`/`nodes`/`chain-adapters` 可空；
-  `approval-roster`/`dkg-failover-policy`/`change-control` 恒有缺省值，不
-  接受 null；`after` 恒非空）。标识、target、before/after 配置形状非法
-  `400`。
-- 审批 `message` 是**仅含** `change_id,target,before,after` 四键（该固定
-  序）的 ASCII 紧凑 JSON（无空白、非 ASCII 转义），且与请求逐字匹配；
-  审批单必须为同钱包 `approved`、有两位**不同**审批人且未过期（未知单
-  `404`；`pending`/`rejected`/`expired`、已过期、message 不符或仅一位审批
-  人均 `409`）。
+  夹带一律 `400`）；`target=chain-policy` 时在 `target` 后额外恰含
+  `asset_id` 一键（原七类 target 夹带 `asset_id` 一律 `400`）。`asset_id`
+  沿用安全标识规则、不要求该资产已有余额记录。`after` 为该 target 对应
+  公开视图配置（各 target 沿用其 PUT 的形状与归一规则：名单码点升序、
+  节点 ID 升序且每值 `key,state`、适配器 ASCII 升序；chain-policy 沿用
+  `PUT /chain/{asset_id}` 的 `chain_id,enabled,required_confirmations,
+  reorg_window` 四键及值规则）；`before` 等于应用前配置，未配置策略为
+  `null`（`approval-policy`/`transaction-policy`/`nodes`/`chain-adapters`/
+  `chain-policy` 可空；`approval-roster`/`dkg-failover-policy`/
+  `change-control` 恒有缺省值，不接受 null；`after` 恒非空）。标识、
+  target、before/after 配置形状非法 `400`；未知钱包、审批单或变更记录
+  `404`。
+- 审批 `message` 是 ASCII 紧凑 JSON（无空白、非 ASCII 转义）：原七类
+  target **仅含** `change_id,target,before,after` 四键（该固定序）；
+  `chain-policy` 在 `target` 后插入 `asset_id`（恰五键
+  `change_id,target,asset_id,before,after`，嵌套策略用原 PUT 公开视图的
+  字段顺序）；均须与请求逐字匹配。审批单必须为同钱包 `approved`、有两位
+  **不同**审批人且未过期（未知单 `404`；`pending`/`rejected`/`expired`、
+  已过期、message 不符或仅一位审批人均 `409`）。
 - 应用在钱包事务锁内比较 `before` 与当前配置、写配置并**原子**追加唯一
   `policy_change_applied` 事件（`request_id` 为 change_id、`actor_id` 为
-  approval_request_id、`reason` 为 null，details 即五字段）；`before` 漂移
-  `409`。首次 `201` 返回含 `change_id,target,before,after,
-  approval_request_id,seq` 的视图；同参重放 `200` 同体且不新增事件；同
-  change_id 异参 `409`。未知 change_id 的 GET `404`。
-- 启用后（含 `change-control` 本身）六类受控 PUT 一律 `409`
+  approval_request_id、`reason` 为 null；原七类 target details 即五字段，
+  chain-policy details 在 target 后增加 `asset_id`）；`before` 漂移
+  `409`（chain-policy 只比较该资产当前公开策略，其他资产的变动不影响
+  比较）。首次 `201` 返回含 `change_id,target,...,approval_request_id,seq`
+  的视图（chain-policy 视图同样含 `asset_id`）；同钱包同 change_id 同参
+  重放 `200` 同体且不新增事件（不复查审批期限与当前配置）；同 change_id
+  异参（chain-policy 含换资产或改参数）`409`。并发同参只有一次首次应用；
+  不同变更都修改同一旧配置时先成功者生效，另一方因 before 漂移 `409`。
+  未知 change_id 的 GET `404`。
+- 启用后（含 `change-control` 本身）原六类受控 PUT 与跨链确认策略
+  `PUT /v1/wallets/{id}/chain/{asset_id}` 一律 `409`
   `change control required` 且**零副作用**（在任何校验/写入之前判定，但晚
-  于钱包存在性与冻结闸门）；`GET .../policy-changes/{change_id}` 返回已应用
-  视图。关闭仍走统一入口（after `{"enabled":false}`），关闭后原 PUT 恢复。
+  于钱包存在性与冻结闸门；chain-policy 的资产粒度冻结闸门对其统一变更
+  同样生效——钱包或目标资产 frozen 时新变更与同参重放均 `409`，查询仍
+  可用）；`GET .../policy-changes/{change_id}` 返回已应用视图。关闭仍走
+  统一入口（after `{"enabled":false}`），关闭后原 PUT 恢复。
 - 配置状态由 legacy 写入事件与 `policy_change_applied` 按 seq 统一折叠：
-  audit-only 配置（roster/故障开关/nodes/adapters/开关）的全部读取与按 seq
-  的事前健康快照折叠（DKG 自动替补、rejoin、share-bind、自动派发、隔离）
-  都把两类事件当作同一快照流；文件型配置（approval/transaction policy）以
-  审计为提交点，崩溃窗口按提交前意图前滚/回滚并把文件对账到折叠结果。并发
-  与重启只产生一次首次应用；事件畸形或无法一致对账 fail-closed（`503`、
-  serve 拒绝就绪、保留现场）。响应、日志、审计与新增文件均不含份额私钥或
-  签名载荷；其余现有功能保持兼容。
+  audit-only 配置（roster/故障开关/nodes/adapters/开关，以及 chain-policy
+  的 `chain_policy` 事件与对应变更事件）的全部读取与按 seq 的事前健康/
+  策略快照折叠（DKG 自动替补、rejoin、share-bind、自动派发、隔离，以及
+  跨链派发后的确认、结算与重组——在途派发始终沿用派发请求提交之前的
+  该资产策略）都把两类事件当作同一快照流；文件型配置（approval/
+  transaction policy）以审计为提交点，崩溃窗口按提交前意图前滚/回滚并把
+  文件对账到折叠结果。并发与重启只产生一次首次应用；事件畸形或无法一致
+  对账 fail-closed（`503`、serve 拒绝就绪、保留现场）。响应、日志、审计
+  与新增文件均不含份额私钥或签名载荷；其余现有功能保持兼容。
 
 ### 冷热钱包交易策略（可选）
 
@@ -1416,9 +1434,11 @@ approval_request_id、details 即 cancelled 操作视图）、
 `{"asset_id","reason"}`，两类事件按 (钱包, 资产) 分组严格交替，按 seq
 折叠出各资产 active/frozen 状态）。
 高风险配置双人变更另有 `policy_change_applied`（`request_id` 为 change_id、
-`actor_id` 为 approval_request_id、reason 为 null，details 恰含
-`change_id,target,before,after,approval_request_id` 五键固定序；同时作为七类
-受控配置的快照事件按 seq 折叠）。
+`actor_id` 为 approval_request_id、reason 为 null；原七类 target 的 details
+恰含 `change_id,target,before,after,approval_request_id` 五键固定序，
+`target=chain-policy` 时在 target 后插入 `asset_id` 为六键；同时作为各类
+受控配置（含单资产跨链确认策略，与 `chain_policy` 事件同流）的快照事件按
+seq 折叠）。
 
 ### 审计完整性（摘要链）
 审计文件顶层携带顺序摘要链 `chain`，恰含 `algorithm`/`head`/`count`，
