@@ -73,6 +73,7 @@ python -m unittest discover -s tests -v
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
+| GET  | `/v1/wallets/{id}/assets` | 钱包级资产清单分页查询（`at_seq`/`expected_head`/`limit`/`after`） |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/unfreeze` | 解除单个资产冻结 `{"reason"}` |
@@ -763,6 +764,44 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 不返回部分结果。钱包或资产冻结时仍可使用；查询不触发审批懒过期、
 不新增事件或历史状态文件，不改变余额、version 或摘要链。响应与日志
 不含私钥、份额或单份额签名。
+
+#### 钱包级资产清单（分页）
+
+`GET /v1/wallets/{id}/assets[?at_seq=N&expected_head=H&limit=L&after=A]`
+只接受 GET。成功 `200` 返回
+`{wallet_id,at_seq,head,assets,next_after}`：
+
+- `assets` 每项恰含 `{asset_id,balance,version}`，按 `asset_id` 的
+  ASCII 顺序升序；只列出边界内已有已提交操作的资产（余额归零仍保
+  留；只有 pending/cancelled 操作的资产不出现）。人工提交、链上确
+  认、多源仲裁、派发最终性结算与重组补偿五类落账方式统一纳入，同
+  一资产不重复，余额/版本与同一边界的单资产历史查询一致。
+- `at_seq` 缺省取本次查询的一致审计尾序号；显式给定时接受 ASCII
+  数字组成的非负整数（前导零允许），`0` 表示空前缀。`head` 为整个
+  钱包该边界后的审计摘要：正边界与 `audit-evidence` 同一
+  `to_seq=N` 的 `end_head` 一致，零边界为 64 个零。
+- `expected_head` 只允许随显式 `at_seq` 使用，须为 64 位小写十六
+  进制并校验该前缀摘要。后续页带回相同 `at_seq` 与 `head` 作为
+  `expected_head` 时，新增事件不改变分页集合与数值。
+- `limit` 接受 ASCII 数字组成的 1 至 1000 整数，缺省 100。`after`
+  沿用资产标识规则（`[A-Za-z0-9_-]{1,128}`），表示排除该值及之前
+  的资产，不要求该标识实际存在。只有仍有后续资产时 `next_after`
+  才返回本页最后一个标识，否则为 `null`。
+- 空钱包、零边界或游标之后无资产均返回 `200` 空数组，但仍校验摘
+  要（`expected_head` 不符仍 `409`）。
+
+错误语义：钱包标识非法 `400`，钱包不存在 `404` 并优先于一切查询参
+数校验；参数重复（`duplicate <name> parameters`）、空值、格式非法
+（`invalid at_seq`/`invalid expected_head`/`invalid limit`/
+`invalid after`）、`limit` 越界或 `expected_head` 缺少 `at_seq`
+（`expected_head requires at_seq`）均 `400`；边界越尾 `404`
+`at_seq beyond the audit tail`；摘要不匹配 `409`
+`expected_head does not match chain head`。审计链、账本或恢复现场
+损坏及读取失败统一 `503` `service temporarily unavailable`，不返回
+部分结果。查询在既有恢复检查之后、每钱包事务锁内读取一致现场，不
+写文件、不触发审批过期、不新增审计，也不改变余额或版本；钱包和资
+产冻结期间仍可查询，重启及合法灾备恢复后同一边界结果一致。响应与
+日志不含私钥、份额或单份额签名。
 
 ### 跨链资产确认（可选）
 
