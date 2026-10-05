@@ -76,6 +76,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/asset-transfers` | 原子资产转账 `{"transfer_id","from_asset_id","to_asset_id","amount","expected_from_version","expected_to_version"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
 | GET  | `/v1/wallets/{id}/assets` | 钱包级资产清单分页查询（`at_seq`/`expected_head`/`limit`/`after`） |
+| POST | `/v1/wallets/{id}/asset-consistency` | 资产一致性校验：快照核对 + 状态根（`at_seq`/`expected_head`） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/unfreeze` | 解除单个资产冻结 `{"reason"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}/security-state` | 查询资产安全状态 `{wallet_id,asset_id,state,reason}` |
@@ -863,6 +864,49 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 查询不写文件、不触发审批懒过期、不新增审计事件，不改变余额或 version；
 钱包与资产冻结期间仍可查询；重启及合法灾备恢复后同一边界结果一致。
 响应与日志不含私钥、份额或单份额签名。
+
+#### 资产一致性校验（快照核对 + 状态根）
+
+`POST /v1/wallets/{id}/asset-consistency?at_seq=N[&expected_head=H]`
+只接受 POST（其他方法一律 `405`）。请求体恰为
+`{"assets":[{"asset_id","balance","version"},...]}`：`assets` 可空；
+`asset_id` 沿用安全标识规则且不得重复；`balance`/`version` 为非布尔
+非负整数；键集错误、`asset_id` 重复或请求体形状错误（非对象、缺键/
+夹带、非法 JSON、空体）一律 `400`。
+
+服务端按边界重建每个资产最后落账记录（与资产清单同一重放路径），
+与快照比对后返回 `200`
+`{wallet_id,at_seq,head,state_root,matched,missing,mismatched,unexpected}`：
+
+- `state_root`：按 `asset_id` ASCII 升序排列的固定字段
+  `asset_id,balance,version` 实际记录数组，经紧凑 UTF-8 JSON（无
+  空白、非 ASCII 不转义）计算的 SHA-256 小写十六进制；
+- `missing`：实际有而快照缺失的资产，只含标识，按标识升序；
+- `unexpected`：快照有而实际没有的资产，回显快照提交的三字段记录，
+  按标识升序；
+- `mismatched`：两边都有但数值不符的资产，同时给出期望（快照）与
+  实际的 `balance`、`version`，按标识升序；
+- `matched`：`missing`/`mismatched`/`unexpected` 三者全空时为
+  `true`，否则 `false`。
+
+`at_seq`/`expected_head` 沿用资产清单语义：`at_seq` 缺省取本次校验
+的一致审计尾序号，显式 `0` 表示空前缀（`head` 为 64 个零、实际记录
+为空）；`expected_head` 只能随显式 `at_seq` 提供，须为 64 位小写
+十六进制且与该边界 `head` 一致。
+
+错误次序：钱包不存在 `404` 优先于一切请求校验；其后为重复查询参数
+（`400` `duplicate query parameters`）→ `at_seq` 非法（`400`
+`invalid at_seq`）→ `expected_head` 缺 `at_seq` 或格式非法（`400`
+`invalid expected_head`）→ 请求体形状/键集/`asset_id` 重复（`400`）
+→ 边界越尾 `404` `at_seq beyond the audit tail` → `expected_head`
+不符 `409` `expected_head does not match chain head`。校验在既有
+恢复检查（`_heal_wallet`）之后、每钱包事务锁内读取一致现场，先做与
+audit-evidence 同一套 DKG 重放对账与整条摘要链完整性校验：审计链、
+账本或恢复现场损坏及读取失败统一 `503`
+`service temporarily unavailable`，保留现场、不返回部分结果。报告
+纯只读：不写文件、不触发审批懒过期、不新增审计事件，不改变余额或
+version；钱包与资产冻结期间仍可校验；重启及合法灾备恢复后同一边界
+结果一致。响应与日志不含私钥、份额或单份额签名。
 
 ### 跨链资产确认（可选）
 

@@ -39,6 +39,7 @@
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
 - GET  /v1/wallets/<wallet_id>/assets                      钱包级资产清单分页查询（at_seq/expected_head/limit/after）
+- POST /v1/wallets/<wallet_id>/asset-consistency           资产一致性校验（快照核对+状态根，at_seq/expected_head）
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本（可带 at_seq/expected_head 读历史状态）
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>/security-state 查询资产安全状态
 - POST /v1/wallets/<wallet_id>/assets/<asset_id>/freeze   应急冻结单个资产
@@ -178,6 +179,32 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             if not isinstance(body, dict):
                 raise ServiceError(400, "request body must be a JSON object")
             return body
+
+        def _read_json_body_deferred(self):
+            """读取请求体并尝试解析为 JSON，但不立即报形状/解析错误。
+
+            供"钱包 404 优先于请求体校验"的路由（asset-consistency）
+            使用：返回 ``(body, None)`` 或 ``(None, 400 文案)``，由
+            service 在钱包存在性检查之后抛出延迟的 400。空体、非法
+            JSON 与 _read_json_body 同文案；Content-Length 非法与
+            超长仍在传输层立即报（400/413）。
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                raise ServiceError(400, "invalid Content-Length")
+            if length < 0:
+                raise ServiceError(400, "invalid Content-Length")
+            if length > _MAX_BODY_BYTES:
+                raise ServiceError(413, "request body too large")
+            if length == 0:
+                return None, "request body is required"
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None, "request body must be valid JSON"
+            return body, None
 
         def _read_empty_body(self) -> None:
             """读取并校验空体 POST（如 settle）：请求体必须零字节；任何
@@ -379,6 +406,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     raise ServiceError(405, "method not allowed")
                 if self._is_share_rotation_cancel_path(rest):
                     # 轮换撤销只接受 POST：其他方法一律 405
+                    raise ServiceError(405, "method not allowed")
+                if self._is_asset_consistency_path(rest):
+                    # 资产一致性校验只接受 POST：其他方法一律 405
                     raise ServiceError(405, "method not allowed")
                 if rest == ["audit-events"]:
                     # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
@@ -877,6 +907,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(status, result)
                     return
 
+                if rest == ["asset-consistency"]:
+                    # 资产一致性校验：钱包 404 优先于请求体校验，故请求体
+                    # 在此只读取/解析，形状错误由 service 在钱包存在性
+                    # 检查之后报。at_seq/expected_head 沿用资产清单语义，
+                    # 以 keep_blank_values 解析使空值（?at_seq= 等）落到
+                    # service 的 400，而不是被 parse_qs 默认丢弃后误按
+                    # 缺省处理。
+                    body, body_error = self._read_json_body_deferred()
+                    asset_query = parse_qs(
+                        parsed.query, keep_blank_values=True
+                    )
+                    self._send_json(
+                        200,
+                        service.check_asset_consistency(
+                            wallet_id,
+                            body,
+                            asset_query.get("at_seq"),
+                            asset_query.get("expected_head"),
+                            body_error,
+                        ),
+                    )
+                    return
+
                 if (
                     len(rest) == 3
                     and rest[0] == "asset-operations"
@@ -1240,6 +1293,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     if rest == ["audit-evidence"]:
                         # audit-evidence 只接受 GET
                         raise ServiceError(405, "method not allowed")
+                    if self._is_asset_consistency_path(rest):
+                        # asset-consistency 只接受 POST
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(
@@ -1380,7 +1436,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         def do_HEAD(self) -> None:  # noqa: N802
             # HEAD 语义不返回响应体：audit-integrity / audit-evidence 与
-            # 会话/轮换 cancel 路径上仅给 405 状态头。
+            # 会话/轮换 cancel、asset-consistency 路径上仅给 405 状态头。
             self._compact_response = False
             path = urlparse(self.path).path
             matched = self._split_wallet_path(path)
@@ -1390,13 +1446,13 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     ["audit-integrity"],
                     ["audit-evidence"],
                 )
-                or self._is_cancel_path(matched[1])
+                or self._is_post_only_path(matched[1])
             ):
                 self.send_response(405)
                 self.send_header(
                     "Allow",
                     "POST"
-                    if self._is_cancel_path(matched[1])
+                    if self._is_post_only_path(matched[1])
                     else "GET",
                 )
                 self.send_header("Content-Length", "0")
@@ -1406,8 +1462,8 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         def _reject_unsupported_method(self) -> None:
             """audit-integrity / audit-evidence 资源与签名会话/份额轮换
-            cancel 路径上的 DELETE/PATCH/OPTIONS/HEAD 一律抛
-            ServiceError(405)；其余路径保持 404。"""
+            cancel、asset-consistency 路径上的 DELETE/PATCH/OPTIONS/HEAD
+            一律抛 ServiceError(405)；其余路径保持 404。"""
             self._compact_response = False
             try:
                 path = urlparse(self.path).path
@@ -1418,7 +1474,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         ["audit-integrity"],
                         ["audit-evidence"],
                     )
-                    or self._is_cancel_path(matched[1])
+                    or self._is_post_only_path(matched[1])
                 ):
                     raise ServiceError(405, "method not allowed")
                 self._send_error(404, "not found")
@@ -1461,6 +1517,18 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             return cls._is_sign_session_cancel_path(
                 rest
             ) or cls._is_share_rotation_cancel_path(rest)
+
+        @staticmethod
+        def _is_asset_consistency_path(rest) -> bool:
+            """rest 是否为 asset-consistency（仅接受 POST）。"""
+            return rest == ["asset-consistency"]
+
+        @classmethod
+        def _is_post_only_path(cls, rest) -> bool:
+            """rest 是否为仅接受 POST 的路径（撤销/资产一致性校验）。"""
+            return cls._is_cancel_path(
+                rest
+            ) or cls._is_asset_consistency_path(rest)
 
         @staticmethod
         def _split_dkg_path(path: str):
