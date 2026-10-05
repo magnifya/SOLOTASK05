@@ -37,6 +37,7 @@
 - GET  /v1/wallets/<wallet_id>/asset-operations/<id>       查询资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
+- POST /v1/wallets/<wallet_id>/asset-transfers             原子资产转账（六键请求体表）
 - GET  /v1/wallets/<wallet_id>/assets                      钱包级资产清单分页查询（at_seq/expected_head/limit/after）
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本（可带 at_seq/expected_head 读历史状态）
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>/security-state 查询资产安全状态
@@ -842,6 +843,36 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("operation_id"),
                         body.get("asset_id"),
                         body.get("delta"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["asset-transfers"]:
+                    body = self._read_json_body()
+                    # 请求体仅允许 transfer_id/from_asset_id/to_asset_id/
+                    # amount/expected_from_version/expected_to_version 六键
+                    if set(body) != {
+                        "transfer_id",
+                        "from_asset_id",
+                        "to_asset_id",
+                        "amount",
+                        "expected_from_version",
+                        "expected_to_version",
+                    }:
+                        raise ServiceError(
+                            400,
+                            "body must contain exactly transfer_id, "
+                            "from_asset_id, to_asset_id, amount, "
+                            "expected_from_version and expected_to_version",
+                        )
+                    status, result = service.create_asset_transfer(
+                        wallet_id,
+                        body.get("transfer_id"),
+                        body.get("from_asset_id"),
+                        body.get("to_asset_id"),
+                        body.get("amount"),
+                        body.get("expected_from_version"),
+                        body.get("expected_to_version"),
                     )
                     self._send_json(status, result)
                     return

@@ -153,6 +153,10 @@ TYPE_ASSET_OPERATION_COMMITTED = "asset_operation_committed"
 #: 撤销未落账的 pending 资产操作（唯一提交点；request_id 为 cancel_id、
 #: actor_id 为 approval_request_id，details 即 cancelled 操作视图）
 TYPE_ASSET_OPERATION_CANCELLED = "asset_operation_cancelled"
+#: 原子资产转账（唯一提交点；request_id 为 transfer_id，details 即转账
+#: 视图 {transfer_id,from_asset_id,to_asset_id,amount,state,from_balance,
+#: from_version,to_balance,to_version}）：一条事件同时落账来源与目标
+TYPE_ASSET_TRANSFER_COMMITTED = "asset_transfer_committed"
 TYPE_TRANSACTION_POLICY_UPDATED = "transaction_policy_updated"
 TYPE_SESSION_EVENT = "session_event"
 TYPE_SESSION_PARTICIPANT_REPLACED = "session_participant_replaced"

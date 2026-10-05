@@ -468,6 +468,10 @@ class WalletService:
             # 双向对账：撤销事件是撤销的唯一提交点，与 cancelled 操作
             # 一一对应、details 即 cancelled 视图。
             self._reconcile_asset_cancelled_events(wallet_id)
+            # 账本 transfers ↔ asset_transfer_committed 事件同样双向
+            # 对账：转账事件是转账落账的唯一提交点，与账本转账记录一一
+            # 对应、details 即转账视图。
+            self._reconcile_asset_transfer_events(wallet_id)
             # 资产冻结事件绑定的每个资产都必须在账本中有已提交操作：
             # 冻结入口只对有已提交余额的资产开放，引用无已提交操作资产
             # 的冻结事件是不可对账现场。须排在账本语义校验之后。
@@ -662,6 +666,9 @@ class WalletService:
             if self._store.asset_ledger_file_exists(wallet_id):
                 self._reconcile_asset_committed_events(wallet_id)
                 self._reconcile_asset_cancelled_events(wallet_id)
+                # 账本 transfers ↔ asset_transfer_committed 事件同属账本
+                # 一致性：账本存在时一并双向对账，矛盾即 fail-closed。
+                self._reconcile_asset_transfer_events(wallet_id)
                 # 资产冻结事件与账本交叉对账：每条冻结事件绑定的资产都
                 # 必须有已提交操作（仅在账本文件存在时需要，资产冻结事件
                 # 只可能随已提交操作出现）。
@@ -1305,6 +1312,10 @@ class WalletService:
             for record in ledger["operations"].values()
             if record.get("state") == "committed"
         }
+        # 已落账转账同样构成资产的已提交现场（目标资产可由转账新建）
+        for record in ledger["transfers"].values():
+            committed_assets.add(record["from_asset_id"])
+            committed_assets.add(record["to_asset_id"])
         for asset_id in self._asset_freeze_events_strict(wallet_id):
             if asset_id not in committed_assets:
                 raise RecoveryError(
@@ -1315,14 +1326,21 @@ class WalletService:
     def _asset_has_committed_ops(
         self, wallet_id: str, asset_id: str
     ) -> bool:
-        """该资产是否已有已提交（committed）操作。资产冻结入口与
+        """该资产是否已有已提交（committed）落账。资产冻结入口与
         security-state 仅对有已提交余额的资产开放（pending/cancelled
-        不构成资产现场）。调用方须持钱包事务锁。"""
+        不构成资产现场；已落账转账的来源/目标侧均构成资产现场）。
+        调用方须持钱包事务锁。"""
         ledger = self._store.check_asset_ledger_semantics(wallet_id)
-        return any(
+        if any(
             record.get("asset_id") == asset_id
             and record.get("state") == "committed"
             for record in ledger["operations"].values()
+        ):
+            return True
+        return any(
+            record["from_asset_id"] == asset_id
+            or record["to_asset_id"] == asset_id
+            for record in ledger["transfers"].values()
         )
 
     def _assert_dispatch_asset_active_locked(
@@ -5766,6 +5784,11 @@ class WalletService:
                     wallet_id, operation_id, intent
                 )
                 continue
+            if isinstance(intent, dict) and intent.get("kind") == "transfer":
+                self._resolve_asset_transfer_intent(
+                    wallet_id, operation_id, intent
+                )
+                continue
             if isinstance(intent, dict) and "kind" in intent:
                 raise RecoveryError(
                     f"wallet {wallet_id!r} asset operation {operation_id!r} "
@@ -5950,6 +5973,113 @@ class WalletService:
                 "have no cancelled event"
             )
 
+    def _reconcile_asset_transfer_events(self, wallet_id: str) -> None:
+        """账本 transfers 与 asset_transfer_committed 事件双向对账
+        （调用方须持钱包事务锁；意图残留须已先恢复清零）。
+
+        asset_transfer_committed 是转账落账的唯一提交点：
+
+        - 每条账本转账记录必须恰有一条同 transfer_id 的事件，
+          ``details`` 与账本中的转账视图逐字段一致；
+        - 每条转账事件必须对应一条账本转账记录（有事件无记录＝事件被
+          半应用或历史被删，fail-closed）；
+        - 同一 transfer_id 出现多条转账事件＝重复提交点，fail-closed。
+
+        审计日志损坏（CorruptDataError）同样向上抛出，由调用方 fail-closed。
+        """
+        ledger = self._store.check_asset_ledger_semantics(wallet_id)
+        transfers = ledger["transfers"]
+        events = self._audit.events_by_type(
+            wallet_id, audit.TYPE_ASSET_TRANSFER_COMMITTED
+        )
+        events_by_id: dict[str, dict] = {}
+        for event in events:
+            transfer_id = event.get("request_id")
+            details = event.get("details")
+            if not isinstance(transfer_id, str):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has an asset_transfer_committed "
+                    "event without a transfer id"
+                )
+            if transfer_id in events_by_id:
+                # 重复提交点：绝不任取一条
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has multiple transfer events for "
+                    f"transfer {transfer_id!r}"
+                )
+            if (
+                not self._transfer_details_shape_ok(details)
+                or details.get("transfer_id") != transfer_id
+            ):
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} transfer event for "
+                    f"{transfer_id!r} is malformed"
+                )
+            events_by_id[transfer_id] = event
+            record = transfers.get(transfer_id)
+            if record is None:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} has a transfer event for "
+                    f"{transfer_id!r} but no ledger transfer"
+                )
+            if details != record:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} transfer event for "
+                    f"{transfer_id!r} does not match the ledger record"
+                )
+        if set(transfers) != set(events_by_id):
+            missing = sorted(set(transfers) - set(events_by_id))
+            raise RecoveryError(
+                f"wallet {wallet_id!r} transfers {missing!r} have no "
+                "transfer event"
+            )
+
+    @staticmethod
+    def _transfer_details_shape_ok(details: object) -> bool:
+        """转账事件 details（转账视图）形状：恰含九键，from/to 为相异
+        字符串，amount 为非布尔正整数，state 恒 committed，两侧
+        balance/version 为非布尔整数。形状矛盾属不可对账现场（503），
+        绝不任取或跳过。"""
+        if not isinstance(details, dict) or set(details) != {
+            "transfer_id",
+            "from_asset_id",
+            "to_asset_id",
+            "amount",
+            "state",
+            "from_balance",
+            "from_version",
+            "to_balance",
+            "to_version",
+        }:
+            return False
+        if not isinstance(details["transfer_id"], str):
+            return False
+        if not isinstance(details["from_asset_id"], str) or not isinstance(
+            details["to_asset_id"], str
+        ):
+            return False
+        if details["from_asset_id"] == details["to_asset_id"]:
+            return False
+        if (
+            not isinstance(details["amount"], int)
+            or isinstance(details["amount"], bool)
+            or details["amount"] <= 0
+        ):
+            return False
+        if details["state"] != "committed":
+            return False
+        for key in (
+            "from_balance",
+            "from_version",
+            "to_balance",
+            "to_version",
+        ):
+            if not isinstance(details[key], int) or isinstance(
+                details[key], bool
+            ):
+                return False
+        return True
+
     def _resolve_asset_cancel_intent(
         self, wallet_id: str, operation_id: str, intent: object
     ) -> None:
@@ -6002,6 +6132,72 @@ class WalletService:
             old_asset if isinstance(old_asset, dict) else None,
         )
         self._store.delete_asset_cancel_intent(wallet_id, operation_id)
+
+    def _resolve_asset_transfer_intent(
+        self, wallet_id: str, transfer_id: str, intent: object
+    ) -> None:
+        """对账单条转账意图：事件在则前滚为 committed，否则回滚到转账前
+        两侧资产现场。调用方须持钱包事务锁。恢复本身不记任何审计事件。
+
+        无论转账事件是否已落盘，损坏/非对象/缺少恢复所需标识与整数的
+        意图都无法安全对账：先 fail-closed 并保留意图现场原样，绝不借
+        "事件在即可前滚"之名把损坏意图删除或继续提交/回滚/清理。
+        """
+        if not self._store.valid_asset_transfer_intent(transfer_id, intent):
+            raise RecoveryError(
+                f"wallet {wallet_id!r} asset transfer {transfer_id!r} "
+                "intent is missing or malformed and cannot be reconciled"
+            )
+        record = intent["record"]
+        from_asset_id = intent["from_asset_id"]
+        to_asset_id = intent["to_asset_id"]
+        event = self._audit.find_event_by_request(
+            wallet_id,
+            audit.TYPE_ASSET_TRANSFER_COMMITTED,
+            transfer_id,
+        )
+        if event is not None:
+            # 唯一提交点已落盘：严格核对事件就是本意图的转账事件
+            # （details 即转账视图），再按事件绝对值补齐账本（两侧资产
+            # 条目一并前滚，绝不只恢复一边），绝不重复记事件。
+            if event.get("details") != record:
+                raise RecoveryError(
+                    f"wallet {wallet_id!r} asset transfer {transfer_id!r} "
+                    "intent does not match its transfer event"
+                )
+            self._store.commit_asset_transfer(
+                wallet_id,
+                transfer_id,
+                record,
+                from_asset_id,
+                {
+                    "balance": record["from_balance"],
+                    "version": record["from_version"],
+                },
+                to_asset_id,
+                {
+                    "balance": record["to_balance"],
+                    "version": record["to_version"],
+                },
+            )
+            self._store.delete_asset_commit_intent(wallet_id, transfer_id)
+            return
+        # 事件未持久化：转账未生效，凭意图快照删除转账记录并原样还原
+        # 两侧资产条目（转账前不存在则删除）。事件从未分配 seq，故事件
+        # 与 seq 均无缺口，可重新转账。
+        self._store.remove_asset_transfer(
+            wallet_id,
+            transfer_id,
+            from_asset_id,
+            intent["old_from_asset"]
+            if isinstance(intent["old_from_asset"], dict)
+            else None,
+            to_asset_id,
+            intent["old_to_asset"]
+            if isinstance(intent["old_to_asset"], dict)
+            else None,
+        )
+        self._store.delete_asset_commit_intent(wallet_id, transfer_id)
 
     def _resolve_asset_commit_intent(
         self, wallet_id: str, operation_id: str, intent: object
@@ -7216,7 +7412,9 @@ class WalletService:
         （``{asset_id,balance,version}``）。``at_seq`` 提供时返回历史
         资产状态：以审计序列中 seq 不超过 ``at_seq`` 的事件为边界，
         余额/版本由边界内该资产最后一条 ``asset_operation_committed``
-        事件的 R 给出，响应仅含 ``asset_id,balance,version,at_seq,head``；
+        事件的 R 或最后一条触及该资产的 ``asset_transfer_committed``
+        事件的对应侧（来源 from_*/目标 to_*）给出，响应仅含
+        ``asset_id,balance,version,at_seq,head``；
         ``head`` 为边界事件后的摘要链头，与 audit-evidence 同一
         ``to_seq=at_seq`` 的 ``end_head`` 相同。边界可落在任意事件上，
         不要求属于所查资产；边界内该资产无已提交操作时 404，绝不以
@@ -7298,20 +7496,38 @@ class WalletService:
                 head = evidence["end_head"]
                 committed = None
                 for event in evidence["events"]:
-                    if event.get("type") != (
-                        audit.TYPE_ASSET_OPERATION_COMMITTED
-                    ):
+                    event_type = event.get("type")
+                    if event_type == audit.TYPE_ASSET_OPERATION_COMMITTED:
+                        details = event.get("details")
+                        # 资产生效点只能是形状合法的 R：形状矛盾与
+                        # audit-evidence 不可对账同等级，绝不猜读。
+                        if not self._committed_details_shape_ok(details):
+                            raise RecoveryError(
+                                f"wallet {wallet_id!r} committed event at "
+                                f"seq {event.get('seq')!r} is malformed"
+                            )
+                        if details["asset_id"] == asset_id:
+                            committed = details
                         continue
-                    details = event.get("details")
-                    # 资产生效点只能是形状合法的 R：形状矛盾与
-                    # audit-evidence 不可对账同等级，绝不猜读。
-                    if not self._committed_details_shape_ok(details):
-                        raise RecoveryError(
-                            f"wallet {wallet_id!r} committed event at "
-                            f"seq {event.get('seq')!r} is malformed"
-                        )
-                    if details["asset_id"] == asset_id:
-                        committed = details
+                    if event_type == audit.TYPE_ASSET_TRANSFER_COMMITTED:
+                        details = event.get("details")
+                        # 转账落账点只能是形状合法的转账视图：形状矛盾
+                        # 与提交事件损坏同等级，绝不猜读。
+                        if not self._transfer_details_shape_ok(details):
+                            raise RecoveryError(
+                                f"wallet {wallet_id!r} transfer event at "
+                                f"seq {event.get('seq')!r} is malformed"
+                            )
+                        if details["from_asset_id"] == asset_id:
+                            committed = {
+                                "balance": details["from_balance"],
+                                "version": details["from_version"],
+                            }
+                        elif details["to_asset_id"] == asset_id:
+                            committed = {
+                                "balance": details["to_balance"],
+                                "version": details["to_version"],
+                            }
                 # 5) 边界前无该资产已提交操作：404，绝不以当前余额
                 #    或零余额代替
                 if committed is None:
@@ -7433,10 +7649,12 @@ class WalletService:
 
         返回 ``{wallet_id,at_seq,head,assets,next_after}``：assets 每项
         仅含 ``asset_id,balance,version``，按 asset_id 的 ASCII 序升序；
-        只列出边界内已有已提交操作的资产（余额归零仍保留，只有
-        pending/cancelled 操作的资产不出现），同一资产不重复，余额与
-        版本取边界内该资产最后一条 ``asset_operation_committed`` 事件的
-        R——与同一边界的单资产历史查询一致。
+        只列出边界内已有已提交落账（已提交操作或已落账转账的任一側）的
+        资产（余额归零仍保留，只有 pending/cancelled 操作的资产不出现），
+        同一资产不重复，余额与版本取边界内该资产最后一条
+        ``asset_operation_committed`` 事件的 R 或最后一条触及该资产的
+        ``asset_transfer_committed`` 事件的对应侧——与同一边界的单资产
+        历史查询一致。
 
         ``at_seq`` 缺省取本次查询的一致审计尾序号；显式给定时接受
         ASCII 数字组成的非负整数（0 表示空前缀：assets 为空、head 为
@@ -7557,19 +7775,37 @@ class WalletService:
                     )
                     head = evidence["end_head"]
                     for event in evidence["events"]:
-                        if event.get("type") != (
+                        event_type = event.get("type")
+                        if event_type == (
                             audit.TYPE_ASSET_OPERATION_COMMITTED
                         ):
+                            details = event.get("details")
+                            # 资产生效点只能是形状合法的 R：形状矛盾与
+                            # audit-evidence 不可对账同等级，绝不猜读。
+                            if not self._committed_details_shape_ok(details):
+                                raise RecoveryError(
+                                    f"wallet {wallet_id!r} committed event at "
+                                    f"seq {event.get('seq')!r} is malformed"
+                                )
+                            committed_by_asset[details["asset_id"]] = details
                             continue
-                        details = event.get("details")
-                        # 资产生效点只能是形状合法的 R：形状矛盾与
-                        # audit-evidence 不可对账同等级，绝不猜读。
-                        if not self._committed_details_shape_ok(details):
-                            raise RecoveryError(
-                                f"wallet {wallet_id!r} committed event at "
-                                f"seq {event.get('seq')!r} is malformed"
-                            )
-                        committed_by_asset[details["asset_id"]] = details
+                        if event_type == audit.TYPE_ASSET_TRANSFER_COMMITTED:
+                            details = event.get("details")
+                            # 转账落账点只能是形状合法的转账视图：一条
+                            # 事件同时落账来源与目标两侧。
+                            if not self._transfer_details_shape_ok(details):
+                                raise RecoveryError(
+                                    f"wallet {wallet_id!r} transfer event at "
+                                    f"seq {event.get('seq')!r} is malformed"
+                                )
+                            committed_by_asset[details["from_asset_id"]] = {
+                                "balance": details["from_balance"],
+                                "version": details["from_version"],
+                            }
+                            committed_by_asset[details["to_asset_id"]] = {
+                                "balance": details["to_balance"],
+                                "version": details["to_version"],
+                            }
                 # 8) expected_head 与边界 head 不符：409（后于边界
                 #    404；空钱包、零边界与空页同样校验摘要）
                 if expected_head is not None and expected_head != head:
@@ -7694,6 +7930,301 @@ class WalletService:
             raise
         except ValueError:
             raise ServiceError(400, "invalid wallet_id")
+
+    # ---- 原子资产转账 -----------------------------------------------------
+
+    @staticmethod
+    def _validate_transfer_id(transfer_id: object) -> None:
+        if not isinstance(transfer_id, str) or not ROTATION_ID_RE.match(
+            transfer_id
+        ):
+            raise ServiceError(
+                400, "transfer_id must match [A-Za-z0-9_-]{1,128}"
+            )
+
+    @staticmethod
+    def _validate_transfer_asset_id(value: object, name: str) -> None:
+        if not isinstance(value, str) or not ROTATION_ID_RE.match(value):
+            raise ServiceError(
+                400, f"{name} must match [A-Za-z0-9_-]{{1,128}}"
+            )
+
+    @staticmethod
+    def _validate_transfer_amount(amount: object) -> None:
+        # bool 是 int 的子类，必须先排除；转账金额必须为正整数
+        if (
+            not isinstance(amount, int)
+            or isinstance(amount, bool)
+            or amount <= 0
+        ):
+            raise ServiceError(400, "amount must be a positive integer")
+
+    @staticmethod
+    def _validate_transfer_expected_version(value: object, name: str) -> None:
+        # bool 是 int 的子类，必须先排除；0 表示资产尚无提交版本
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ServiceError(
+                400, f"{name} must be a non-negative integer"
+            )
+
+    def create_asset_transfer(
+        self,
+        wallet_id: str,
+        transfer_id: object,
+        from_asset_id: object,
+        to_asset_id: object,
+        amount: object,
+        expected_from_version: object,
+        expected_to_version: object,
+    ) -> tuple[int, dict]:
+        """POST /v1/wallets/<id>/asset-transfers：原子地把 amount 从
+        from_asset 转到 to_asset（可恢复事务）。返回 (状态码, 转账视图)。
+
+        一次请求同时落账两侧：来源 -amount、目标 +amount，两个 version
+        各加一，状态恒为 committed；目标资产可由此新建。成功只追加一条
+        asset_transfer_committed 审计事件（request_id=transfer_id、
+        details 即转账视图）作为唯一提交点，at_seq 历史、资产清单、审计
+        筛选与 backup/restore 按该序号同时反映两项变化。
+
+        事务顺序（全部在每钱包跨进程事务锁内）::
+
+            1. 写转账意图（记录转账视图与提交前两侧资产快照）
+            2. 原子提交账本：转账记录与两个资产条目同文件一次写入
+            3. 追加唯一的 asset_transfer_committed 事件
+            4. 删除转账意图
+
+        崩溃恢复以事件是否落盘为准：事件在则前滚补齐两侧，事件不在则
+        整体回滚到转账前现场，绝不只恢复一边。
+
+        校验次序（全部在锁内，失败均零副作用）：钱包存在 404 → 六字段
+        形状 400（from==to、amount 非正/布尔、版本布尔/负数一律 400）→
+        同 transfer_id 重放（同参 200 原视图、不重新校验现场；异参 409
+        transfer conflict）→ 钱包或任一资产冻结 409 → 交易策略白名单/
+        max_delta 409 → 两侧 expected version 同时比对 409
+        "asset version conflict" → 来源不存在或余额不足 409
+        "insufficient balance"。并发、重启及灾备恢复后结果与序号一致。
+        """
+        record: dict | None = None
+        try:
+            with self._wallet_lock(wallet_id):
+                # 快照前先自愈他进程崩溃遗留的提交意图，余额/version 才准确
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：存在性先于六字段校验
+                self._get_wallet_or_404(wallet_id)
+                self._validate_transfer_id(transfer_id)
+                self._validate_transfer_asset_id(
+                    from_asset_id, "from_asset_id"
+                )
+                self._validate_transfer_asset_id(to_asset_id, "to_asset_id")
+                if from_asset_id == to_asset_id:
+                    raise ServiceError(
+                        400, "from_asset_id and to_asset_id must differ"
+                    )
+                self._validate_transfer_amount(amount)
+                self._validate_transfer_expected_version(
+                    expected_from_version, "expected_from_version"
+                )
+                self._validate_transfer_expected_version(
+                    expected_to_version, "expected_to_version"
+                )
+                # 幂等重放：同 transfer_id 同参（资产对与金额；乐观版本
+                # 是现场校验而非转账身份）返回账本中的原视图，不重新校验
+                # 冻结/策略/版本/余额现场，不重复改账、不记事件；异参
+                # 409 且零副作用。
+                existing = self._store.get_asset_transfer(
+                    wallet_id, transfer_id
+                )
+                if existing is not None:
+                    if (
+                        existing.get("from_asset_id") != from_asset_id
+                        or existing.get("to_asset_id") != to_asset_id
+                        or existing.get("amount") != amount
+                    ):
+                        raise ServiceError(409, "transfer conflict")
+                    return 200, existing
+                # 冻结闸门：钱包或任一资产 frozen 一律 409 且零副作用
+                # （不改账、不记事件、不写意图）。
+                if (
+                    self._security_state_locked(wallet_id)["state"]
+                    == WALLET_STATE_FROZEN
+                ):
+                    raise ServiceError(409, "wallet or asset frozen")
+                self._reconcile_asset_freeze_ledger(wallet_id)
+                asset_states = self._asset_security_states_locked(wallet_id)
+                for asset_id in (from_asset_id, to_asset_id):
+                    asset_state = asset_states.get(asset_id)
+                    if (
+                        asset_state is not None
+                        and asset_state["state"] == ASSET_STATE_FROZEN
+                    ):
+                        raise ServiceError(409, "wallet or asset frozen")
+                # 交易策略：白名单须同时含来源与目标资产，amount 不得超过
+                # max_delta；违反 409 且零副作用（hot/cold 语义不变）。
+                policy = self._store.get_transaction_policy(wallet_id)
+                if policy is not None:
+                    if (
+                        from_asset_id not in policy["allowed_assets"]
+                        or to_asset_id not in policy["allowed_assets"]
+                        or amount > policy["max_delta"]
+                    ):
+                        raise ServiceError(
+                            409, "transaction policy violation"
+                        )
+                # 乐观版本：按锁内当前账本同时校验两侧版本（无条目按 0），
+                # 任一不一致 409 且零副作用，可用新版本重试。
+                from_asset = self._store.get_asset(wallet_id, from_asset_id)
+                to_asset = self._store.get_asset(wallet_id, to_asset_id)
+                from_version = (
+                    from_asset["version"] if from_asset is not None else 0
+                )
+                to_version = (
+                    to_asset["version"] if to_asset is not None else 0
+                )
+                if (
+                    from_version != expected_from_version
+                    or to_version != expected_to_version
+                ):
+                    raise ServiceError(409, "asset version conflict")
+                # 来源必须存在且余额充足；目标允许新建（version 0 起）。
+                from_balance = (
+                    from_asset["balance"] if from_asset is not None else 0
+                )
+                if from_asset is None or from_balance < amount:
+                    raise ServiceError(409, "insufficient balance")
+                record = self._commit_asset_transfer_locked(
+                    wallet_id,
+                    transfer_id,
+                    from_asset_id,
+                    to_asset_id,
+                    amount,
+                    from_asset,
+                    to_asset,
+                )
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+        return 201, record
+
+    def _commit_asset_transfer_locked(
+        self,
+        wallet_id: str,
+        transfer_id: str,
+        from_asset_id: str,
+        to_asset_id: str,
+        amount: int,
+        from_asset: Optional[dict],
+        to_asset: Optional[dict],
+    ) -> dict:
+        """在每钱包事务锁内落账一条资产转账，返回 committed 转账视图。
+
+        调用方须已持锁、已 heal、已通过全部前置校验（冻结/策略/版本/
+        余额）。事务顺序：
+
+            1. 写转账意图（记录转账视图与提交前两侧资产快照）
+            2. 原子提交账本：转账记录与来源/目标资产条目同文件一次写入
+            3. 追加唯一的 asset_transfer_committed 事件（唯一提交点）
+            4. 删除转账意图
+
+        崩溃恢复以事件是否落盘为准：事件在则前滚补齐两侧，事件不在则
+        整体回滚到转账前现场（转账记录删除、两侧资产还原），绝不只
+        恢复一边。
+        """
+        old_from_balance = (
+            from_asset["balance"] if from_asset is not None else 0
+        )
+        old_from_version = (
+            from_asset["version"] if from_asset is not None else 0
+        )
+        old_to_balance = to_asset["balance"] if to_asset is not None else 0
+        old_to_version = to_asset["version"] if to_asset is not None else 0
+        record = {
+            "transfer_id": transfer_id,
+            "from_asset_id": from_asset_id,
+            "to_asset_id": to_asset_id,
+            "amount": amount,
+            "state": "committed",
+            "from_balance": old_from_balance - amount,
+            "from_version": old_from_version + 1,
+            "to_balance": old_to_balance + amount,
+            "to_version": old_to_version + 1,
+        }
+        from_entry = {
+            "balance": record["from_balance"],
+            "version": record["from_version"],
+        }
+        to_entry = {
+            "balance": record["to_balance"],
+            "version": record["to_version"],
+        }
+        # 意图只含标识与整数，不含任何私钥材料
+        intent = {
+            "kind": "transfer",
+            "transfer_id": transfer_id,
+            "from_asset_id": from_asset_id,
+            "to_asset_id": to_asset_id,
+            "amount": amount,
+            "old_from_asset": from_asset,
+            "old_to_asset": to_asset,
+            "record": record,
+        }
+        try:
+            self._store.write_asset_commit_intent(
+                wallet_id, transfer_id, intent
+            )
+            self._store.commit_asset_transfer(
+                wallet_id,
+                transfer_id,
+                record,
+                from_asset_id,
+                from_entry,
+                to_asset_id,
+                to_entry,
+            )
+            self._emit(
+                wallet_id,
+                self._audit_event(
+                    audit.TYPE_ASSET_TRANSFER_COMMITTED,
+                    request_id=transfer_id,
+                    details=record,
+                ),
+            )
+        except BaseException:
+            # 与单资产提交同构：事件真正落盘（如落盘成功但返回阶段报错）
+            # 则前滚为唯一 committed 转账，绝不重复记事件；否则整体回滚
+            # 到转账前现场。事件从未分配 seq，故无事件、无 seq 缺口。
+            landed = self._audit.find_event_by_request(
+                wallet_id,
+                audit.TYPE_ASSET_TRANSFER_COMMITTED,
+                transfer_id,
+            )
+            if landed is not None and landed.get("details") == record:
+                self._store.commit_asset_transfer(
+                    wallet_id,
+                    transfer_id,
+                    record,
+                    from_asset_id,
+                    from_entry,
+                    to_asset_id,
+                    to_entry,
+                )
+                self._store.delete_asset_commit_intent(
+                    wallet_id, transfer_id
+                )
+                return record
+            self._store.remove_asset_transfer(
+                wallet_id,
+                transfer_id,
+                from_asset_id,
+                from_asset,
+                to_asset_id,
+                to_asset,
+            )
+            self._store.delete_asset_commit_intent(wallet_id, transfer_id)
+            raise
+        self._store.delete_asset_commit_intent(wallet_id, transfer_id)
+        return record
 
     # ---- 跨链资产确认 -----------------------------------------------------
 

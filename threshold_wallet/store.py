@@ -16,13 +16,14 @@
     audit/<wallet_id>.json          该钱包的审计事件日志（seq 从 1 起仅追加，
                                     由 audit.AuditStore 维护）
     assets/<wallet_id>.json         该钱包的资产账本：asset-operations（操作
-                                    状态机 pending/committed）与 assets（每个
-                                    资产的 balance/version），同一文件原子写入
+                                    状态机 pending/committed）、transfers（已
+                                    落账的原子资产转账）与 assets（每个资产的
+                                    balance/version），同一文件原子写入
     asset-intents/<wallet_id>/<operation_id>.json
-                                    资产提交的"提交意图"（可恢复事务日志）：
-                                    仅在 commit 事务窗口内存在，提交完成即删；
+                                    资产提交/撤销/转账的"提交意图"（可恢复
+                                    事务日志）：仅在事务窗口内存在，完成即删；
                                     崩溃后启动恢复据此判定提交是否已落事件，
-                                    决定补齐账本或回滚为 pending
+                                    决定补齐账本或回滚为提交前现场
     transaction-policies/<wallet_id>.json
                                     该钱包的冷热钱包交易策略
                                     （mode/max_delta/allowed_assets），
@@ -286,6 +287,59 @@ def _asset_operation_shape_ok(key: str, record: object) -> bool:
         ):
             return False
     return True
+
+
+#: 转账视图（即 asset_transfer_committed 事件的 details 与账本 transfers
+#: 条目）的恰含键集
+_ASSET_TRANSFER_KEYS = frozenset(
+    (
+        "transfer_id",
+        "from_asset_id",
+        "to_asset_id",
+        "amount",
+        "state",
+        "from_balance",
+        "from_version",
+        "to_balance",
+        "to_version",
+    )
+)
+
+
+def _asset_transfer_shape_ok(transfer_id: str, record: object) -> bool:
+    """转账条目形状：恰含转账视图九键，transfer_id 与键名一致，来源/目标
+    为不同的安全标识，amount 为非布尔正整数，state 恒为 committed，
+    两侧 balance/version 均为非布尔整数（version 至少为 1：转账落账即
+    占一个提交版本）。"""
+    if not isinstance(record, dict):
+        return False
+    if set(record) != _ASSET_TRANSFER_KEYS:
+        return False
+    if (
+        not _valid_safe_id(record.get("transfer_id"))
+        or record["transfer_id"] != transfer_id
+    ):
+        return False
+    from_asset_id = record.get("from_asset_id")
+    to_asset_id = record.get("to_asset_id")
+    if not _valid_safe_id(from_asset_id) or not _valid_safe_id(to_asset_id):
+        return False
+    if from_asset_id == to_asset_id:
+        return False
+    amount = record.get("amount")
+    if not _is_plain_int(amount) or amount <= 0:
+        return False
+    if record.get("state") != "committed":
+        return False
+    for key in ("from_balance", "from_version", "to_balance", "to_version"):
+        if not _is_plain_int(record.get(key)):
+            return False
+    return (
+        record["from_version"] >= 1
+        and record["to_version"] >= 1
+        and record["from_balance"] >= 0
+        and record["to_balance"] >= 0
+    )
 
 
 class DuplicateWalletError(Exception):
@@ -1023,7 +1077,12 @@ class WalletStore:
         不是对象、操作条目字段形状非法（operation_id/asset_id 合法、
         delta/balance/version 为非布尔整数、state 仅
         pending/committed/cancelled）、
-        资产条目 balance/version 不是非布尔整数。
+        资产条目 balance/version 不是非布尔整数；
+        transfers 存在时必须是对象且每条转账条目形状非法（转账视图九键、
+        来源/目标相异、amount 非布尔正整数、state 恒 committed、两侧
+        balance/version 非布尔整数）同样视为损坏。旧账本没有 transfers
+        键时按无转账处理（缺省不是损坏），返回的账本 dict 也只在磁盘
+        存在该键时才携带它（写回时原样保留）。
         """
         path = self._assets_path(wallet_id)
         ledger = self._read_json(path)
@@ -1044,6 +1103,11 @@ class WalletStore:
             raise CorruptDataError(
                 f"asset ledger {path!r} has no object-valued 'assets'"
             )
+        transfers = ledger.get("transfers")
+        if transfers is not None and not isinstance(transfers, dict):
+            raise CorruptDataError(
+                f"asset ledger {path!r} has a non-object 'transfers'"
+            )
         for operation_id, record in operations.items():
             if not _valid_safe_id(operation_id) or not (
                 _asset_operation_shape_ok(operation_id, record)
@@ -1057,7 +1121,18 @@ class WalletStore:
                 raise CorruptDataError(
                     f"asset ledger {path!r} has malformed asset {asset_id!r}"
                 )
-        return {"operations": operations, "assets": assets}
+        for transfer_id, record in (transfers or {}).items():
+            if not _valid_safe_id(transfer_id) or not (
+                _asset_transfer_shape_ok(transfer_id, record)
+            ):
+                raise CorruptDataError(
+                    f"asset ledger {path!r} has malformed transfer "
+                    f"{transfer_id!r}"
+                )
+        result = {"operations": operations, "assets": assets}
+        if transfers is not None:
+            result["transfers"] = transfers
+        return result
 
     def check_asset_ledger(self, wallet_id: str) -> None:
         """只读校验资产账本形状；损坏时抛 CorruptDataError/OSError。
@@ -1077,7 +1152,9 @@ class WalletStore:
 
         - 每条操作（pending/committed）都必须携带非布尔整数
           balance/version 快照（服务落盘的 R 恒含这两项）；
-        - 对每个资产，按 version 升序的 committed 操作必须恰为
+        - 对每个资产，按 version 升序的已提交落账条目（committed 操作，
+          以及触及该资产的转账：来源侧 delta=-amount、目标侧
+          delta=+amount，各自携带落账后的 balance/version）必须恰为
           version 1..K（不缺号、不重号、起点为 1），且余额从 0 起按
           delta 逐条累加，每个前缀余额都必须非负、与记录快照一致；
         - K>=1 时资产条目必须恰为 {balance: 末态, version: K}；
@@ -1095,6 +1172,9 @@ class WalletStore:
         ledger = self._read_asset_ledger(wallet_id)
         operations = ledger["operations"]
         assets = ledger["assets"]
+        # 旧账本可能没有 transfers 键：归一化为空转账集（仅内存视图，
+        # 不写盘），语义对账与上层对账统一按有键处理。
+        transfers = ledger.setdefault("transfers", {})
 
         asset_ids: set[str] = set()
         pending_by_asset: dict[str, list[dict]] = {}
@@ -1111,11 +1191,37 @@ class WalletStore:
                     f"{record.get('operation_id')!r} lacks a snapshot"
                 )
             if record["state"] == "committed":
-                committed_by_asset.setdefault(asset_id, []).append(record)
+                committed_by_asset.setdefault(asset_id, []).append(
+                    {
+                        "version": record["version"],
+                        "delta": record["delta"],
+                        "balance": record["balance"],
+                    }
+                )
             else:
                 # pending 与 cancelled 都从未落账：不占 version、不改余额，
                 # 二者快照都必须落在某条已提交前缀上。
                 pending_by_asset.setdefault(asset_id, []).append(record)
+
+        for record in transfers.values():
+            # 每条已提交转账同时是来源资产的 -amount 落账条目与目标资产
+            # 的 +amount 落账条目，两侧各占各自资产的一个提交版本。
+            asset_ids.add(record["from_asset_id"])
+            committed_by_asset.setdefault(record["from_asset_id"], []).append(
+                {
+                    "version": record["from_version"],
+                    "delta": -record["amount"],
+                    "balance": record["from_balance"],
+                }
+            )
+            asset_ids.add(record["to_asset_id"])
+            committed_by_asset.setdefault(record["to_asset_id"], []).append(
+                {
+                    "version": record["to_version"],
+                    "delta": record["amount"],
+                    "balance": record["to_balance"],
+                }
+            )
 
         for asset_id, entry in assets.items():
             asset_ids.add(asset_id)
@@ -1318,6 +1424,72 @@ class WalletStore:
                 ledger["assets"].pop(asset_id, None)
             else:
                 ledger["assets"][asset_id] = asset_record
+            self._atomic_write(path, ledger)
+
+    # ---- 原子资产转账（transfers）-----------------------------------------
+
+    def get_asset_transfer(
+        self, wallet_id: str, transfer_id: str
+    ) -> Optional[dict]:
+        """返回某条转账记录（即 committed 转账视图），不存在返回 None。"""
+        _check_id("transfer_id", transfer_id)
+        record = self._read_asset_ledger(wallet_id).get("transfers", {}).get(
+            transfer_id
+        )
+        return dict(record) if isinstance(record, dict) else None
+
+    def commit_asset_transfer(
+        self,
+        wallet_id: str,
+        transfer_id: str,
+        transfer_record: dict,
+        from_asset_id: str,
+        from_asset_record: dict,
+        to_asset_id: str,
+        to_asset_record: dict,
+    ) -> None:
+        """原子地落账一条资产转账：转账记录与来源/目标两个资产条目同文件
+        一次写入（调用方须持有该钱包事务锁）。"""
+        _check_id("transfer_id", transfer_id)
+        _check_id("from_asset_id", from_asset_id)
+        _check_id("to_asset_id", to_asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            ledger.setdefault("transfers", {})[transfer_id] = transfer_record
+            ledger["assets"][from_asset_id] = from_asset_record
+            ledger["assets"][to_asset_id] = to_asset_record
+            self._atomic_write(path, ledger)
+
+    def remove_asset_transfer(
+        self,
+        wallet_id: str,
+        transfer_id: str,
+        from_asset_id: str,
+        from_asset_record: Optional[dict],
+        to_asset_id: str,
+        to_asset_record: Optional[dict],
+    ) -> None:
+        """转账提交事件追加失败时回滚：删除本事务新建的转账记录并恢复
+        来源/目标资产记录（asset_record 为 None 表示事务前该资产无账本
+        记录，直接删除）。转账在事务前不存在，故回滚是删除而非还原。"""
+        _check_id("transfer_id", transfer_id)
+        _check_id("from_asset_id", from_asset_id)
+        _check_id("to_asset_id", to_asset_id)
+        path = self._assets_path(wallet_id)
+        with self._lock:
+            ledger = self._read_asset_ledger(wallet_id)
+            transfers = ledger.get("transfers")
+            if isinstance(transfers, dict):
+                transfers.pop(transfer_id, None)
+            if from_asset_record is None:
+                ledger["assets"].pop(from_asset_id, None)
+            else:
+                ledger["assets"][from_asset_id] = from_asset_record
+            if to_asset_record is None:
+                ledger["assets"].pop(to_asset_id, None)
+            else:
+                ledger["assets"][to_asset_id] = to_asset_record
             self._atomic_write(path, ledger)
 
     # ---- 资产提交意图（可恢复事务日志）-----------------------------------
@@ -1526,6 +1698,61 @@ class WalletStore:
         return (
             pending["state"] == "pending"
             and pending["asset_id"] == asset_id
+        )
+
+    @staticmethod
+    def valid_asset_transfer_intent(transfer_id: str, intent: object) -> bool:
+        """校验转账意图是否具备安全回滚/前滚所需的全部标识与整数。
+
+        正常转账写入的意图含 kind="transfer"、transfer_id、from/to
+        asset_id、amount、提交前两侧资产快照 old_from_asset/old_to_asset
+        （None 或 {balance,version}）与提交结果 record（committed 转账
+        视图）。任一字段缺失、类型错误、布尔冒整、标识不匹配或前后账目
+        不守恒（来源 -amount/version+1、目标 +amount/version+1）都判定
+        为无效：调用方必须 fail-closed（保留意图现场，不回滚/前滚/
+        清理），绝不把损坏意图当成空意图继续。
+        """
+        if not isinstance(intent, dict):
+            return False
+        if intent.get("kind") != "transfer":
+            return False
+        if intent.get("transfer_id") != transfer_id:
+            return False
+        from_asset_id = intent.get("from_asset_id")
+        to_asset_id = intent.get("to_asset_id")
+        if not _valid_safe_id(from_asset_id) or not _valid_safe_id(
+            to_asset_id
+        ):
+            return False
+        if from_asset_id == to_asset_id:
+            return False
+        amount = intent.get("amount")
+        if not _is_plain_int(amount) or amount <= 0:
+            return False
+        old_from = intent.get("old_from_asset")
+        if old_from is not None and not _asset_entry_shape_ok(old_from):
+            return False
+        old_to = intent.get("old_to_asset")
+        if old_to is not None and not _asset_entry_shape_ok(old_to):
+            return False
+        record = intent.get("record")
+        if not _asset_transfer_shape_ok(transfer_id, record):
+            return False
+        if (
+            record["from_asset_id"] != from_asset_id
+            or record["to_asset_id"] != to_asset_id
+            or record["amount"] != amount
+        ):
+            return False
+        old_from_balance = old_from["balance"] if old_from is not None else 0
+        old_from_version = old_from["version"] if old_from is not None else 0
+        old_to_balance = old_to["balance"] if old_to is not None else 0
+        old_to_version = old_to["version"] if old_to is not None else 0
+        return (
+            record["from_balance"] == old_from_balance - amount
+            and record["from_version"] == old_from_version + 1
+            and record["to_balance"] == old_to_balance + amount
+            and record["to_version"] == old_to_version + 1
         )
 
     def list_asset_intents(self, wallet_id: str) -> list[tuple[str, Optional[dict]]]:

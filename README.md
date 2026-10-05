@@ -73,6 +73,7 @@ python -m unittest discover -s tests -v
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作（可带 `{"expected_version"}` 乐观版本校验） |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
+| POST | `/v1/wallets/{id}/asset-transfers` | 原子资产转账 `{"transfer_id","from_asset_id","to_asset_id","amount","expected_from_version","expected_to_version"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
 | GET  | `/v1/wallets/{id}/assets` | 钱包级资产清单分页查询（`at_seq`/`expected_head`/`limit`/`after`） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
@@ -725,6 +726,29 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   version、审计不变（失败不写意图，也不懒落过期事件）。唯一取消事件
   已存在后，三键完全相同的重放优先返回 `200`，即使审批单随后推进为
   `signed` 也不再复查当前审批状态。冻结钱包撤销沿用 `409` 闸门。
+- `POST asset-transfers`：原子资产转账，请求体恰为六键
+  `{transfer_id,from_asset_id,to_asset_id,amount,expected_from_version,
+  expected_to_version}`。两个资产不得相同，`amount` 为非布尔正整数，
+  两个版本为非布尔非负整数（`0` 表示尚无提交版本）；非法 `400`，
+  钱包不存在 `404`。提交在钱包锁内按当前账本同时校验两个版本，来源
+  减 `amount`、目标加 `amount`、两个 `version` 各加一，目标资产可
+  新建，状态恒为 committed，成功 `201` 返回转账视图
+  `{transfer_id,from_asset_id,to_asset_id,amount,state,from_balance,
+  from_version,to_balance,to_version}`。版本冲突 `409`
+  `{"error":"asset version conflict"}`；来源不存在或余额不足 `409`
+  `{"error":"insufficient balance"}`；钱包或任一资产冻结 `409`
+  `{"error":"wallet or asset frozen"}`；交易策略白名单不含任一资产或
+  `amount` 超过 `max_delta` `409` `{"error":"transaction policy
+  violation"}`（hot/cold 语义不变）；以上失败均零副作用。同
+  `transfer_id` 同参（资产对与金额）重放 `200` 返回原视图，不重新
+  校验现场、不重复改账、不记事件；异参 `409`
+  `{"error":"transfer conflict"}`。成功只追加一条
+  `asset_transfer_committed` 审计事件（`request_id` 为 transfer_id、
+  details 即转账视图）作为唯一提交点；`at_seq` 历史、资产清单、审计
+  筛选与 backup/restore 按该序号同时反映两侧变化。转账事务可恢复
+  （意图以 `kind:"transfer"` 存于 `asset-intents/`）：崩溃按事件是否
+  落盘前滚补齐两侧或整体回滚到转账前现场，绝不只恢复一边；事件、
+  账本、摘要链或快照无法对账时统一 `503` 并拒绝就绪。
 - `GET asset-operations/{oid}`：在每钱包事务锁和恢复/对账后只读返回
   固定键序的既有操作视图，末键 `cancellation` 在未撤销时为 `null`；
   已撤销时为 `{cancel_id,approval_request_id,seq}`，`seq` 为
@@ -754,7 +778,10 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 `{asset_id,balance,version,at_seq,head}`：
 
 - `balance`/`version` 仅由边界内该资产**最后一条**
-  `asset_operation_committed` 事件的 R（`balance`/`version`）给出；
+  `asset_operation_committed` 事件的 R（`balance`/`version`）或最后
+  一条触及该资产的 `asset_transfer_committed` 事件的对应侧（来源
+  `from_balance`/`from_version`、目标 `to_balance`/`to_version`）
+  给出；
   人工提交、链上确认、多源仲裁、派发最终性结算与重组补偿五类提交点
   统一适用，每笔已提交操作只计入一次，pending、cancelled 与幂等重放
   不改变结果；不同资产分别计算余额与版本。
@@ -1431,6 +1458,8 @@ active 钱包没有 unfreeze 记录，对其 unfreeze 一律 `409`。
 `share_rotation_prepared/activated`、`asset_operation_committed`、
 `asset_operation_cancelled`（`request_id` 为 cancel_id、`actor_id` 为
 approval_request_id、details 即 cancelled 操作视图）、
+`asset_transfer_committed`（`request_id` 为 transfer_id、details 即
+转账视图，一条事件同时落账来源与目标两侧）、
 `transaction_policy_updated`、`session_event`、
 `session_participant_replaced`、`session_takeover`、`dkg_stage`、
 `dkg_failover`、`dkg_failover_policy_updated`、`node_state`、
