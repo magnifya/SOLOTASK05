@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -8176,6 +8177,276 @@ class WalletService:
         if limit < 1 or limit > cls.ASSET_LIST_MAX_LIMIT:
             raise ServiceError(400, "invalid limit")
         return limit
+
+    def check_asset_consistency(
+        self,
+        wallet_id: str,
+        body: object,
+        at_seq: object = None,
+        expected_head: object = None,
+        body_error: "ServiceError | None" = None,
+    ) -> dict:
+        """资产一致性校验（POST /v1/wallets/{id}/asset-consistency）。
+
+        托管方按 ``{"assets":[{asset_id,balance,version},...]}`` 快照
+        核对服务在审计边界 ``at_seq`` 处的资产状态，返回
+        ``{wallet_id,at_seq,head,state_root,matched,missing,
+        mismatched,unexpected}``。
+
+        请求体恰含 ``assets`` 一键；``assets`` 为数组（可空），每项恰含
+        ``asset_id,balance,version`` 三键，asset_id 沿用资产安全标识
+        规则，balance/version 为非布尔非负整数，asset_id 不得重复；
+        键集错误、形状错误或标识重复一律 400。``at_seq``/``expected_head``
+        为查询参数，沿用资产清单语义：at_seq 缺省取本次校验的一致审计
+        尾序号，0 表示空前缀；expected_head 只能随显式 at_seq 提供且
+        须为 64 位小写十六进制。
+
+        实际状态按清单同一套边界重放重建：边界内每个资产最后一条
+        ``asset_operation_committed``/``asset_transfer_committed``
+        事件的 R。``state_root`` 为按 asset_id ASCII 升序排列的固定
+        字段 asset_id/balance/version 记录数组，经紧凑 UTF-8 JSON
+        （无空白、非 ASCII 不转义）计算的 SHA-256 小写十六进制。
+        ``missing`` 为快照有而实际无的资产标识（仅标识，升序）；
+        ``unexpected`` 为实际有而快照无的资产（实际三字段记录，升序）；
+        ``mismatched`` 为两侧都有但 balance/version 不符的资产，同时
+        给出期望与实际值（升序）；三者全空时 ``matched`` 为 true。
+
+        校验次序：钱包存在性 404 优先于一切请求校验（请求体读取/解析
+        错误由 HTTP 层延迟到此之后重抛）；随后依次为重复查询参数 400
+        （duplicate query parameters）→ at_seq 非法 400 → expected_head
+        缺 at_seq/格式非法 400 → 请求体形状/键集/标识/取值/重复 400 →
+        边界越尾 404 → expected_head 不符 409。
+
+        纯只读：沿用既有恢复检查（_heal_wallet）与 audit-evidence 同一
+        套 DKG 重放对账和整条摘要链完整性校验；审计链、账本或恢复现场
+        损坏及读取失败一律上抛（HTTP 边界转 503），不返回部分结果。
+        校验不写文件、不新增审计事件、不改变余额或 version；钱包与资产
+        冻结期间仍可校验；同一 at_seq 的结果在重启或备份恢复后一致。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                # 校验前先自愈他进程崩溃遗留的提交意图，绝不基于半完成
+                # 余额/审计现场回答一致性报告。
+                self._heal_wallet(wallet_id)
+                # 钱包 404 优先于一切请求校验（含请求体与查询参数）。
+                self._get_wallet_or_404(wallet_id)
+                # 1) 重复查询参数：at_seq/expected_head 任一重复即 400
+                if isinstance(at_seq, list) and len(at_seq) > 1:
+                    raise ServiceError(400, "duplicate query parameters")
+                if (
+                    isinstance(expected_head, list)
+                    and len(expected_head) > 1
+                ):
+                    raise ServiceError(400, "duplicate query parameters")
+                if isinstance(at_seq, list):
+                    at_seq = at_seq[0]
+                # 2) at_seq：与资产清单同一规则（ASCII 数字组成的非负
+                #    整数，0 表示空前缀；空值、空白、带符号、小数、
+                #    Unicode 数字一律 400）。只做形状校验并保留归一化
+                #    文本，int 转换推迟到尾序号比较之后。
+                boundary_text = (
+                    None
+                    if at_seq is None
+                    else self._asset_list_at_seq_text(at_seq)
+                )
+                if isinstance(expected_head, list):
+                    expected_head = expected_head[0]
+                # 3) expected_head 只能随显式 at_seq 使用：缺 at_seq
+                #    或 expected_head 非 64 位小写十六进制均 400
+                if expected_head is not None:
+                    if at_seq is None:
+                        raise ServiceError(400, "invalid expected_head")
+                    if (
+                        not isinstance(expected_head, str)
+                        or not self._EXPECTED_HEAD_RE.match(expected_head)
+                    ):
+                        raise ServiceError(400, "invalid expected_head")
+                # 4) 请求体：HTTP 层读取/解析错误在此重抛（钱包 404
+                #    优先），随后校验键集与每项形状/标识/取值/重复。
+                if body_error is not None:
+                    raise body_error
+                expected_assets = self._consistency_body_assets(body)
+                # 与 audit-evidence 同一套严格 DKG 对账与摘要链完整
+                # 性校验：链元数据缺失/矛盾、事件被改动等不可对账
+                # 现场 fail-closed，绝不静默出证。
+                self._reconcile_dkg_events_locked(wallet_id)
+                tail_count = self._audit.integrity(wallet_id)[0]
+                # 5) 边界：缺省取本次校验的一致审计尾序号；显式边界
+                #    超过当前审计尾序号 404（按位数/文本比较，避免对
+                #    超长数字串做 int 转换）。
+                if boundary_text is None:
+                    boundary = tail_count
+                else:
+                    tail_text = str(tail_count)
+                    beyond_tail = (
+                        len(boundary_text) > len(tail_text)
+                        or (
+                            len(boundary_text) == len(tail_text)
+                            and boundary_text > tail_text
+                        )
+                    )
+                    if beyond_tail:
+                        raise ServiceError(
+                            404, "at_seq beyond the audit tail"
+                        )
+                    boundary = int(boundary_text)
+                # 6) 边界内逐资产取最后一条已提交事件的 R（与资产清单
+                #    同一套重放）；零边界为空前缀：head 为 64 个零、
+                #    无资产。
+                committed_by_asset: dict[str, dict] = {}
+                if boundary == 0:
+                    head = audit.GENESIS_HEAD
+                else:
+                    evidence = self._audit.range_evidence(
+                        wallet_id, 1, boundary
+                    )
+                    head = evidence["end_head"]
+                    for event in evidence["events"]:
+                        event_type = event.get("type")
+                        if event_type == (
+                            audit.TYPE_ASSET_OPERATION_COMMITTED
+                        ):
+                            details = event.get("details")
+                            # 资产生效点只能是形状合法的 R：形状矛盾与
+                            # audit-evidence 不可对账同等级，绝不猜读。
+                            if not self._committed_details_shape_ok(details):
+                                raise RecoveryError(
+                                    f"wallet {wallet_id!r} committed event at "
+                                    f"seq {event.get('seq')!r} is malformed"
+                                )
+                            committed_by_asset[details["asset_id"]] = details
+                            continue
+                        if event_type == audit.TYPE_ASSET_TRANSFER_COMMITTED:
+                            details = event.get("details")
+                            if not self._transfer_details_shape_ok(details):
+                                raise RecoveryError(
+                                    f"wallet {wallet_id!r} transfer event at "
+                                    f"seq {event.get('seq')!r} is malformed"
+                                )
+                            committed_by_asset[details["from_asset_id"]] = {
+                                "balance": details["from_balance"],
+                                "version": details["from_version"],
+                            }
+                            committed_by_asset[details["to_asset_id"]] = {
+                                "balance": details["to_balance"],
+                                "version": details["to_version"],
+                            }
+                            continue
+                # 7) expected_head 与边界 head 不符：409（后于边界
+                #    404；空钱包、零边界同样校验摘要）
+                if expected_head is not None and expected_head != head:
+                    raise ServiceError(
+                        409, "expected_head does not match chain head"
+                    )
+                # 8) 状态根：按 asset_id ASCII 升序的固定字段记录数组，
+                #    紧凑 UTF-8 JSON 的 SHA-256 小写十六进制。
+                actual_ids = sorted(committed_by_asset)
+                actual_records = [
+                    {
+                        "asset_id": aid,
+                        "balance": committed_by_asset[aid]["balance"],
+                        "version": committed_by_asset[aid]["version"],
+                    }
+                    for aid in actual_ids
+                ]
+                state_root = hashlib.sha256(
+                    json.dumps(
+                        actual_records,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                # 9) 快照比对：missing 仅标识、unexpected 为实际三字段
+                #    记录、mismatched 同时给出期望与实际值，均按标识
+                #    升序；三者全空时 matched 为 true。
+                missing = sorted(
+                    aid
+                    for aid in expected_assets
+                    if aid not in committed_by_asset
+                )
+                unexpected = [
+                    record
+                    for record in actual_records
+                    if record["asset_id"] not in expected_assets
+                ]
+                mismatched = []
+                for aid in sorted(expected_assets):
+                    actual = committed_by_asset.get(aid)
+                    if actual is None:
+                        continue
+                    expected = expected_assets[aid]
+                    if (
+                        expected["balance"] != actual["balance"]
+                        or expected["version"] != actual["version"]
+                    ):
+                        mismatched.append(
+                            {
+                                "asset_id": aid,
+                                "expected_balance": expected["balance"],
+                                "expected_version": expected["version"],
+                                "actual_balance": actual["balance"],
+                                "actual_version": actual["version"],
+                            }
+                        )
+                return {
+                    "wallet_id": wallet_id,
+                    "at_seq": boundary,
+                    "head": head,
+                    "state_root": state_root,
+                    "matched": not missing and not mismatched and not unexpected,
+                    "missing": missing,
+                    "mismatched": mismatched,
+                    "unexpected": unexpected,
+                }
+        except CorruptDataError:
+            raise
+        except ValueError:
+            raise ServiceError(400, "invalid wallet_id")
+
+    @classmethod
+    def _consistency_body_assets(cls, body: object) -> dict[str, dict]:
+        """一致性校验请求体：恰含 ``assets`` 一键，值为数组（可空）；
+        每项恰含 asset_id/balance/version 三键，asset_id 沿用资产安全
+        标识规则且不得重复，balance/version 为非布尔非负整数。任何键集
+        错误、形状错误或标识重复一律 400。返回 {asset_id: {balance,
+        version}}（校验后绝无重复键）。"""
+        if not isinstance(body, dict) or set(body) != {"assets"}:
+            raise ServiceError(400, "body must contain exactly assets")
+        assets = body["assets"]
+        if not isinstance(assets, list):
+            raise ServiceError(400, "assets must be an array")
+        expected: dict[str, dict] = {}
+        for item in assets:
+            if not isinstance(item, dict) or set(item) != {
+                "asset_id",
+                "balance",
+                "version",
+            }:
+                raise ServiceError(
+                    400,
+                    "each asset must contain exactly asset_id, balance "
+                    "and version",
+                )
+            asset_id = item["asset_id"]
+            cls._validate_asset_id(asset_id)
+            for key in ("balance", "version"):
+                value = item[key]
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                ):
+                    raise ServiceError(
+                        400, f"{key} must be a non-negative integer"
+                    )
+            if asset_id in expected:
+                raise ServiceError(400, "duplicate asset_id")
+            expected[asset_id] = {
+                "balance": item["balance"],
+                "version": item["version"],
+            }
+        return expected
 
     def get_asset_operation(
         self, wallet_id: str, operation_id: object

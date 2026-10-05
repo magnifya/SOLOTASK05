@@ -35,6 +35,7 @@
 - POST /v1/wallets/<wallet_id>/share-rotations/<id>/cancel    撤销未激活轮换
 - POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
 - POST /v1/wallets/<wallet_id>/asset-transfers             原子资产转账（创建即提交）
+- POST /v1/wallets/<wallet_id>/asset-consistency           资产一致性校验（托管方快照核对，纯只读）
 - GET  /v1/wallets/<wallet_id>/asset-operations/<id>       查询资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
@@ -379,6 +380,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     raise ServiceError(405, "method not allowed")
                 if self._is_share_rotation_cancel_path(rest):
                     # 轮换撤销只接受 POST：其他方法一律 405
+                    raise ServiceError(405, "method not allowed")
+                if rest == ["asset-consistency"]:
+                    # 资产一致性校验只接受 POST：其他方法一律 405
                     raise ServiceError(405, "method not allowed")
                 if rest == ["audit-events"]:
                     # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
@@ -877,6 +881,33 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(status, result)
                     return
 
+                if rest == ["asset-consistency"]:
+                    # 资产一致性校验（纯只读）：钱包 404 优先于一切请求
+                    # 校验，故请求体读取/解析错误不在此抛出，而是延迟到
+                    # service 判定钱包存在性之后统一重抛；at_seq/
+                    # expected_head 为查询参数，与资产清单一样以
+                    # keep_blank_values 解析，使空值（?at_seq= 等）落到
+                    # service 的 400，而不是被 parse_qs 默认丢弃后误按
+                    # 缺省处理。
+                    try:
+                        body = self._read_json_body()
+                        body_error = None
+                    except ServiceError as exc:
+                        body = None
+                        body_error = exc
+                    asset_query = parse_qs(
+                        parsed.query, keep_blank_values=True
+                    )
+                    result = service.check_asset_consistency(
+                        wallet_id,
+                        body,
+                        asset_query.get("at_seq"),
+                        asset_query.get("expected_head"),
+                        body_error,
+                    )
+                    self._send_json(200, result)
+                    return
+
                 if (
                     len(rest) == 3
                     and rest[0] == "asset-operations"
@@ -1240,6 +1271,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     if rest == ["audit-evidence"]:
                         # audit-evidence 只接受 GET
                         raise ServiceError(405, "method not allowed")
+                    if rest == ["asset-consistency"]:
+                        # 资产一致性校验只接受 POST
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(
@@ -1379,8 +1413,8 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             self._reject_unsupported_method()
 
         def do_HEAD(self) -> None:  # noqa: N802
-            # HEAD 语义不返回响应体：audit-integrity / audit-evidence 与
-            # 会话/轮换 cancel 路径上仅给 405 状态头。
+            # HEAD 语义不返回响应体：audit-integrity / audit-evidence、
+            # asset-consistency 与会话/轮换 cancel 路径上仅给 405 状态头。
             self._compact_response = False
             path = urlparse(self.path).path
             matched = self._split_wallet_path(path)
@@ -1389,15 +1423,20 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 in (
                     ["audit-integrity"],
                     ["audit-evidence"],
+                    ["asset-consistency"],
                 )
                 or self._is_cancel_path(matched[1])
             ):
                 self.send_response(405)
                 self.send_header(
                     "Allow",
-                    "POST"
-                    if self._is_cancel_path(matched[1])
-                    else "GET",
+                    "GET"
+                    if matched[1]
+                    in (
+                        ["audit-integrity"],
+                        ["audit-evidence"],
+                    )
+                    else "POST",
                 )
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -1405,9 +1444,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 self._send_error(404, "not found")
 
         def _reject_unsupported_method(self) -> None:
-            """audit-integrity / audit-evidence 资源与签名会话/份额轮换
-            cancel 路径上的 DELETE/PATCH/OPTIONS/HEAD 一律抛
-            ServiceError(405)；其余路径保持 404。"""
+            """audit-integrity / audit-evidence 资源、asset-consistency
+            与签名会话/份额轮换 cancel 路径上的 DELETE/PATCH/OPTIONS/HEAD
+            一律抛 ServiceError(405)；其余路径保持 404。"""
             self._compact_response = False
             try:
                 path = urlparse(self.path).path
@@ -1417,6 +1456,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     in (
                         ["audit-integrity"],
                         ["audit-evidence"],
+                        ["asset-consistency"],
                     )
                     or self._is_cancel_path(matched[1])
                 ):
