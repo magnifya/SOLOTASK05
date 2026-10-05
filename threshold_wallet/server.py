@@ -194,6 +194,37 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             if raw:
                 raise ServiceError(400, "request body must be empty")
 
+        def _read_optional_expected_version(self) -> object:
+            """读取人工提交的可选请求体：零字节（或缺 Content-Length）返回
+            WalletService._NO_EXPECTED_VERSION，沿用旧的无条件提交语义；
+            非空体必须是恰含 expected_version 的 JSON 对象，返回其原始值
+            （类型由 service 校验）。非对象/缺键/夹带/非法 JSON 一律 400。
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                raise ServiceError(400, "invalid Content-Length")
+            if length < 0:
+                raise ServiceError(400, "invalid Content-Length")
+            if length > _MAX_BODY_BYTES:
+                raise ServiceError(413, "request body too large")
+            if length == 0:
+                return WalletService._NO_EXPECTED_VERSION
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise ServiceError(400, "request body must be valid JSON")
+            if not isinstance(body, dict):
+                raise ServiceError(400, "request body must be a JSON object")
+            # 请求体仅允许 expected_version 一键（值类型由 service 校验）；
+            # 缺键/夹带一律 400
+            if set(body) != {"expected_version"}:
+                raise ServiceError(
+                    400, "body must contain exactly expected_version"
+                )
+            return body["expected_version"]
+
         # ---- 路由 -------------------------------------------------------
 
         def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
@@ -820,8 +851,13 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     and rest[0] == "asset-operations"
                     and rest[2] == "commit"
                 ):
+                    # 零字节请求体沿用旧的无条件提交；非空体仅接受恰含
+                    # expected_version 的 JSON 对象（乐观版本校验）
+                    expected_version = (
+                        self._read_optional_expected_version()
+                    )
                     status, result = service.commit_asset_operation(
-                        wallet_id, rest[1]
+                        wallet_id, rest[1], expected_version
                     )
                     self._send_json(status, result)
                     return

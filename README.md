@@ -71,7 +71,7 @@ python -m unittest discover -s tests -v
 | POST | `/v1/wallets/{id}/share-bind` | 绑定 DKG 复职节点到轮换份额槽位 `{"id","rotation","dkg","round","node","slot","approval"}` |
 | POST | `/v1/wallets/{id}/asset-operations` | 建资产操作 `{"operation_id","asset_id","delta"}` |
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
-| POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作 |
+| POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作（可带 `{"expected_version"}` 乐观版本校验） |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
 | GET  | `/v1/wallets/{id}/assets` | 钱包级资产清单分页查询（`at_seq`/`expected_head`/`limit`/`after`） |
@@ -699,7 +699,19 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 - `POST commit`：仅 pending 可提交；`balance+delta < 0` 为 `409`
   （状态不变、可重试）；成功原子改余额、`version+1`、转 committed，
   `201` 返回 R。并发恰一个 `201`，其余幂等 `200`；committed 重放
-  `200` 同体不重复改账。操作不存在 `404`。
+  `200` 同体不重复改账。操作不存在 `404`。请求体可零字节（旧客户端
+  的无条件提交语义完全不变）；非空时只接受恰含 `expected_version`
+  的 JSON 对象，值为非布尔非负整数（`0` 表示资产尚无提交版本），
+  非对象/缺键/夹带/类型非法 `400`。声明后若操作仍为 pending，在钱包
+  锁内比较提交瞬间的资产 `version`（无资产条目按 `0`）：一致才继续
+  原有冻结闸门、链上策略、余额不足与提交逻辑；不一致 `409`
+  `{"error":"asset version conflict"}`，操作保持 pending，余额、
+  version、审计事件、摘要链与提交意图均不变，可用新版本重试。
+  committed 重放不重新比较，仍按原幂等规则 `200`。版本比较、余额
+  计算、账本写入与 `asset_operation_committed` 事件在同一钱包锁内
+  线性化：多个操作声明同一版本时至多一个 `201`；条件失败不创建
+  恢复意图，已进入提交事务的请求仍按事件提交点前滚/回滚，恢复不再
+  解释 `expected_version`。
 - `POST cancel`：请求体恰为 `{"cancel_id","approval_request_id"}`，
   两个标识沿用安全标识；请求体/ID 非法 `400`，钱包/操作/审批单不存在
   `404`。仅撤销 pending 操作：成功后转 cancelled，余额与 version 不变、
