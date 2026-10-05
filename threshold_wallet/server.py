@@ -35,7 +35,7 @@
 - POST /v1/wallets/<wallet_id>/share-rotations/<id>/cancel    撤销未激活轮换
 - POST /v1/wallets/<wallet_id>/asset-operations            创建资产操作
 - GET  /v1/wallets/<wallet_id>/asset-operations/<id>       查询资产操作
-- POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作
+- POST /v1/wallets/<wallet_id>/asset-operations/<id>/commit   提交资产操作（可带可选 expected_version 乐观版本校验）
 - POST /v1/wallets/<wallet_id>/asset-operations/<id>/cancel   撤销未落账操作
 - GET  /v1/wallets/<wallet_id>/assets                      钱包级资产清单分页查询（at_seq/expected_head/limit/after）
 - GET  /v1/wallets/<wallet_id>/assets/<asset_id>           查询资产余额/版本（可带 at_seq/expected_head 读历史状态）
@@ -193,6 +193,29 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
             raw = self.rfile.read(length) if length > 0 else b""
             if raw:
                 raise ServiceError(400, "request body must be empty")
+
+        def _read_optional_json_body(self) -> dict | None:
+            """读取可选 JSON 请求体（如 commit 的 expected_version）：
+            零字节返回 None；非空必须是合法 JSON 对象。始终读完整个
+            body，避免 keep-alive 连接上残留字节污染下一个请求。"""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                raise ServiceError(400, "invalid Content-Length")
+            if length < 0:
+                raise ServiceError(400, "invalid Content-Length")
+            if length > _MAX_BODY_BYTES:
+                raise ServiceError(413, "request body too large")
+            if length == 0:
+                return None
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise ServiceError(400, "request body must be valid JSON")
+            if not isinstance(body, dict):
+                raise ServiceError(400, "request body must be a JSON object")
+            return body
 
         # ---- 路由 -------------------------------------------------------
 
@@ -820,8 +843,30 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     and rest[0] == "asset-operations"
                     and rest[2] == "commit"
                 ):
+                    body = self._read_optional_json_body()
+                    expected_version = None
+                    if body is not None:
+                        # 请求体仅允许 expected_version 一键：零字节体沿用
+                        # 旧的无条件提交；非空体必须恰含 expected_version
+                        # （非布尔的非负整数，0 表示资产尚无提交版本）
+                        if set(body) != {"expected_version"}:
+                            raise ServiceError(
+                                400,
+                                "body must contain exactly expected_version",
+                            )
+                        expected_version = body["expected_version"]
+                        if (
+                            not isinstance(expected_version, int)
+                            or isinstance(expected_version, bool)
+                            or expected_version < 0
+                        ):
+                            raise ServiceError(
+                                400,
+                                "expected_version must be a non-negative "
+                                "integer",
+                            )
                     status, result = service.commit_asset_operation(
-                        wallet_id, rest[1]
+                        wallet_id, rest[1], expected_version
                     )
                     self._send_json(status, result)
                     return

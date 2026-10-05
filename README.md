@@ -699,7 +699,20 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 - `POST commit`：仅 pending 可提交；`balance+delta < 0` 为 `409`
   （状态不变、可重试）；成功原子改余额、`version+1`、转 committed，
   `201` 返回 R。并发恰一个 `201`，其余幂等 `200`；committed 重放
-  `200` 同体不重复改账。操作不存在 `404`。
+  `200` 同体不重复改账。操作不存在 `404`。请求体可零字节（无条件
+  提交，旧客户端行为不变）；非空时只接受恰含 `expected_version` 的
+  JSON 对象（非布尔的非负整数，`0` 表示资产尚无提交版本），非对象、
+  缺失或夹带字段、类型非法均 `400`。操作仍为 pending 且带
+  `expected_version` 时，在钱包锁内收敛现场后读取提交瞬间的资产
+  version（不存在按 `0`），相等才继续原有冻结闸门、链上策略、余额
+  不足与提交逻辑；不一致返回 `409`
+  `{"error":"asset version conflict"}`，操作保持 pending，余额、
+  version、审计事件、摘要链与提交意图均不变（条件失败不创建恢复
+  意图），可用新版本重试。版本比较、余额计算、账本写入与
+  `asset_operation_committed` 事件在同一钱包锁内线性化：多个操作
+  声明同一版本时至多一个以 `201` 提交。committed 重放仍按原幂等
+  规则 `200`，不重新比较 `expected_version`；未提供该字段时完全
+  沿用旧的无条件提交语义。
 - `POST cancel`：请求体恰为 `{"cancel_id","approval_request_id"}`，
   两个标识沿用安全标识；请求体/ID 非法 `400`，钱包/操作/审批单不存在
   `404`。仅撤销 pending 操作：成功后转 cancelled，余额与 version 不变、

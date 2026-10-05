@@ -5609,6 +5609,18 @@ class WalletService:
             raise ServiceError(400, "delta must be a non-zero integer")
 
     @staticmethod
+    def _validate_expected_version(expected_version: object) -> None:
+        # bool 是 int 的子类，必须先排除；0 表示资产尚无提交版本
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise ServiceError(
+                400, "expected_version must be a non-negative integer"
+            )
+
+    @staticmethod
     def _validate_cancel_id(cancel_id: object) -> None:
         if not isinstance(cancel_id, str) or not ROTATION_ID_RE.match(
             cancel_id
@@ -6518,7 +6530,10 @@ class WalletService:
                 )
 
     def commit_asset_operation(
-        self, wallet_id: str, operation_id: str
+        self,
+        wallet_id: str,
+        operation_id: str,
+        expected_version: object = None,
     ) -> tuple[int, dict]:
         """提交一条 pending 的资产操作（可恢复事务）。返回 (状态码, R)。
 
@@ -6536,11 +6551,24 @@ class WalletService:
 
         余额不足 409 且无副作用；committed 重放 200 同体，不改账、不记事件。
 
+        ``expected_version`` 为可选的乐观版本校验（None 表示不校验，
+        完全沿用旧的无条件提交语义）：操作仍为 pending 时，在锁内读取
+        提交瞬间的资产 version（资产不存在按 0），与声明值相等才继续
+        原有的冻结闸门、链上策略、余额不足与提交逻辑；不一致返回 409
+        ``asset version conflict``，操作保持 pending，余额/version/
+        审计事件/摘要链/提交意图均不变，可用新版本重试。committed
+        重放仍按原幂等规则返回 200，不重新比较 expected_version。
+        版本比较、余额计算、账本写入与提交事件在同一钱包锁内线性化：
+        多个操作声明同一版本时至多一个以 201 提交。条件失败不创建
+        恢复意图；已进入提交事务的请求恢复后不再解释 expected_version。
+
         恢复检查、钱包存在性、operation_id 校验、幂等/状态判定与整个
         提交事务全部在锁内：绝不基于锁外快照决定 404/409 或重放。
         """
         try:
-            return self._commit_asset_operation_tx(wallet_id, operation_id)
+            return self._commit_asset_operation_tx(
+                wallet_id, operation_id, expected_version
+            )
         except CorruptDataError:
             raise
         except ValueError:
@@ -6548,7 +6576,10 @@ class WalletService:
             raise ServiceError(400, "invalid wallet_id")
 
     def _commit_asset_operation_tx(
-        self, wallet_id: str, operation_id: str
+        self,
+        wallet_id: str,
+        operation_id: str,
+        expected_version: object = None,
     ) -> tuple[int, dict]:
         with self._wallet_lock(wallet_id):
             # 先自愈他进程崩溃遗留的任何提交意图，再基于一致账本判定，
@@ -6558,12 +6589,27 @@ class WalletService:
             self._get_wallet_or_404(wallet_id)
             self._assert_wallet_active_locked(wallet_id)
             self._validate_operation_id(operation_id)
+            if expected_version is not None:
+                self._validate_expected_version(expected_version)
 
             record = self._store.get_asset_operation(wallet_id, operation_id)
             if record is None:
                 raise ServiceError(
                     404, f"asset operation {operation_id!r} not found"
                 )
+            # 乐观版本校验：仅对 pending 操作、且调用方声明了
+            # expected_version 时，在锁内收敛现场后读取提交瞬间的资产
+            # version（不存在按 0），相等才继续原有冻结闸门/链上策略/
+            # 余额不足/提交逻辑；不一致 409 且零副作用（不创建恢复
+            # 意图、不记事件、不改余额/version）。committed 重放走到
+            # 下面的幂等分支，不重新比较。
+            if record["state"] == "pending" and expected_version is not None:
+                asset = self._store.get_asset(wallet_id, record["asset_id"])
+                current_version = (
+                    asset["version"] if asset is not None else 0
+                )
+                if current_version != expected_version:
+                    raise ServiceError(409, "asset version conflict")
             # 资产粒度冻结闸门：先于 committed 幂等重放（frozen 时重放也
             # 一律 409），不改账、不记事件。
             self._assert_asset_active_locked(
