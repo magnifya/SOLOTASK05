@@ -73,6 +73,7 @@ python -m unittest discover -s tests -v
 | GET | `/v1/wallets/{id}/asset-operations/{oid}` | 查询资产操作与取消信息 |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/commit` | 提交资产操作（可带 `{"expected_version"}` 乐观版本校验） |
 | POST | `/v1/wallets/{id}/asset-operations/{oid}/cancel` | 撤销未落账资产操作 `{"cancel_id","approval_request_id"}` |
+| POST | `/v1/wallets/{id}/asset-transfers` | 原子资产转账 `{"transfer_id","from_asset_id","to_asset_id","amount","expected_from_version","expected_to_version"}` |
 | GET  | `/v1/wallets/{id}/assets/{asset_id}` | 查资产 `balance`/`version`（可带 `at_seq`/`expected_head` 读历史状态） |
 | GET  | `/v1/wallets/{id}/assets` | 钱包级资产清单分页查询（`at_seq`/`expected_head`/`limit`/`after`） |
 | POST | `/v1/wallets/{id}/assets/{asset_id}/freeze` | 资产粒度应急冻结 `{"reason"}` |
@@ -725,6 +726,36 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   version、审计不变（失败不写意图，也不懒落过期事件）。唯一取消事件
   已存在后，三键完全相同的重放优先返回 `200`，即使审批单随后推进为
   `signed` 也不再复查当前审批状态。冻结钱包撤销沿用 `409` 闸门。
+- `POST asset-transfers`：原子资产转账，一次请求同时完成创建与提交，
+  避免客户端拆成"来源扣减 + 目标入账"两笔造成只扣未入。请求体恰为
+  `{"transfer_id","from_asset_id","to_asset_id","amount",
+  "expected_from_version","expected_to_version"}` 六键（缺键/夹带
+  `400`）：三个标识均为安全标识，两个资产不得相同，`amount` 为正的
+  非布尔整数，两个 `expected_*_version` 为非布尔非负整数（`0` 表示
+  该资产尚无提交版本）；非法 `400`，钱包不存在 `404`。成功 `201`
+  返回九键转账视图
+  `R={transfer_id,from_asset_id,to_asset_id,amount,state,
+  from_balance,from_version,to_balance,to_version}`（state 恒为
+  committed）：在钱包事务锁内按当前账本**同时**校验两个资产的乐观
+  版本，来源减 `amount`、目标加 `amount`，两个 `version` 各加一；
+  目标资产可新建。错误全部零副作用（账本/version/审计/摘要链/意图
+  均不变）：任一版本不一致 `409` `asset version conflict`；来源不
+  存在或余额不足 `409` `insufficient balance`；钱包或任一资产冻结
+  `409` `wallet or asset frozen`（应急闸门，先于幂等重放与一切业务
+  判定）；交易策略白名单不含任一资产或 `amount` 超过 `max_delta`
+  `409` `transaction policy violation`（hot/cold 语义与单资产操作
+  一致）。`transfer_id` 同参（from/to/amount 相同）重放 `200` 返回
+  原视图，不重新校验现场（`expected_*` 是提交瞬间的乐观前提，与
+  committed 重放不重新比较 `expected_version` 同一规则）；异参
+  `409` `transfer conflict`。版本比较、余额计算、账本写入与提交
+  事件在同一钱包锁内线性化：多个声明同一版本的并发转账至多一个
+  `201`。转账事务可恢复（提交意图以 `kind:"transfer"` 共用
+  `asset-intents/`）：唯一提交点是审计事件
+  `asset_transfer_committed`（`request_id` 为 transfer_id、details
+  即九键转账视图 R，仅首次提交记一次），一条事件同序同时是来源与
+  目标两个资产账本变化的生效点；崩溃按事件是否落盘前滚补齐或整体
+  回滚到转账前现场——绝不只恢复一边。事件或账本无法对账、摘要链
+  或快照损坏时统一 `503`，保留现场并拒绝就绪。
 - `GET asset-operations/{oid}`：在每钱包事务锁和恢复/对账后只读返回
   固定键序的既有操作视图，末键 `cancellation` 在未撤销时为 `null`；
   已撤销时为 `{cancel_id,approval_request_id,seq}`，`seq` 为
@@ -743,8 +774,9 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
   账本或提交意图损坏/矛盾时 fail-closed（常驻 `503`、阻止就绪），绝不
   归一为空或覆盖删除。
 - 审计事件 `asset_operation_committed`（details 即 committed 视图 R，
-  仅首次提交记一次）、`asset_operation_cancelled` 与
-  `transaction_policy_updated`。
+  仅首次提交记一次）、`asset_operation_cancelled`、
+  `asset_transfer_committed`（details 即九键转账视图 R，仅首次转账
+  记一次）与 `transaction_policy_updated`。
 
 #### 历史资产状态（at_seq）
 
@@ -754,10 +786,13 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 `{asset_id,balance,version,at_seq,head}`：
 
 - `balance`/`version` 仅由边界内该资产**最后一条**
-  `asset_operation_committed` 事件的 R（`balance`/`version`）给出；
-  人工提交、链上确认、多源仲裁、派发最终性结算与重组补偿五类提交点
-  统一适用，每笔已提交操作只计入一次，pending、cancelled 与幂等重放
-  不改变结果；不同资产分别计算余额与版本。
+  `asset_operation_committed` 或 `asset_transfer_committed` 事件的 R
+  （`balance`/`version`；转账事件命中来源侧取
+  `from_balance`/`from_version`，命中目标侧取
+  `to_balance`/`to_version`）给出；
+  人工提交、链上确认、多源仲裁、派发最终性结算、重组补偿与原子转账
+  六类提交点统一适用，每笔已提交操作/转账只计入一次，pending、
+  cancelled 与幂等重放不改变结果；不同资产分别计算余额与版本。
 - 资产变化从 `asset_operation_committed` 事件序号起生效：边界落在同批
   报告/投票/结算/重组事件但未包含提交事件时，按落账前状态回答。边界
   可落在任意事件上，不要求属于所查资产；`head` 绑定**整个钱包**审计
@@ -799,11 +834,11 @@ rejoin 审批恢复为 `up` 的轮外待命节点正式换入当前轮槽位（�
 只接受 GET。成功 `200` 返回
 `{wallet_id,at_seq,head,assets,next_after}`：`assets` 每项仅含
 `asset_id,balance,version`，按 `asset_id` 的 ASCII 序升序；只列出边界
-内已有已提交操作的资产（余额归零仍保留，只有 pending/cancelled 操作的
+内已有已提交变化的资产（余额归零仍保留，只有 pending/cancelled 操作的
 资产不出现），所有既有落账方式（人工提交、链上确认、多源仲裁、派发
-最终性结算与重组补偿）统一纳入，同一资产不重复，余额与版本取边界内该
-资产最后一条 `asset_operation_committed` 事件的 R，与同一边界的单资产
-历史查询一致。
+最终性结算、重组补偿与原子转账）统一纳入，同一资产不重复，余额与版本
+取边界内该资产最后一条 `asset_operation_committed` 或
+`asset_transfer_committed` 事件的 R，与同一边界的单资产历史查询一致。
 
 - `at_seq` 缺省取本次查询的一致审计尾序号；显式给定时接受 ASCII 数字
   组成的非负整数，`0` 表示空前缀（assets 为空、`head` 为 64 个零）。

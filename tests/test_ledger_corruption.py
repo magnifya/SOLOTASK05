@@ -63,7 +63,7 @@ class LedgerShapeValidationTest(unittest.TestCase):
         self.store.check_asset_ledger("w1")
         self.assertEqual(
             self.store._read_asset_ledger("w1"),
-            {"operations": {}, "assets": {}},
+            {"operations": {}, "assets": {}, "transfers": {}},
         )
 
     def test_corrupt_payloads_raise(self):
