@@ -620,11 +620,6 @@ _ROTATION_RECORD_KEYS = frozenset(
      "previous_public_key", "cancellation")
 )
 
-#: 审批单记录允许的契约键
-_REQUEST_RECORD_KEYS = frozenset(
-    ("id", "message", "state", "approvers", "req", "t0", "t1", "reason")
-)
-
 #: 已完成签名记录允许的契约键（绝不含份额私钥）
 _SIGNATURE_RECORD_KEYS = frozenset(("message", "signature"))
 
@@ -835,43 +830,17 @@ def _load_json_object(data: bytes, what: str) -> dict:
 # ---- 业务对账（形状/公私钥/审计/账本/会话/轮换/签名）--------------------
 
 def _request_shape_ok(key: str, record: object) -> bool:
-    """审批单记录的最小形状（state 机/审批人/时间窗）。"""
-    from .store import parse_utc_iso
+    """审批单记录的最小形状（state 机/审批人/时间窗）。
 
-    if not isinstance(record, dict):
-        return False
-    if set(record) != _REQUEST_RECORD_KEYS:
-        return False
-    if record.get("id") != key:
-        return False
-    if not isinstance(record.get("message"), str):
-        return False
-    if record.get("state") not in (
-        "pending", "approved", "rejected", "expired", "signed", "cancelled",
-    ):
-        return False
-    approvers = record.get("approvers")
-    if not isinstance(approvers, list) or not all(
-        isinstance(a, str) for a in approvers
-    ) or len(set(approvers)) != len(approvers):
-        return False
-    if record.get("req") not in (1, 2):
-        return False
-    if parse_utc_iso(record.get("t0")) is None:
+    与线上读取共用一个形状定义，另加备份/恢复特有的时间窗不变式
+    （t1 必须晚于 t0：线上服务写出的记录恒满足，被回拨 t1 的快照
+    视为矛盾现场）。"""
+    from .store import parse_utc_iso, request_record_shape_ok
+
+    if not request_record_shape_ok(key, record):
         return False
     t1 = parse_utc_iso(record.get("t1"))
-    if t1 is None or t1 <= parse_utc_iso(record.get("t0")):
-        return False
-    reason = record.get("reason")
-    if reason is not None and not isinstance(reason, str):
-        return False
-    # pending 不得已有批准；达到门槛必须是 approved
-    approvers_n = len(approvers)
-    if approvers_n > record.get("req"):
-        return False
-    if record.get("state") == "approved" and approvers_n < record.get("req"):
-        return False
-    return True
+    return t1 > parse_utc_iso(record.get("t0"))
 
 
 def _verify_inuse_shares(wallet: dict, files: dict[str, bytes], wallet_id: str) -> None:

@@ -64,6 +64,10 @@ _SAFE_SHARE_ID = re.compile(r"^[A-Za-z0-9_-]{1,136}$")
 #: 轮换撤销原因允许的最大字符数（与 service 层契约一致）
 _MAX_CANCEL_REASON_LENGTH = 1024
 
+#: 审批策略 required_approvals 的允许范围（多方审批阈值，含端点）
+MIN_REQUIRED_APPROVALS = 1
+MAX_REQUIRED_APPROVALS = 16
+
 
 def _cancellation_shape_ok(value: object) -> bool:
     """撤销快照形状：恰含 cancel_id（安全标识）与 reason（1..1024 字符、
@@ -138,16 +142,73 @@ def parse_utc_iso(value: object) -> Optional[datetime]:
 
 def approval_policy_shape_ok(policy: object) -> bool:
     """审批策略条目形状：wallet_id 为合法标识、required_approvals 为
-    非布尔整数 1/2、timeout_seconds 为非布尔正整数。"""
+    非布尔整数 1..16、timeout_seconds 为非布尔正整数。"""
     if not isinstance(policy, dict):
         return False
     if not _valid_safe_id(policy.get("wallet_id")):
         return False
     required = policy.get("required_approvals")
-    if not _is_plain_int(required) or required not in (1, 2):
+    if not _is_plain_int(required) or not (
+        MIN_REQUIRED_APPROVALS <= required <= MAX_REQUIRED_APPROVALS
+    ):
         return False
     timeout = policy.get("timeout_seconds")
     return _is_plain_int(timeout) and timeout > 0
+
+
+#: 审批单记录的契约键（与对外视图字段一致）
+_REQUEST_RECORD_KEYS = frozenset(
+    ("id", "message", "state", "approvers", "req", "t0", "t1", "reason")
+)
+
+#: 审批单状态机取值
+_REQUEST_STATES = frozenset(
+    ("pending", "approved", "rejected", "expired", "signed", "cancelled")
+)
+
+
+def request_record_shape_ok(key: str, record: object) -> bool:
+    """审批单记录的最小形状（状态机/审批人集合/快照阈值/时间窗）。
+
+    ``req`` 为建单时的策略阈值快照（1..16 非布尔整数）；``approvers``
+    为无重复字符串列表，计数不得超过 req；approved 必须已达阈值。
+    任何矛盾都视为持久化损坏（fail-closed），绝不静默归一。t0/t1 只
+    要求可解析的 UTC 时间戳（t1 可能已被回拨到过去以模拟超时）。"""
+    if not isinstance(record, dict):
+        return False
+    if set(record) != _REQUEST_RECORD_KEYS:
+        return False
+    if record.get("id") != key:
+        return False
+    if not isinstance(record.get("message"), str):
+        return False
+    if record.get("state") not in _REQUEST_STATES:
+        return False
+    approvers = record.get("approvers")
+    if (
+        not isinstance(approvers, list)
+        or not all(isinstance(a, str) for a in approvers)
+        or len(set(approvers)) != len(approvers)
+    ):
+        return False
+    req = record.get("req")
+    if not _is_plain_int(req) or not (
+        MIN_REQUIRED_APPROVALS <= req <= MAX_REQUIRED_APPROVALS
+    ):
+        return False
+    if parse_utc_iso(record.get("t0")) is None:
+        return False
+    if parse_utc_iso(record.get("t1")) is None:
+        return False
+    reason = record.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return False
+    # 计数与集合必须相符：不得超过阈值；approved 必须恰达阈值
+    if len(approvers) > req:
+        return False
+    if record.get("state") == "approved" and len(approvers) < req:
+        return False
+    return True
 
 
 def transaction_policy_shape_ok(policy: object) -> bool:
@@ -560,6 +621,22 @@ class WalletStore:
 
     # ---- 签名请求审批单 ---------------------------------------------------
 
+    def _read_requests(self, path: str) -> dict:
+        """读取并逐条校验审批单文件；任一记录形状/取值矛盾（阈值越界、
+        审批人重复、计数与集合不符等）抛 CorruptDataError：fail-closed
+        保留现场，绝不把残缺审批单交给下游继续判定。"""
+        all_records = self._read_json(path)
+        if not all_records:
+            return {}
+        for key, record in all_records.items():
+            if not _valid_safe_id(key) or not request_record_shape_ok(
+                key, record
+            ):
+                raise CorruptDataError(
+                    f"signing request {key!r} is malformed"
+                )
+        return all_records
+
     def create_request(
         self, wallet_id: str, signing_request_id: str, record: dict
     ) -> Optional[dict]:
@@ -571,7 +648,7 @@ class WalletStore:
         _check_id("signing_request_id", signing_request_id)
         path = self._requests_path(wallet_id)
         with self._lock:
-            all_records = self._read_json(path) or {}
+            all_records = self._read_requests(path)
             existing = all_records.get(signing_request_id)
             if existing is not None:
                 return existing
@@ -584,9 +661,7 @@ class WalletStore:
     ) -> Optional[dict]:
         """返回某条签名请求审批单，不存在返回 None。"""
         _check_id("signing_request_id", signing_request_id)
-        all_records = self._read_json(self._requests_path(wallet_id))
-        if not all_records:
-            return None
+        all_records = self._read_requests(self._requests_path(wallet_id))
         return all_records.get(signing_request_id)
 
     def update_request(
@@ -596,13 +671,13 @@ class WalletStore:
         _check_id("signing_request_id", signing_request_id)
         path = self._requests_path(wallet_id)
         with self._lock:
-            all_records = self._read_json(path) or {}
+            all_records = self._read_requests(path)
             all_records[signing_request_id] = record
             self._atomic_write(path, all_records)
 
     def list_requests(self, wallet_id: str) -> dict:
         """返回该钱包全部审批单记录（恢复对账用）。"""
-        return self._read_json(self._requests_path(wallet_id)) or {}
+        return self._read_requests(self._requests_path(wallet_id))
 
     def request_file_exists(self, wallet_id: str) -> bool:
         return os.path.exists(self._requests_path(wallet_id))

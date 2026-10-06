@@ -44,7 +44,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/change-control` | 查询高风险配置双人变更控制开关 `{"enabled":bool}`（缺省 false） |
 | POST | `/v1/wallets/{id}/policy-changes` | 双人审批统一变更受控配置 |
 | GET  | `/v1/wallets/{id}/policy-changes/{change_id}` | 查询已应用的配置变更视图 |
-| PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1\|2,"timeout_seconds":>0}` |
+| PUT  | `/v1/wallets/{id}/approval-policy` | 审批策略 `{"required_approvals":1..16,"timeout_seconds":>0}` |
 | PUT/GET | `/v1/wallets/{id}/approval-roster` | 钱包级审批人名单 `{"allowed_approvers":[...]}` |
 | PUT  | `/v1/wallets/{id}/transaction-policy` | 交易策略 `{"mode":"hot"\|"cold","max_delta":正整数,"allowed_assets":[...]}` |
 | GET  | `/v1/wallets/{id}/transaction-policy` | 查询交易策略（未配置 404） |
@@ -119,15 +119,18 @@ JSON 对象。
 
 ### 审批工作流（可选）
 
-- `PUT approval-policy`：`required_approvals` 为 1 或 2，
-  `timeout_seconds` 为正整数；成功 `200`，非法 `400`，钱包不存在 `404`。
+- `PUT approval-policy`：`required_approvals` 为 1 至 16 的非布尔整数
+  （多方审批阈值），`timeout_seconds` 为正整数；成功 `200`，非法 `400`，
+  钱包不存在 `404`。名单非空且成员数少于新阈值时 `409` 且零副作用
+  （不写策略、名单或审计事件）。
 - `PUT/GET approval-roster`：请求/响应体仅含 `allowed_approvers` 数组；
   成员为 1..128 字符非空白字符串且不得重复，响应按 Unicode 码点升序，
   空数组取消限制。缺字段、夹带字段、成员非法或重复、钱包标识非法为
   `400`，钱包不存在为 `404`；GET 对已存在钱包始终 `200`，未设置为
   空数组且不记事件。首次设置、修改、清空和同值更新均为 `200` 并记录
   `approval_roster_updated`，details 仅含当前名单；名单只由该事件序列
-  的最后一条重建。
+  的最后一条重建。把非空名单缩小到少于当前策略阈值时 `409` 且零副作用；
+  空名单沿用开放审批人语义，不受阈值约束。
 - `POST sign-requests`：`id`、`message` 非空；未设策略 `409`；首建
   `201`；同 id 同文幂等 `200`；同 id 异文 `409`。
 - 审批单视图 `{id,message,state,approvers,count,req,t0,t1,reason}`，

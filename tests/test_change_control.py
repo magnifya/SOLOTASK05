@@ -396,7 +396,7 @@ class ChangeControlServiceTest(unittest.TestCase):
             ("change-control", {"enabled": False}, {}),
             ("approval-policy",
              {"required_approvals": 2, "timeout_seconds": 60},
-             {"required_approvals": 3, "timeout_seconds": 60}),
+             {"required_approvals": 17, "timeout_seconds": 60}),
             ("approval-policy",
              {"required_approvals": 2, "timeout_seconds": 60},
              {"required_approvals": 1, "timeout_seconds": 0}),

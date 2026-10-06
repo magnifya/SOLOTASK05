@@ -80,7 +80,8 @@ class ApprovalHttpTest(unittest.TestCase):
     def test_put_policy_bad_values_400(self):
         for body in (
             {"required_approvals": 0, "timeout_seconds": 60},
-            {"required_approvals": 3, "timeout_seconds": 60},
+            {"required_approvals": 17, "timeout_seconds": 60},
+            {"required_approvals": -1, "timeout_seconds": 60},
             {"required_approvals": True, "timeout_seconds": 60},
             {"required_approvals": "2", "timeout_seconds": 60},
             {"required_approvals": 2.0, "timeout_seconds": 60},
@@ -97,6 +98,14 @@ class ApprovalHttpTest(unittest.TestCase):
             )
             self.assertEqual(status, 400, body)
             self.assertIn("error", resp)
+
+    def test_put_policy_multi_party_threshold_200(self):
+        # 多方审批阈值：1..16 的非布尔整数均合法
+        for req in (1, 2, 3, 8, 16):
+            status, body = self.put_policy(req=req, timeout=60)
+            self.assertEqual(status, 200, req)
+            self.assertEqual(body["required_approvals"], req)
+            self.assertEqual(body["timeout_seconds"], 60)
 
     def test_put_policy_missing_wallet_404(self):
         status, _ = self.put_policy(wallet="ghost")
@@ -567,7 +576,7 @@ class ApprovalCliTest(unittest.TestCase):
         # 策略参数非法
         code, _, err = self.run_cli(
             "policy", "--url", self.url, "--wallet-id", "w1",
-            "--required-approvals", "5", "--timeout-seconds", "60",
+            "--required-approvals", "17", "--timeout-seconds", "60",
         )
         self.assertEqual(code, 1)
         self.assertIn("error", json.loads(err))

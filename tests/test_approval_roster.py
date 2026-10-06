@@ -144,7 +144,8 @@ class ApprovalRosterHttpTest(unittest.TestCase):
         self.decide("approve", "approved", "alice")
         self.prepare_request("pending", req=2)
         self.decide("approve", "pending", "alice")
-        self.put_roster(["bob"])
+        # 名单成员数须满足当前阈值（req=2）：两人名单排除 carol
+        self.put_roster(["bob", "dave"])
 
         self.assertEqual(self.decide("approve", "pending", "alice")[0], 200)
         self.assertEqual(self.decide("approve", "pending", "carol")[0], 409)
@@ -152,9 +153,9 @@ class ApprovalRosterHttpTest(unittest.TestCase):
         self.assertEqual(self.decide("approve", "approved", "alice")[0], 200)
 
         self.prepare_request("rejected", req=2)
-        self.put_roster(["alice"])
+        self.put_roster(["alice", "erin"])
         self.assertEqual(self.decide("reject", "rejected", "alice")[0], 200)
-        self.put_roster(["bob"])
+        self.put_roster(["bob", "frank"])
         self.assertEqual(self.decide("reject", "rejected", "alice")[0], 200)
         self.assertEqual(
             self.decide("approve", "rejected", "bob")[0],
