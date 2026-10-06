@@ -14141,6 +14141,149 @@ class WalletService:
                 raise
         return 201, {"signature": aggregate.hex()}
 
+    # ---- 聚合签名验真（纯只读） -------------------------------------------
+
+    def verify_signature(
+        self, wallet_id: str, body: object
+    ) -> tuple[int, dict]:
+        """只读验真一份已完成 /sign 的聚合签名，返回 (HTTP 状态码, 响应体)。
+
+        恢复/对账、钱包存在性、正文校验、记录/事件/轮换时间线/摘要链核对
+        与验签全部在同一把每钱包事务锁内完成。纯只读：不触发审批懒过期、
+        不追加审计事件、不修改签名/份额/审批/资产/策略，冻结钱包仍可查询。
+
+        - 钱包不存在 404，优先于一切正文校验；
+        - 缺键/夹带键/类型非法/十六进制无法解码为 128 字节一律 400；
+        - 已持久化聚合签名不存在 404；message 与记录原文不一致 409；
+        - 记录、request_signed 事件、轮换时间线或摘要链无法对账一律
+          RecoveryError/CorruptDataError（HTTP 边界转 503，保留现场）；
+        - 验签使用 request_signed 提交序号前最后生效的两份历史公钥，
+          绝不使用轮换后的当前公钥；重复查询与后续轮换都不改变
+          signed_seq/public_key/valid；格式正确但验签失败仍以 200
+          返回 valid=false。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：锁内、heal 之后先判定钱包存在性
+                wallet = self._get_wallet_or_404(wallet_id)
+                if not isinstance(body, dict) or set(body) != {
+                    "signing_request_id",
+                    "message",
+                    "signature",
+                }:
+                    raise ServiceError(
+                        400,
+                        "body must contain exactly signing_request_id, "
+                        "message and signature",
+                    )
+                signing_request_id = body["signing_request_id"]
+                message = body["message"]
+                signature_hex = body["signature"]
+                if not isinstance(
+                    signing_request_id, str
+                ) or not _SAFE_ID.match(signing_request_id):
+                    raise ServiceError(400, "invalid signing_request_id")
+                if not isinstance(message, str):
+                    raise ServiceError(400, "message must be a string")
+                if not isinstance(signature_hex, str):
+                    raise ServiceError(400, "signature must be hex")
+                try:
+                    candidate = bytes.fromhex(signature_hex)
+                except ValueError:
+                    raise ServiceError(400, "signature must be hex")
+                if len(candidate) != 128:
+                    raise ServiceError(
+                        400,
+                        "signature must be a 128-byte aggregate signature",
+                    )
+                # 摘要链对账：链元数据缺失或与事件摘要矛盾即不可对账
+                self._audit.integrity(wallet_id)
+                record = self._store.get_signature(
+                    wallet_id, signing_request_id
+                )
+                if record is None:
+                    raise ServiceError(
+                        404,
+                        f"signing request {signing_request_id!r} has no "
+                        "signature",
+                    )
+                # 记录形状对账：与 /sign 提交时恰写的两键不符即损坏现场
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"message", "signature"}
+                    or not isinstance(record["message"], str)
+                    or not isinstance(record["signature"], str)
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} signature record for "
+                        f"{signing_request_id!r} is malformed"
+                    )
+                if record["message"] != message:
+                    raise ServiceError(
+                        409, "message does not match the signed record"
+                    )
+                # request_signed 事件对账：记录存在则提交事件必须恰好一条，
+                # 且事件原文与记录一致
+                signed_events = [
+                    event
+                    for event in self._audit.events_by_type(
+                        wallet_id, audit.TYPE_REQUEST_SIGNED
+                    )
+                    if event.get("request_id") == signing_request_id
+                ]
+                if len(signed_events) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} signature record for "
+                        f"{signing_request_id!r} cannot be reconciled with "
+                        "request_signed events"
+                    )
+                event = signed_events[0]
+                signed_seq = event.get("seq")
+                details = event.get("details")
+                if (
+                    not isinstance(signed_seq, int)
+                    or isinstance(signed_seq, bool)
+                    or not isinstance(details, dict)
+                    or details.get("message") != record["message"]
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} request_signed event for "
+                        f"{signing_request_id!r} is malformed"
+                    )
+                # 签名时刻的两份历史公钥：request_signed 序号前最后生效的
+                # 份额集（轮换激活事件与该事件绝不同号），沿轮换记录链解析
+                timeline = self._rotation_timeline(wallet_id)
+                share_ids = self._active_share_set_at(
+                    timeline, signed_seq - 1
+                )
+                public = self._session_share_public_keys(
+                    wallet_id, list(share_ids), wallet
+                )
+                public_key_hex = (
+                    public[share_ids[0]] + public[share_ids[1]]
+                )
+                payload = crypto.build_payload(signing_request_id, message)
+                halves = crypto.split_signature(candidate)
+                valid = all(
+                    crypto.verify_share(
+                        bytes.fromhex(public[share_id]), payload, half
+                    )
+                    for share_id, half in zip(share_ids, halves)
+                )
+                return 200, {
+                    "wallet_id": wallet_id,
+                    "signing_request_id": signing_request_id,
+                    "valid": valid,
+                    "signed_seq": signed_seq,
+                    "public_key": public_key_hex,
+                }
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
     # ---- 可恢复签名会话 ---------------------------------------------------
 
     @staticmethod

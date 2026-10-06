@@ -22,6 +22,7 @@
 - GET  /v1/wallets/<wallet_id>/chain-adapters       查询跨链适配器健康熔断表
 - POST /v1/wallets/<wallet_id>/nodes/<node_id>/rejoin 故障节点重新加入
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
+- POST /v1/wallets/<wallet_id>/signature-verifications  只读验真已完成聚合签名
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
 - GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
@@ -638,6 +639,18 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("signing_request_id"),
                         body.get("message"),
                         body.get("signatures"),
+                    )
+                    self._send_json(status, result)
+                    return
+
+                if rest == ["signature-verifications"]:
+                    # 聚合签名只读验真：请求体恰为 signing_request_id/
+                    # message/signature 三键。键集合与值类型校验在 service
+                    # 锁内、钱包 404 之后进行（404 优先于正文校验）；本入口
+                    # 纯只读，不触发懒过期、不记事件、不改任何状态。
+                    body = self._read_json_body()
+                    status, result = service.verify_signature(
+                        wallet_id, body
                     )
                     self._send_json(status, result)
                     return
