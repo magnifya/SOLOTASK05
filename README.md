@@ -64,6 +64,7 @@ python -m unittest discover -s tests -v
 | GET  | `/v1/wallets/{id}/audit-evidence` | 区间逐条证据（`from_seq`/`to_seq`/`expected_head`） |
 | GET  | `/v1/wallets/{id}/audit-integrity` | 审计防篡改摘要链校验（可带 `expected_head`） |
 | POST | `/v1/wallets/{id}/sign` | 提交两份份额签名，返回聚合签名 |
+| POST | `/v1/wallets/{id}/signature-verifications` | 聚合签名验真 `{"signing_request_id","message","signature"}`（审计只读核对，纯只读） |
 | POST | `/v1/wallets/{id}/share-rotations` | 准备轮换 `{"rotation_id"}` |
 | GET  | `/v1/wallets/{id}/share-rotations/{rid}` | 查轮换状态 |
 | POST | `/v1/wallets/{id}/share-rotations/{rid}/activate` | 激活轮换 |
@@ -116,6 +117,17 @@ JSON 对象。
 - `/sign`：两份齐备且全部校验通过 `201`；缺份、份额重复/未知、签名
   非法或校验失败 `400`；钱包不存在 `404`。同一 `signing_request_id`
   重复提交幂等返回已有签名（`200`）。
+- `POST signature-verifications`（聚合签名验真，纯只读）：请求体恰为
+  `{"signing_request_id","message","signature"}`，`signature` 须解码为
+  128 字节；缺键/夹带键/类型或十六进制长度非法 `400`，钱包不存在
+  `404`（优先于正文校验），签名记录不存在 `404`，`message` 与记录
+  原文不一致 `409`。服务按签名时刻（`request_signed` 审计序号之前）
+  最后生效的两份公钥拆分候选签名分别验签，成功响应固定为
+  `{"wallet_id","signing_request_id","valid","signed_seq","public_key"}`：
+  两半均通过 `valid=true`，验签失败仍以 `200` 返回 `valid=false`。
+  记录、事件、轮换时间线或摘要链无法对账时返回 `503`。不触发懒过期、
+  不新增审计事件、不改变任何业务状态，冻结钱包仍可查询；后续轮换
+  不改变 `signed_seq`、`public_key` 或 `valid`。
 
 ### 审批工作流（可选）
 

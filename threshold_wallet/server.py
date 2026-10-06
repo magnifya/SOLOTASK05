@@ -22,6 +22,7 @@
 - GET  /v1/wallets/<wallet_id>/chain-adapters       查询跨链适配器健康熔断表
 - POST /v1/wallets/<wallet_id>/nodes/<node_id>/rejoin 故障节点重新加入
 - POST /v1/wallets/<wallet_id>/sign                 提交两份额签名
+- POST /v1/wallets/<wallet_id>/signature-verifications  聚合签名验真（审计只读核对）
 - POST /v1/wallets/<wallet_id>/sign-requests        创建签名请求审批单
 - GET  /v1/wallets/<wallet_id>/sign-requests/<id>   查询审批单
 - GET  /v1/wallets/<wallet_id>/audit-events         查询审计事件（升序）
@@ -384,6 +385,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 if rest == ["asset-consistency"]:
                     # 资产一致性校验只接受 POST：其他方法一律 405
                     raise ServiceError(405, "method not allowed")
+                if rest == ["signature-verifications"]:
+                    # 聚合签名验真只接受 POST：其他方法一律 405
+                    raise ServiceError(405, "method not allowed")
                 if rest == ["audit-events"]:
                     # 该路由成功体与 400/404/503 错误体均为 UTF-8 紧凑
                     # JSON（非 ASCII 不转义、无末换行）；其余路由不变。
@@ -640,6 +644,22 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         body.get("signatures"),
                     )
                     self._send_json(status, result)
+                    return
+
+                if rest == ["signature-verifications"]:
+                    # 聚合签名验真（纯只读）：钱包 404 优先于一切正文
+                    # 校验，故请求体读取/解析错误不在此抛出，而是延迟到
+                    # service 判定钱包存在性之后统一重抛。
+                    try:
+                        body = self._read_json_body()
+                        body_error = None
+                    except ServiceError as exc:
+                        body = None
+                        body_error = exc
+                    result = service.verify_signature(
+                        wallet_id, body, body_error
+                    )
+                    self._send_json(200, result)
                     return
 
                 if rest == ["sign-requests"]:
@@ -1274,6 +1294,9 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     if rest == ["asset-consistency"]:
                         # 资产一致性校验只接受 POST
                         raise ServiceError(405, "method not allowed")
+                    if rest == ["signature-verifications"]:
+                        # 聚合签名验真只接受 POST
+                        raise ServiceError(405, "method not allowed")
                     if rest == ["approval-policy"]:
                         body = self._read_json_body()
                         result = service.put_policy(
@@ -1414,7 +1437,8 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
 
         def do_HEAD(self) -> None:  # noqa: N802
             # HEAD 语义不返回响应体：audit-integrity / audit-evidence、
-            # asset-consistency 与会话/轮换 cancel 路径上仅给 405 状态头。
+            # asset-consistency、signature-verifications 与会话/轮换
+            # cancel 路径上仅给 405 状态头。
             self._compact_response = False
             path = urlparse(self.path).path
             matched = self._split_wallet_path(path)
@@ -1424,6 +1448,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                     ["audit-integrity"],
                     ["audit-evidence"],
                     ["asset-consistency"],
+                    ["signature-verifications"],
                 )
                 or self._is_cancel_path(matched[1])
             ):
@@ -1444,9 +1469,10 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                 self._send_error(404, "not found")
 
         def _reject_unsupported_method(self) -> None:
-            """audit-integrity / audit-evidence 资源、asset-consistency
-            与签名会话/份额轮换 cancel 路径上的 DELETE/PATCH/OPTIONS/HEAD
-            一律抛 ServiceError(405)；其余路径保持 404。"""
+            """audit-integrity / audit-evidence 资源、asset-consistency、
+            signature-verifications 与签名会话/份额轮换 cancel 路径上的
+            DELETE/PATCH/OPTIONS/HEAD 一律抛 ServiceError(405)；其余路径
+            保持 404。"""
             self._compact_response = False
             try:
                 path = urlparse(self.path).path
@@ -1457,6 +1483,7 @@ def build_handler(service: WalletService) -> type[BaseHTTPRequestHandler]:
                         ["audit-integrity"],
                         ["audit-evidence"],
                         ["asset-consistency"],
+                        ["signature-verifications"],
                     )
                     or self._is_cancel_path(matched[1])
                 ):

@@ -14141,6 +14141,162 @@ class WalletService:
                 raise
         return 201, {"signature": aggregate.hex()}
 
+    def verify_signature(
+        self,
+        wallet_id: str,
+        body: object,
+        body_error: "ServiceError | None" = None,
+    ) -> dict:
+        """聚合签名验真（POST /v1/wallets/{id}/signature-verifications）。
+
+        审计者只读核对已完成的 /sign 结果：请求体恰为
+        ``{"signing_request_id","message","signature"}``，signature 须
+        解码为 128 字节门限签名。按 signing_request_id 查找已持久化的
+        聚合签名（不存在 404），message 与记录原文不一致 409；随后定位
+        对应 request_signed 审计序号，取该序号前最后生效的两份公钥
+        （绝不用轮换后的当前公钥）拆分候选签名，分别验证
+        signing_request_id 与 message 直接拼接的载荷。两半均通过时
+        valid 为 true；格式正确但验签失败仍以 200 返回 valid=false。
+
+        校验次序：钱包存在性 404 优先于一切正文校验（请求体读取/解析
+        错误由 HTTP 层延迟到此之后重抛）；随后依次为键集 400 → 字段
+        类型/hex/长度 400 → 签名记录缺失 404 → message 不符 409。
+
+        纯只读：在每钱包事务锁内完成既有恢复与对账（_heal_wallet +
+        摘要链完整性校验）；签名记录、request_signed 事件、轮换时间线
+        或摘要链无法对账一律上抛（HTTP 边界转 503，保留现场）。不触发
+        审批懒过期、不新增审计事件、不修改签名/份额/审批/资产/策略，
+        也不输出私钥、单份额签名或签名载荷；冻结钱包仍可查询。重复
+        查询结果稳定：后续轮换不改变 signed_seq、public_key 或 valid。
+        """
+        try:
+            with self._wallet_lock(wallet_id):
+                # 先自愈他进程崩溃遗留的半完成现场，绝不基于半完成的
+                # 签名记录/审计/轮换时间线回答验真结果。
+                self._heal_wallet(wallet_id)
+                # 404 优先于 400：锁内、heal 之后先判定钱包存在性；
+                # 冻结钱包仍可查询（不经过活跃闸门）。
+                wallet = self._get_wallet_or_404(wallet_id)
+                # 请求体读取/解析错误延迟到钱包 404 之后重抛
+                if body_error is not None:
+                    raise body_error
+                if not isinstance(body, dict) or set(body) != {
+                    "signing_request_id",
+                    "message",
+                    "signature",
+                }:
+                    raise ServiceError(
+                        400,
+                        "body must contain exactly signing_request_id, "
+                        "message and signature",
+                    )
+                signing_request_id = body.get("signing_request_id")
+                message = body.get("message")
+                signature_hex = body.get("signature")
+                if (
+                    not isinstance(signing_request_id, str)
+                    or not signing_request_id
+                ):
+                    raise ServiceError(
+                        400, "signing_request_id must be a non-empty string"
+                    )
+                if not isinstance(message, str):
+                    raise ServiceError(400, "message must be a string")
+                if not isinstance(signature_hex, str):
+                    raise ServiceError(400, "signature must be hex")
+                try:
+                    candidate = bytes.fromhex(signature_hex)
+                except ValueError:
+                    raise ServiceError(400, "signature must be hex")
+                if len(candidate) != 2 * 64:
+                    raise ServiceError(
+                        400,
+                        "signature must be a 128-byte threshold signature",
+                    )
+                # 已持久化的聚合签名：不存在 404
+                try:
+                    record = self._store.get_signature(
+                        wallet_id, signing_request_id
+                    )
+                except CorruptDataError:
+                    raise
+                except ValueError:
+                    raise ServiceError(400, "invalid signing_request_id")
+                if record is None:
+                    raise ServiceError(
+                        404,
+                        f"signature for signing request "
+                        f"{signing_request_id!r} not found",
+                    )
+                if (
+                    not isinstance(record, dict)
+                    or not isinstance(record.get("message"), str)
+                    or not isinstance(record.get("signature"), str)
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} signature record for "
+                        f"{signing_request_id!r} is malformed"
+                    )
+                if record["message"] != message:
+                    raise ServiceError(
+                        409, "message does not match the recorded signature"
+                    )
+                # 摘要链完整性：链元数据缺失/矛盾即不可对账，fail-closed
+                self._audit.integrity(wallet_id)
+                # 定位对应 request_signed 审计序号：必须恰有一条，缺失
+                # 或重复都是记录与审计无法对账的现场（503）。
+                signed_events = [
+                    event
+                    for event in self._audit.events_by_type(
+                        wallet_id, audit.TYPE_REQUEST_SIGNED
+                    )
+                    if event.get("request_id") == signing_request_id
+                ]
+                if len(signed_events) != 1:
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} signature record for "
+                        f"{signing_request_id!r} cannot be reconciled "
+                        "with its request_signed audit event"
+                    )
+                signed_seq = signed_events[0].get("seq")
+                if not isinstance(signed_seq, int) or isinstance(
+                    signed_seq, bool
+                ):
+                    raise RecoveryError(
+                        f"wallet {wallet_id!r} request_signed event for "
+                        f"{signing_request_id!r} has no valid seq"
+                    )
+                # 该序号前最后生效的两份份额及其公钥：绝不用轮换后的
+                # 当前公钥验历史签名。
+                timeline = self._rotation_timeline(wallet_id)
+                share_ids = self._active_share_set_at(timeline, signed_seq)
+                public = self._session_share_public_keys(
+                    wallet_id, list(share_ids), wallet
+                )
+                public_key = public[share_ids[0]] + public[share_ids[1]]
+                payload = crypto.build_payload(signing_request_id, message)
+                halves = crypto.split_signature(candidate)
+                valid = all(
+                    crypto.verify_share(
+                        bytes.fromhex(public[share_ids[index]]),
+                        payload,
+                        halves[index],
+                    )
+                    for index in range(REQUIRED_SHARES)
+                )
+                return {
+                    "wallet_id": wallet_id,
+                    "signing_request_id": signing_request_id,
+                    "valid": valid,
+                    "signed_seq": signed_seq,
+                    "public_key": public_key,
+                }
+        except CorruptDataError:
+            raise
+        except ValueError:
+            # wallet_id 含非法字符（构造锁路径时抛出）
+            raise ServiceError(400, "invalid wallet_id")
+
     # ---- 可恢复签名会话 ---------------------------------------------------
 
     @staticmethod
