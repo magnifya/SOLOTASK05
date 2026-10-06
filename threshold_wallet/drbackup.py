@@ -18,6 +18,16 @@
     前滚/回滚替换；``restore-records/<W>.json`` 记录 S 与 manifest 哈希，
     首次 201、同 S 同 manifest 200 同体、不同内容 409、损坏/不可对账 503。
 
+``verify --wallet-id W --input B``
+    只读离线验真：不接收也不触碰任何 data-dir——不读目标现场、不写
+    restore-txn、不登记 restore-records、不补算摘要链、不自愈/修复任何
+    文件。仅完整读取快照并依次做封闭成员校验、manifest v1/绑定哈希/清单
+    顺序与逐项字节 sha256 核对，以及与 restore 完全相同的全量业务对账
+    （在临时目录内运行线上恢复器 + 份额公私钥 + 审计链 + 历史聚合签名
+    重验）；快照夹带未结算现场（恢复器需归一化/改动业务文件）同样失败。
+    成功返回与 restore 成功体同形的 200 响应（manifest 为同一规范视图）；
+    参数错误 400、归属不符 409、其余一切失败 503。
+
 安全边界：恢复不新增审计事件，余额/version 不跳变，幂等保持，历史签名
 连续可验；响应与 manifest 只含公钥/标识/哈希/整数/业务原文，绝不含任何
 份额私钥。
@@ -442,7 +452,7 @@ def backup(
             # 出包前用与 restore 完全相同的全量对账（临时目录跑线上恢复器 +
             # 在用份额公私钥 + 审计/账本/会话/轮换/历史签名对账）校验即将
             # 打包的**确切字节**：不能对账绝不出包，也绝不生成无法恢复的快照。
-            _verify_snapshot(service, wallet_id, manifest, dict(payloads))
+            _verify_snapshot(wallet_id, manifest, dict(payloads))
             _write_snapshot(output, manifest, payloads)
     except BackupError:
         raise
@@ -1407,18 +1417,18 @@ def _verify_staging_shapes(wallet_id: str, files: dict[str, bytes]) -> None:
 
 
 def _verify_snapshot(
-    service: WalletService,
     wallet_id: str,
     manifest: dict,
     files: dict[str, bytes],
 ) -> None:
-    """锁内完整对账校验（失败抛 BackupError(503)，绝不写盘）。
+    """完整对账校验（失败抛 BackupError(503)，绝不写盘）。
 
     做法：把候选文件写入**临时目录**，在其上运行与线上完全相同的启动恢复
     （审计 seq 连续、轮换激活链、账本语义与 committed 事件、会话严格
     加载），再显式校验在用份额公私钥、策略/审批单形状与全部历史签名。
     合法快照是已对账现场，恢复器不得改动任何业务文件——若改动说明快照
-    夹带了半状态，同样拒绝。
+    夹带了半状态，同样拒绝。本函数只读取 ``files`` 并写隔离临时目录，
+    绝不读取或改动任何真实 data-dir。
     """
     import tempfile
 
@@ -2724,7 +2734,7 @@ def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
                 )
 
             # 全量对账校验（临时目录内运行线上恢复器）；失败绝不写盘。
-            _verify_snapshot(service, wallet_id, manifest, files)
+            _verify_snapshot(wallet_id, manifest, files)
 
             txn = _txn_dir(data_dir, wallet_id, snapshot_id)
             os.makedirs(txn, exist_ok=True)
@@ -2784,4 +2794,50 @@ def restore(data_dir: str, wallet_id: str, input_path: str) -> tuple[int, dict]:
         raise BackupError(503, "restore failed, data left untouched") from exc
     return 201, _restore_body(
         201, wallet_id, snapshot_id, manifest_sha256, manifest
+    )
+
+
+# ---- 只读验真（不触碰任何 data-dir）---------------------------------------
+
+def verify(wallet_id: str, input_path: str) -> dict:
+    """只读离线验真：确认快照完整且可启动恢复，返回 200 规范响应体。
+
+    与 restore 的校验路径完全同源（同一 ``_read_snapshot`` 封闭读包 +
+    同一 ``_verify_snapshot`` 全量业务对账），但**绝不读取或改动任何
+    data-dir**：不构造线上 WalletStore、不持钱包锁、不做 restore-txn
+    前滚/回滚、不登记 restore-records、不补算审计摘要链、不自愈或修复
+    任何现场。唯一的磁盘写入是 ``_verify_snapshot`` 自有的隔离临时目录
+    （用完即删）。
+
+    失败语义与 restore 对齐：参数为空/类型错误/标识非法 400；快照归属
+    其他钱包 409；文件缺失、tar/JSON 损坏、哈希不符、私钥材料越界、语义
+    不可对账或读取失败一律 503。错误信息为泛化文本，绝不回显私钥、份额
+    正文或签名载荷。
+    """
+    if not isinstance(input_path, str) or not input_path:
+        raise BackupError(400, "--input must be a non-empty path")
+    if not isinstance(wallet_id, str) or not is_safe_id(wallet_id):
+        raise BackupError(400, "invalid wallet_id")
+
+    # 封闭读包：成员类型/路径/顺序/重复、manifest v1 形状与 S 绑定哈希、
+    # 逐项字节数与 sha256 全部在此核对；任何不符抛 BackupError(503)。
+    manifest, files = _read_snapshot(input_path)
+    if manifest["wallet_id"] != wallet_id:
+        raise BackupError(409, "snapshot belongs to a different wallet")
+
+    try:
+        # 与 restore 完全相同的全量对账（隔离临时目录内运行线上恢复器 +
+        # 份额公私钥 + 审计链 + 审批单/会话/轮换/账本 + 历史聚合签名重验）。
+        _verify_snapshot(wallet_id, manifest, files)
+    except BackupError:
+        raise
+    except (RecoveryError, CorruptDataError, ValueError, OSError) as exc:
+        # 不回显内部对账细节，避免泄露任何密钥/载荷线索
+        raise BackupError(503, "snapshot cannot be verified") from exc
+    return _restore_body(
+        200,
+        wallet_id,
+        manifest["snapshot_id"],
+        manifest["manifest_sha256"],
+        manifest,
     )
