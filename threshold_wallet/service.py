@@ -37,8 +37,8 @@ REQUIRED_SHARES = 2
 #: 服务端为两个份额生成的固定标识（按此顺序聚合公钥与签名）
 SHARE_IDS = ("share-1", "share-2")
 
-#: 审批策略允许的 required_approvals 取值
-ALLOWED_REQUIRED_APPROVALS = (1, 2)
+#: 审批策略允许的 required_approvals 取值（1..16 的多方审批阈值）
+ALLOWED_REQUIRED_APPROVALS = tuple(range(1, 17))
 
 #: 冷热钱包交易策略允许的 mode 取值
 TRANSACTION_POLICY_MODES = ("hot", "cold")
@@ -1575,6 +1575,16 @@ class WalletService:
                     raise ServiceError(
                         400, "timeout_seconds must be a positive integer"
                     )
+                # 名单非空且成员数少于新阈值时阈值不可满足：409 且零副作用
+                # （不写策略、名单或审计事件）；空名单沿用开放审批人语义。
+                roster = self._effective_roster_locked(wallet_id)
+                if roster and len(roster) < required_approvals:
+                    raise ServiceError(
+                        409,
+                        f"approval roster has only {len(roster)} members, "
+                        "fewer than required_approvals "
+                        f"{required_approvals}",
+                    )
                 policy = {
                     "wallet_id": wallet_id,
                     "required_approvals": required_approvals,
@@ -1706,6 +1716,21 @@ class WalletService:
                 self._assert_change_control_not_required_locked(wallet_id)
                 self._approval_roster_events_strict(wallet_id)
                 roster = self._validate_allowed_approvers(allowed_approvers)
+                # 非空名单成员数不得少于当前审批策略阈值（否则阈值不可
+                # 满足）：409 且零副作用（不写名单、策略或审计事件）；
+                # 清空名单沿用开放审批人语义，不受阈值约束。
+                policy = self._store.get_policy(wallet_id)
+                if (
+                    roster
+                    and policy is not None
+                    and len(roster) < policy["required_approvals"]
+                ):
+                    raise ServiceError(
+                        409,
+                        f"approval roster of {len(roster)} members cannot "
+                        "satisfy required_approvals "
+                        f"{policy['required_approvals']}",
+                    )
                 # 首次设置、修改、清空和同值更新都以最后一条快照事件为
                 # 提交点，并各记一条事件。
                 self._emit(
@@ -2812,6 +2837,36 @@ class WalletService:
                         "policy change before-config does not match the "
                         "current configuration",
                     )
+
+                # --- 4.5 阈值可满足性（零副作用 409）---
+                # 非空名单成员数不得少于新阈值；把名单缩小到不可满足当前
+                # 阈值同样拒绝。空名单沿用开放审批人语义，不受约束。
+                if target == "approval-policy":
+                    roster = self._effective_roster_locked(wallet_id)
+                    if roster and len(roster) < after_view[
+                        "required_approvals"
+                    ]:
+                        raise ServiceError(
+                            409,
+                            f"approval roster has only {len(roster)} "
+                            "members, fewer than required_approvals "
+                            f"{after_view['required_approvals']}",
+                        )
+                elif target == "approval-roster":
+                    policy = self._store.get_policy(wallet_id)
+                    if (
+                        after_view["allowed_approvers"]
+                        and policy is not None
+                        and len(after_view["allowed_approvers"])
+                        < policy["required_approvals"]
+                    ):
+                        raise ServiceError(
+                            409,
+                            "approval roster of "
+                            f"{len(after_view['allowed_approvers'])} members "
+                            "cannot satisfy required_approvals "
+                            f"{policy['required_approvals']}",
+                        )
 
                 # --- 5. 应用：写配置 + 唯一提交事件，原子 ---
                 event = self._apply_policy_change_locked(

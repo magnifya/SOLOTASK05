@@ -77,10 +77,19 @@ class ApprovalHttpTest(unittest.TestCase):
         self.assertEqual(body["required_approvals"], 1)
         self.assertEqual(body["timeout_seconds"], 60)
 
+    def test_put_policy_multi_party_threshold_200(self):
+        for req in (2, 3, 8, 16):
+            status, body = self.put_policy(req=req, timeout=60)
+            self.assertEqual(status, 200, req)
+            self.assertEqual(body["required_approvals"], req)
+            self.assertEqual(body["timeout_seconds"], 60)
+
     def test_put_policy_bad_values_400(self):
         for body in (
             {"required_approvals": 0, "timeout_seconds": 60},
-            {"required_approvals": 3, "timeout_seconds": 60},
+            {"required_approvals": -1, "timeout_seconds": 60},
+            {"required_approvals": 17, "timeout_seconds": 60},
+            {"required_approvals": 100, "timeout_seconds": 60},
             {"required_approvals": True, "timeout_seconds": 60},
             {"required_approvals": "2", "timeout_seconds": 60},
             {"required_approvals": 2.0, "timeout_seconds": 60},
@@ -201,6 +210,187 @@ class ApprovalHttpTest(unittest.TestCase):
         self.create_request()
         status, body = self.approve()
         self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "approved")
+
+    # ---- 多方审批阈值（3..16） ------------------------------------------
+
+    def test_approve_req3_flow_to_approved(self):
+        self.put_policy(req=3)
+        self.create_request()
+        status, body = self.approve(approver="alice")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "pending")
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["req"], 3)
+        self.assertEqual(body["approvers"], ["alice"])
+        # 重复批准幂等且不计数
+        status, body = self.approve(approver="alice")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["state"], "pending")
+        status, body = self.approve(approver="bob")
+        self.assertEqual(body["state"], "pending")
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["approvers"], ["alice", "bob"])
+        # 第三名不同审批人达到阈值
+        status, body = self.approve(approver="carol")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "approved")
+        self.assertEqual(body["count"], 3)
+        # 已 approved 再批准：409
+        self.assertEqual(self.approve(approver="dave")[0], 409)
+        # request_approved 事件反映累计 count/req
+        status, events = self.request("GET", "/v1/wallets/w1/audit-events")
+        approved_events = [
+            event
+            for event in events["events"]
+            if event["type"] == "request_approved"
+        ]
+        self.assertEqual(len(approved_events), 3)
+        self.assertEqual(
+            [event["details"] for event in approved_events],
+            [
+                {"count": 1, "req": 3, "state": "pending"},
+                {"count": 2, "req": 3, "state": "pending"},
+                {"count": 3, "req": 3, "state": "approved"},
+            ],
+        )
+
+    def test_approve_req16_flow(self):
+        self.put_policy(req=16)
+        self.create_request()
+        approvers = [f"a{i}" for i in range(16)]
+        for approver in approvers[:-1]:
+            status, body = self.approve(approver=approver)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["state"], "pending")
+        status, body = self.approve(approver=approvers[-1])
+        self.assertEqual(body["state"], "approved")
+        self.assertEqual(body["count"], 16)
+        self.assertEqual(body["approvers"], approvers)
+
+    def test_req_snapshot_not_retroactive(self):
+        # 建单时的阈值写入 req 快照：后续策略更新不追溯既有请求
+        self.put_policy(req=3)
+        self.create_request(rid="r1")
+        self.put_policy(req=1)
+        status, body = self.request("GET", "/v1/wallets/w1/sign-requests/r1")
+        self.assertEqual(body["req"], 3)
+        self.approve(rid="r1", approver="alice")
+        self.approve(rid="r1", approver="bob")
+        status, body = self.request("GET", "/v1/wallets/w1/sign-requests/r1")
+        self.assertEqual(body["state"], "pending")
+        self.approve(rid="r1", approver="carol")
+        status, body = self.request("GET", "/v1/wallets/w1/sign-requests/r1")
+        self.assertEqual(body["state"], "approved")
+        # 新建请求采用新阈值
+        self.create_request(rid="r2", message="pay-200")
+        status, body = self.request("GET", "/v1/wallets/w1/sign-requests/r2")
+        self.assertEqual(body["req"], 1)
+
+    def test_reject_req3_immediately_terminal(self):
+        self.put_policy(req=3)
+        self.create_request()
+        self.approve(approver="alice")
+        status, body = self.reject(approver="bob", reason="no")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "rejected")
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(self.approve(approver="carol")[0], 409)
+
+    def test_sign_gate_with_req3(self):
+        self.put_policy(req=3)
+        self.create_request()
+        self.approve(approver="alice")
+        self.approve(approver="bob")
+        # 未达阈值：409
+        status, _ = self.request(
+            "POST", "/v1/wallets/w1/sign", self._sign_body("w1", "r1", "pay-100")
+        )
+        self.assertEqual(status, 409)
+        self.approve(approver="carol")
+        status, body = self.request(
+            "POST", "/v1/wallets/w1/sign", self._sign_body("w1", "r1", "pay-100")
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(len(bytes.fromhex(body["signature"])), 128)
+
+    # ---- 名单与阈值的可满足性约束 ----------------------------------------
+
+    def put_roster(self, approvers, wallet="w1"):
+        return self.request(
+            "PUT",
+            f"/v1/wallets/{wallet}/approval-roster",
+            {"allowed_approvers": approvers},
+        )
+
+    def test_put_policy_above_roster_size_409_zero_side_effects(self):
+        self.assertEqual(self.put_roster(["alice", "bob"])[0], 200)
+        status, _ = self.put_policy(req=3)
+        self.assertEqual(status, 409)
+        # 零副作用：策略仍未设置、无 policy_updated 事件
+        self.assertIsNone(self.srv.harness.store.get_policy("w1"))
+        status, events = self.request("GET", "/v1/wallets/w1/audit-events")
+        self.assertEqual(
+            [
+                event
+                for event in events["events"]
+                if event["type"] == "policy_updated"
+            ],
+            [],
+        )
+        # 阈值不超过名单规模则成功
+        self.assertEqual(self.put_policy(req=2)[0], 200)
+        # 已有策略时把阈值提到名单规模以上同样 409 且不改旧策略
+        status, _ = self.put_policy(req=5)
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            self.srv.harness.store.get_policy("w1")["required_approvals"], 2
+        )
+
+    def test_put_policy_with_empty_roster_open_semantics(self):
+        # 空名单（缺省）沿用开放审批人语义：任意阈值可设
+        self.assertEqual(self.put_policy(req=16)[0], 200)
+        # 显式清空名单同样不受阈值约束
+        self.assertEqual(self.put_roster([])[0], 200)
+        self.assertEqual(self.put_policy(req=16)[0], 200)
+
+    def test_shrink_roster_below_threshold_409_zero_side_effects(self):
+        self.put_policy(req=3)
+        self.assertEqual(self.put_roster(["alice", "bob", "carol"])[0], 200)
+        # 缩小到不可满足阈值：409，名单与事件均不变
+        status, _ = self.put_roster(["alice", "bob"])
+        self.assertEqual(status, 409)
+        status, body = self.request("GET", "/v1/wallets/w1/approval-roster")
+        self.assertEqual(
+            body, {"allowed_approvers": ["alice", "bob", "carol"]}
+        )
+        status, events = self.request("GET", "/v1/wallets/w1/audit-events")
+        roster_events = [
+            event
+            for event in events["events"]
+            if event["type"] == "approval_roster_updated"
+        ]
+        self.assertEqual(len(roster_events), 1)
+        # 清空名单（开放语义）与满足阈值的名单均成功
+        self.assertEqual(
+            self.put_roster(["alice", "bob", "carol", "dave"])[0], 200
+        )
+        self.assertEqual(self.put_roster([])[0], 200)
+        # 策略仍在：非空但不足阈值的名单仍 409
+        self.assertEqual(self.put_roster(["alice"])[0], 409)
+        # 无策略的钱包名单不受阈值约束
+        self.request("POST", "/v1/wallets", {"wallet_id": "w2", "shares": 2})
+        self.assertEqual(self.put_roster(["alice"], wallet="w2")[0], 200)
+
+    def test_roster_gates_multi_party_approvals(self):
+        self.put_policy(req=3)
+        self.put_roster(["alice", "bob", "carol"])
+        self.create_request()
+        self.assertEqual(self.approve(approver="dave")[0], 409)
+        self.assertEqual(self.approve(approver="alice")[0], 200)
+        self.assertEqual(self.approve(approver="bob")[0], 200)
+        status, body = self.approve(approver="carol")
         self.assertEqual(body["state"], "approved")
 
     def test_approve_bad_approver_400(self):
@@ -564,10 +754,10 @@ class ApprovalCliTest(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertIn("error", json.loads(err))
-        # 策略参数非法
+        # 策略参数非法（阈值越界 17）
         code, _, err = self.run_cli(
             "policy", "--url", self.url, "--wallet-id", "w1",
-            "--required-approvals", "5", "--timeout-seconds", "60",
+            "--required-approvals", "17", "--timeout-seconds", "60",
         )
         self.assertEqual(code, 1)
         self.assertIn("error", json.loads(err))

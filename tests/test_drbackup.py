@@ -176,6 +176,47 @@ class BackupTest(unittest.TestCase):
         self.assertFalse(any("locks/" in p for p in paths))
         self.assertFalse(any("asset-intents/" in p for p in paths))
 
+    def test_multi_party_request_survives_backup_restore(self):
+        svc = self.h.service
+        svc.put_policy("alice", 3, 3600)
+        svc.create_sign_request("alice", "r1", "hello")
+        svc.approve("alice", "r1", "a1", None)
+        svc.approve("alice", "r1", "a2", None)
+        svc.approve("alice", "r1", "a3", None)
+
+        drbackup.backup(self.data, "alice", "S1", self.out)
+        dst = os.path.join(self.tmp, "restored")
+        status, _ = drbackup.restore(dst, "alice", self.out)
+        self.assertEqual(status, 201)
+
+        restored_store = WalletStore(dst)
+        record = restored_store.get_request("alice", "r1")
+        self.assertEqual(record["state"], "approved")
+        self.assertEqual(record["req"], 3)
+        self.assertEqual(record["approvers"], ["a1", "a2", "a3"])
+        self.assertEqual(
+            restored_store.get_policy("alice")["required_approvals"], 3
+        )
+        # 恢复后服务可正常重启并呈现一致的审批单视图
+        from threshold_wallet.service import WalletService
+
+        view = WalletService(restored_store).get_sign_request("alice", "r1")
+        self.assertEqual(view["state"], "approved")
+        self.assertEqual(view["count"], 3)
+        self.assertEqual(view["req"], 3)
+
+    def test_restore_rejects_out_of_range_req(self):
+        svc = self.h.service
+        svc.put_policy("alice", 2, 3600)
+        svc.create_sign_request("alice", "r1", "hello")
+        record = self.h.store.get_request("alice", "r1")
+        record = dict(record, req=17)
+        self.h.store.update_request("alice", "r1", record)
+
+        with self.assertRaises(drbackup.BackupError) as cm:
+            drbackup.backup(self.data, "alice", "S1", self.out)
+        self.assertEqual(cm.exception.status, 503)
+
     def test_cancelled_request_survives_backup_restore(self):
         svc = self.h.service
         svc.put_policy("alice", 1, 3600)

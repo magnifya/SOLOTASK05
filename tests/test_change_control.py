@@ -396,7 +396,7 @@ class ChangeControlServiceTest(unittest.TestCase):
             ("change-control", {"enabled": False}, {}),
             ("approval-policy",
              {"required_approvals": 2, "timeout_seconds": 60},
-             {"required_approvals": 3, "timeout_seconds": 60}),
+             {"required_approvals": 17, "timeout_seconds": 60}),
             ("approval-policy",
              {"required_approvals": 2, "timeout_seconds": 60},
              {"required_approvals": 1, "timeout_seconds": 0}),
@@ -543,6 +543,106 @@ class ChangeControlServiceTest(unittest.TestCase):
             self.svc.get_approval_roster("w1"),
             {"allowed_approvers": ["bob", "carol"]},
         )
+
+    def test_apply_approval_policy_multi_party_threshold(self):
+        self._policy2(3600)
+        code, _ = self._apply(
+            "c1", "approval-policy",
+            {"required_approvals": 2, "timeout_seconds": 3600},
+            {"required_approvals": 3, "timeout_seconds": 60},
+            "r1",
+        )
+        self.assertEqual(code, 201)
+        self.assertEqual(
+            self.h.store.get_policy("w1"),
+            {"wallet_id": "w1", "required_approvals": 3,
+             "timeout_seconds": 60},
+        )
+        # 新建审批单取新阈值快照；既有审批单（r1）不追溯
+        code, view = self.svc.create_sign_request("w1", "r2", "m")
+        self.assertEqual(code, 201)
+        self.assertEqual(view["req"], 3)
+        self.assertEqual(self.svc.get_sign_request("w1", "r1")["req"], 2)
+        self.svc.approve("w1", "r2", "alice")
+        self.svc.approve("w1", "r2", "bob")
+        self.assertEqual(
+            self.svc.get_sign_request("w1", "r2")["state"], "pending"
+        )
+        self.svc.approve("w1", "r2", "carol")
+        self.assertEqual(
+            self.svc.get_sign_request("w1", "r2")["state"], "approved"
+        )
+
+    def test_policy_change_above_roster_size_409_zero_side_effects(self):
+        self._policy2()
+        # 变更控制启用前直接设置两名成员名单（满足 req=2）
+        self.svc.put_approval_roster("w1", ["alice", "bob"])
+        self._enable()
+        before_events = len(self._events("policy_change_applied"))
+        with self.assertRaises(ServiceError) as ctx:
+            self._apply(
+                "c2", "approval-policy",
+                {"required_approvals": 2, "timeout_seconds": 3600},
+                {"required_approvals": 3, "timeout_seconds": 60},
+                "r2",
+            )
+        self.assertEqual(ctx.exception.status, 409)
+        # 零副作用：策略不变、无新的变更事件
+        self.assertEqual(
+            self.h.store.get_policy("w1")["required_approvals"], 2
+        )
+        self.assertEqual(
+            len(self._events("policy_change_applied")), before_events
+        )
+
+    def test_policy_change_shrink_roster_below_threshold_409(self):
+        self._policy2()
+        self._enable()
+        # 先把阈值提高到 3（名单为空，开放语义不受约束）
+        code, _ = self._apply(
+            "c2", "approval-policy",
+            {"required_approvals": 2, "timeout_seconds": 3600},
+            {"required_approvals": 3, "timeout_seconds": 3600},
+            "r2",
+        )
+        self.assertEqual(code, 201)
+
+        def apply3(change_id, target, before, after, rid):
+            """阈值为 3 后审批单需三名不同审批人方可应用变更。"""
+            message = _change_message(change_id, target, before, after)
+            code, _ = self.svc.create_sign_request("w1", rid, message)
+            self.assertEqual(code, 201)
+            for approver in ("alice", "bob", "carol"):
+                self.svc.approve("w1", rid, approver)
+            return self.svc.post_policy_change(
+                "w1", change_id, target, before, after, rid
+            )
+
+        # 把名单缩小到不可满足阈值：409 且零副作用
+        with self.assertRaises(ServiceError) as ctx:
+            apply3(
+                "c3", "approval-roster",
+                {"allowed_approvers": []},
+                {"allowed_approvers": ["alice", "bob"]},
+                "r3",
+            )
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(
+            self.svc.get_approval_roster("w1"), {"allowed_approvers": []}
+        )
+        # 满足阈值的名单可正常应用
+        code, _ = apply3(
+            "c4", "approval-roster",
+            {"allowed_approvers": []},
+            {"allowed_approvers": ["alice", "bob", "carol"]},
+            "r4",
+        )
+        self.assertEqual(code, 201)
+        self.assertEqual(
+            self.svc.get_approval_roster("w1"),
+            {"allowed_approvers": ["alice", "bob", "carol"]},
+        )
+
 
     def test_apply_dkg_failover_policy_takes_effect(self):
         self._enable()

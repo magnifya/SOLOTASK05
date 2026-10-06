@@ -855,7 +855,12 @@ def _request_shape_ok(key: str, record: object) -> bool:
         isinstance(a, str) for a in approvers
     ) or len(set(approvers)) != len(approvers):
         return False
-    if record.get("req") not in (1, 2):
+    req = record.get("req")
+    if (
+        not isinstance(req, int)
+        or isinstance(req, bool)
+        or not 1 <= req <= 16
+    ):
         return False
     if parse_utc_iso(record.get("t0")) is None:
         return False

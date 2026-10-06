@@ -138,13 +138,13 @@ def parse_utc_iso(value: object) -> Optional[datetime]:
 
 def approval_policy_shape_ok(policy: object) -> bool:
     """审批策略条目形状：wallet_id 为合法标识、required_approvals 为
-    非布尔整数 1/2、timeout_seconds 为非布尔正整数。"""
+    非布尔整数 1..16、timeout_seconds 为非布尔正整数。"""
     if not isinstance(policy, dict):
         return False
     if not _valid_safe_id(policy.get("wallet_id")):
         return False
     required = policy.get("required_approvals")
-    if not _is_plain_int(required) or required not in (1, 2):
+    if not _is_plain_int(required) or not 1 <= required <= 16:
         return False
     timeout = policy.get("timeout_seconds")
     return _is_plain_int(timeout) and timeout > 0
