@@ -11,6 +11,9 @@
               （签名内容为 signing_request_id 与 message 的拼接），
               输出可直接交给 sign 子命令的 {"share_id", "signature"}
 
+离线灾备命令（本地，不经 HTTP）：backup / restore / verify（只读验真，
+不读写任何 data-dir）。
+
 客户端命令只通过 HTTP 与服务端交互；create/show 的响应中本就不含私钥。
 """
 
@@ -156,6 +159,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_restore.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     p_restore.add_argument("--wallet-id", required=True)
     p_restore.add_argument("--input", required=True)
+
+    # verify（兼容灾备：只读离线验真，不触碰任何 data-dir）
+    p_verify = sub.add_parser(
+        "verify", help="只读验真灾备快照（本地，离线，不读写 data-dir）"
+    )
+    p_verify.add_argument("--wallet-id", required=True)
+    p_verify.add_argument("--input", required=True)
 
     return parser
 
@@ -364,7 +374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # 兜底：任何未预期异常也只落一行泛化 JSON，杜绝 traceback
                 return _fail("share-sign failed, refusing to sign")
 
-        elif args.command in ("backup", "restore"):
+        elif args.command in ("backup", "restore", "verify"):
             from . import drbackup
 
             # 灾备命令的统一错误边界（与 share-sign 一致）：stdout 为空、
@@ -379,6 +389,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         args.output,
                     )
                     _print_json(result)
+                    return 0
+                if args.command == "verify":
+                    # 只读验真：无 --data-dir，绝不读取/改动任何数据目录，
+                    # 成功体与 restore 同形（status 固定 200）。
+                    _print_json(drbackup.verify(args.wallet_id, args.input))
                     return 0
                 status, body = drbackup.restore(
                     args.data_dir, args.wallet_id, args.input
